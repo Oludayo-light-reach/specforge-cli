@@ -17,9 +17,11 @@ venv/
 Thumbs.db
 
 # Editor
-.vscode/
 .idea/
 *.swp
 
 # Spec-local (mirrors what this CLI itself writes)
 .spec/
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

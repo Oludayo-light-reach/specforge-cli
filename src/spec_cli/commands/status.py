@@ -81,6 +81,110 @@ def _print_pending_prompt_captures(root) -> None:
     )
 
 
+def _print_live_team_activity(root, manifest) -> None:
+    """Surface a short snapshot of recent Spec Live activity at the top.
+
+    Quiet on the happy path:
+
+    * No credentials → silent (the user isn't signed in; nothing to show).
+    * No `cloud.project` → silent (no Cloud target to query).
+    * Network error → silent (status should never block on a slow API).
+    * Empty feed → silent (nothing to surface).
+
+    A small block of recent events otherwise — same shape as `spec
+    team`, just capped to the freshest few. Disabled with
+    ``SPEC_STATUS_NO_LIVE=1`` for users who really don't want a
+    network call on every status invocation.
+    """
+    import os
+
+    if os.environ.get("SPEC_STATUS_NO_LIVE", "").strip() == "1":
+        return
+
+    try:
+        from ..api import ApiError, CloudClient
+        from ..config import (
+            RemoteUrlError,
+            load_credentials,
+            parse_cloud_project,
+        )
+        from ..realtime.events import IncomingEvent
+    except Exception:  # noqa: BLE001
+        return
+
+    raw = manifest.cloud_project
+    if not raw:
+        return
+    creds = load_credentials()
+    if not creds or not creds.access_token:
+        return
+    try:
+        handle, slug = parse_cloud_project(raw, default_handle=creds.user_handle)
+    except RemoteUrlError:
+        return
+
+    try:
+        client = CloudClient(creds)
+        project_info = client.resolve_project(handle, slug)
+        rows = client.list_prompt_events(int(project_info["id"]), limit=5)
+    except (ApiError, KeyError, TypeError, ValueError):
+        return
+
+    if not rows:
+        return
+    events = [IncomingEvent.from_json(r) for r in rows if isinstance(r, dict)]
+    self_id = _resolve_self_id(client)
+    others = [e for e in events if self_id is None or e.author_user_id != self_id]
+    if not others:
+        return
+
+    console.print()
+    console.print(
+        f"[sf.label]Live team activity[/] [sf.muted]· {len(others)} recent event(s) "
+        f"on {handle}/{slug} · `spec watch` to stream[/]"
+    )
+    for event in others[:5]:
+        when = _short_ago(event.turn_at or event.received_at)
+        author = event.author_display
+        branch = event.branch or "-"
+        text = (event.summary or event.text or "").strip()
+        head = text.splitlines()[0] if text else ""
+        if len(head) > 120:
+            head = head[:120].rstrip() + "…"
+        console.print(
+            f"  [sf.muted]·[/] [sf.label]{author}[/] "
+            f"[sf.muted]on {branch} · {when} · {event.role}[/]"
+            + (f" — {head}" if head else "")
+        )
+
+
+def _resolve_self_id(client) -> int | None:
+    try:
+        me = client._request("GET", "/api/auth/me")  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(me, dict) and isinstance(me.get("id"), int):
+        return int(me["id"])
+    return None
+
+
+def _short_ago(value) -> str:
+    if value is None:
+        return "?"
+    from datetime import datetime, timezone
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    seconds = max(0, (datetime.now(timezone.utc) - value).total_seconds())
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86_400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86_400)}d ago"
+
+
 def _print_unmerged_branch_prompts(root, *, current_branch: str) -> None:
     """When on trunk, list branch-prompts files that haven't been rolled up.
 
@@ -170,6 +274,11 @@ def status_cmd(show_all: bool, show_ignored: bool) -> None:
     # capture` without writing — the user gets a heads-up that their
     # `.prompts` is about to grow on the next `spec add` / `git commit`.
     _print_pending_prompt_captures(root)
+
+    # Spec Live snapshot — recent peer prompts at a glance. Silent on
+    # error or when nothing's happening; users who don't want even
+    # the network probe set ``SPEC_STATUS_NO_LIVE=1``.
+    _print_live_team_activity(root, manifest)
 
     # When the user is on trunk, surface any non-trunk branch-prompts
     # files that should be rolled into trunk's `<trunk>.prompts`. Either

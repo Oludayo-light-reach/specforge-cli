@@ -74,6 +74,7 @@ GITIGNORE_BLOCK_BODY: str = f"""\
 # block (sentinels included) to opt out.
 .spec/         # Spec CLI's local index/staging directory.
 out/           # Default `spec compile` output target — regenerated.
+.claude/settings.local.json   # Claude Code per-user settings — never shared.
 {GITIGNORE_BLOCK_END}
 """
 
@@ -324,6 +325,65 @@ cloud:
   # `spec push` (PLAN.md §11). Once set, every push verifies it against
   # the remote — pointing `cloud.project` at an unrelated bundle by
   # accident is then a hard refusal, not a silent overwrite.
+
+  # Spec Live — real-time prompt sharing across the team. Each new
+  # turn in any local Cursor / Codex / Claude Code session is
+  # redacted, posted to Spec Cloud, and fanned out via SSE to every
+  # teammate's `spec watch` daemon. Enabled by default — the team
+  # feed lights up the moment a teammate installs the CLI. Toggle
+  # with `spec live on` / `spec live off`, or per-machine with
+  # `spec live mute`. See `spec/PROMPT-LIVE-PLAN.md`.
+  prompt_stream:
+    enabled: true
+    # `verbose: true` would also share assistant *full text* (not
+    # just summaries) — off by default since assistant bodies are
+    # big and often sensitive.
+"""
+
+
+# Cursor rule scaffold. Cursor reads `.cursor/rules/*.mdc` (or `.md`) in
+# the project root and surfaces them to the model as system-level
+# guidance. We drop a Spec-Live-aware rule so Cursor checks
+# ``.spec/team-presence.json`` before suggesting destructive edits.
+# Stays small: the file is one of *many* rules a project may have, so
+# we deliberately keep it focused on the presence-check contract and
+# defer to ``AGENTS.md`` for everything else.
+_CURSOR_RULES_DIRNAME: str = ".cursor/rules"
+_CURSOR_RULE_FILENAME: str = "spec-team-presence.mdc"
+_CURSOR_RULE_BODY: str = """\
+---
+description: Spec Live presence check before file edits
+alwaysApply: true
+---
+
+# Spec Live — check team presence before editing
+
+This bundle uses **Spec Live**. Before you edit any file in this
+project, run:
+
+```bash
+spec presence check <bundle-relative-path>
+```
+
+The exit code is the contract:
+
+- **0** → no teammate is currently editing the file. Proceed.
+- **2** → at least one teammate has the file dirty in their working
+  tree. Show the printed warning to the user and ask whether to
+  proceed before editing.
+
+If the command exits with code **0** because the file
+`.spec/team-presence.json` is missing, that simply means no teammate
+is currently running `spec watch` — proceed normally; do not block.
+
+You do **not** need to run this for files you are creating fresh
+under your own scaffolding (no path conflict possible). Only run it
+when modifying files that already exist or that other teammates
+might also be touching.
+
+This rule pairs with the Claude Code `PreToolUse` hook in
+`.claude/settings.json`, which performs the same check
+automatically for Edit / Write / MultiEdit tool calls.
 """
 
 
@@ -367,6 +427,43 @@ code for this bundle:
 - Don't edit files under `out/` by hand; they are regenerated on every
   compile.
 - Don't commit `.spec/` — it's local index state.
+
+## Spec Live — checking team presence before file edits
+
+This bundle uses **Spec Live**: when teammates are running
+`spec watch`, their currently-dirty files (and per-file `+/-` line
+counts) are mirrored to `.spec/team-presence.json`. Before you
+modify any file in this bundle, you should check whether a teammate
+already has uncommitted work in it.
+
+The mechanical contract:
+
+```bash
+spec presence check <bundle-relative-path>
+# exit 0 → clear
+# exit 2 → a teammate is currently editing it (warning printed)
+```
+
+Use this in two situations:
+
+1. **Before writing or editing a file** that is not net-new
+   scaffolding (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`,
+   `StrReplace`, `Delete`). If exit code is non-zero, show the user
+   the warning text and ask whether to proceed before making the
+   edit.
+2. **Before pushing or merging changes** that touch many files —
+   run the check on each touched file and group warnings into one
+   summary the user can react to.
+
+If `.spec/team-presence.json` is missing (no `spec watch` running),
+this command exits 0 silently. That is the expected behaviour —
+fail open, never block work because the daemon isn't on.
+
+A Claude Code `PreToolUse` hook is automatically wired into
+`.claude/settings.json` by `spec init`, so Claude Code does this
+check for you on every `Edit` / `Write` / `MultiEdit` /
+`NotebookEdit`. Other agents (Cursor, Codex, generic LLMs reading
+this file) should call `spec presence check` themselves.
 """
 
 
@@ -687,6 +784,37 @@ def init_cmd(
     # project conventions.
     agents_written = _write_if_missing(root / AGENTS_FILENAME, _STARTER_AGENTS)
 
+    # Spec Live integrations for AI IDEs:
+    #   * `.cursor/rules/spec-team-presence.mdc` — universal "always
+    #     apply" rule that tells Cursor + any LLM reading the rules
+    #     dir to call `spec presence check` before edits.
+    #   * `.claude/settings.json` — PreToolUse hook that does the
+    #     same check automatically for Claude Code's edit tools.
+    # Both are idempotent and respect pre-existing user files (the
+    # Cursor rule only writes when missing; the Claude settings
+    # surgically replace just the Spec-managed entry).
+    cursor_rule_written = False
+    cursor_rule_path = root / _CURSOR_RULES_DIRNAME / _CURSOR_RULE_FILENAME
+    try:
+        cursor_rule_path.parent.mkdir(parents=True, exist_ok=True)
+        cursor_rule_written = _write_if_missing(
+            cursor_rule_path, _CURSOR_RULE_BODY
+        )
+    except OSError as e:
+        info("")
+        dim(f"Could not write Cursor rule ({e}). Skipping.")
+
+    claude_settings_written = False
+    claude_settings_path: Path | None = None
+    try:
+        from .hooks import install_claude_settings
+
+        claude_settings_path = install_claude_settings(root, block_mode=False)
+        claude_settings_written = True
+    except OSError as e:
+        info("")
+        dim(f"Could not write .claude/settings.json ({e}). Skipping.")
+
     # Git hooks: pre-commit mirrors git↔spec staging, commit-msg captures
     # prompts, pre-push runs `spec push`. Skipped outside a git worktree or
     # with --skip-git-hook.
@@ -744,6 +872,18 @@ def init_cmd(
         pointer("agents      ", "AGENTS.md")
     else:
         dim("AGENTS.md already exists — left untouched.")
+    if cursor_rule_written:
+        try:
+            rel = cursor_rule_path.relative_to(root)
+        except ValueError:
+            rel = cursor_rule_path
+        pointer("cursor rule ", str(rel))
+    if claude_settings_written and claude_settings_path is not None:
+        try:
+            rel = claude_settings_path.relative_to(root)
+        except ValueError:
+            rel = claude_settings_path
+        pointer("claude hook ", f"{rel} (PreToolUse → spec presence)")
 
     if auto_staged:
         dim(

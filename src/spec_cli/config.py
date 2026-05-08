@@ -92,6 +92,83 @@ class Manifest:
         cloud["project"] = project
 
     @property
+    def prompt_stream(self) -> dict[str, Any]:
+        """Spec Live (real-time prompt sharing) settings.
+
+        Read from ``cloud.prompt_stream`` in ``spec.yaml``. Accepted
+        shapes:
+
+        * Missing / ``null``          → default ON, summary-only.
+        * Boolean ``true``/``false``  → ``{"enabled": <bool>, "verbose": False}``.
+        * ``"enabled"`` / ``"on"`` / ``"true"`` (string) → ON.
+        * ``"disabled"`` / ``"off"`` / ``"false"`` (string) → OFF.
+        * Mapping ``{enabled, verbose}`` → explicit fine-grained control.
+
+        **Default is ON.** Spec Live works the moment a teammate
+        installs the CLI — the value-prop of "your team feed lights up
+        as you type" disappears the second we make it opt-in. Privacy
+        is preserved by (a) per-user mute via ``spec live mute`` (see
+        ``spec_cli.preferences``), (b) unconditional secret redaction
+        on every outbound payload, and (c) summary-only assistant
+        bodies unless ``verbose: true`` is explicitly set.
+
+        Set ``cloud.prompt_stream: disabled`` (or run ``spec live off``)
+        to turn it off for the whole bundle.
+        """
+        cloud = self.data.get("cloud") or {}
+        raw = cloud.get("prompt_stream") if isinstance(cloud, dict) else None
+
+        # Default: ON, summary-only. The next branches override.
+        enabled = True
+        verbose = False
+        if raw is None:
+            return {"enabled": enabled, "verbose": verbose}
+        if isinstance(raw, bool):
+            enabled = raw
+        elif isinstance(raw, str):
+            value = raw.strip().lower()
+            if value in {"disabled", "off", "false", "no", "0"}:
+                enabled = False
+            elif value in {"enabled", "on", "true", "yes", "1"}:
+                enabled = True
+            # Anything else falls through to the default ON.
+        elif isinstance(raw, dict):
+            enabled = bool(raw.get("enabled", True))
+            verbose = bool(raw.get("verbose", False))
+        return {"enabled": enabled, "verbose": verbose}
+
+    def set_cloud_prompt_stream(self, *, enabled: bool, verbose: bool | None = None) -> None:
+        """Write ``cloud.prompt_stream`` to the in-memory manifest.
+
+        Caller persists via ``dump_manifest``. We always write the
+        explicit mapping form so the state in ``spec.yaml`` is
+        unambiguous to a human reader — the implicit default is what
+        shipped users get, and the explicit form is what shows up
+        once anyone has flipped the toggle.
+        """
+        cloud = self.data.get("cloud")
+        if not isinstance(cloud, dict):
+            cloud = {}
+            self.data["cloud"] = cloud
+        if verbose is None:
+            cloud["prompt_stream"] = {"enabled": bool(enabled)}
+        else:
+            cloud["prompt_stream"] = {
+                "enabled": bool(enabled),
+                "verbose": bool(verbose),
+            }
+
+    @property
+    def prompt_stream_enabled(self) -> bool:
+        """Convenience: is broadcasting opted in for this bundle?"""
+        return bool(self.prompt_stream.get("enabled"))
+
+    @property
+    def prompt_stream_verbose(self) -> bool:
+        """Convenience: should the watcher broadcast assistant full text?"""
+        return bool(self.prompt_stream.get("verbose"))
+
+    @property
     def root(self) -> Path:
         return self.path.parent
 

@@ -166,6 +166,91 @@ command: `spec add .`, `git commit` with Spec hooks, and
 `spec prompts capture --source all` scan the local Claude Code, Cursor, and
 Codex Desktop stores for sessions that belong to the current bundle.
 
+### Spec Live — real-time team feed
+
+Spec Live broadcasts every new prompt you write in Cursor / Claude Code / Codex
+to the rest of your team within a few seconds, surfaces theirs back in your
+terminal, and streams a live "who is editing what" presence layer that AI IDEs
+can read before making file edits. **All of it is on by default the moment you
+install the CLI.**
+
+```bash
+# Start the daemon. Run it once in a dedicated terminal pane and leave it
+# open alongside your editor. Broadcasts your prompts + dirty files;
+# receives teammates' the same way.
+spec watch
+
+# One-shot snapshot — the last 20 prompt events, no daemon required.
+spec team
+
+# Who's editing what RIGHT NOW (file + line counts per teammate)
+spec presence show
+
+# Programmatic conflict probe (for hooks / scripts):
+spec presence check path/to/file.py
+#   exit 0 → clear · exit 2 → a teammate is editing it (warning printed)
+
+# See whether you're broadcasting right now and why
+spec live status
+
+# Kill switches
+spec live off       # disable broadcasting for this bundle (writes spec.yaml)
+spec live mute      # silence broadcasting on this machine for every bundle
+spec live unmute    # remove the per-machine mute
+spec live on        # re-enable for this bundle (with --verbose for full assistant text)
+```
+
+| Command | Purpose |
+|---|---|
+| `spec watch` | Long-running daemon. Broadcasts your prompts + dirty files; renders teammates' in your terminal. `--mirror` also writes incoming events to `prompts/captured/peers/<handle>/`. |
+| `spec team` | Snapshot of recent prompt activity (no SSE). |
+| `spec presence show` | Show every teammate's current dirty-file list with `+/-` line counts. |
+| `spec presence check <path>` | Exit code is the contract: 0 = clear, 2 = a teammate is editing the path. |
+| `spec hooks install-claude` | Wire the Spec Live `PreToolUse` hook into Claude Code (`spec init` does this for you on first run). Add `--block` to refuse edits on conflict instead of just warning. |
+| `spec live status` | Resolved broadcasting state — bundle setting, machine mute, and the final answer. |
+| `spec live on` / `off` | Per-bundle: writes `cloud.prompt_stream` to `spec.yaml`. Commit it so teammates inherit. |
+| `spec live mute` / `unmute` | Per-machine: lives in `~/.spec/preferences.json`. Receivers always work; this only stops your outgoing share. |
+
+#### How AI IDEs see teammate presence
+
+`spec watch` keeps `.spec/team-presence.json` fresh whenever a teammate's
+state changes. The file has a stable, documented shape (`schema: 1`, plus
+`members[]` and a pre-built `files_index` for O(1) lookup). Three integration
+vectors today:
+
+- **Claude Code** — `spec init` writes `.claude/settings.json` with a
+  `PreToolUse` hook that runs `spec hooks claude-pre-tool-use` before every
+  `Edit` / `Write` / `MultiEdit` / `NotebookEdit`. If a teammate is editing
+  the target file, Claude shows the warning inline. Add `--block` mode to make
+  Claude refuse the call until you intervene.
+- **Cursor** — `spec init` writes `.cursor/rules/spec-team-presence.mdc`
+  with `alwaysApply: true`. Cursor's model voluntarily runs `spec presence
+  check` before suggesting edits.
+- **Any AI agent** — `AGENTS.md` (also written by `spec init`) instructs any
+  model-driven agent to call `spec presence check <path>` before making
+  destructive edits and surface the warning to the user.
+
+When `spec watch` isn't running, `team-presence.json` is missing → all three
+vectors **fail open** (exit 0, silent). We never block work because the daemon
+is off.
+
+What's still on the roadmap (deferred until they earn the cost):
+
+- **Live cursor position** (which line / column a teammate is on) — needs a
+  per-editor extension or LSP server. The SSE channel is the substrate.
+- **Sub-file hunk granularity** — `git diff -U0` parsing to ship `(start_line,
+  end_line)` ranges in addition to the per-file `+/-` counts.
+
+Privacy posture, by default:
+
+- Secrets are redacted from every outbound payload (same `_SECRET_PATTERNS` as `.prompts` files on disk).
+- Assistant turns are summary-only — bodies stay local unless you set `verbose: true` in `spec.yaml` or pass `--verbose-out`.
+- The author block is server-stamped from your bearer token; nobody can spoof your handle on the feed.
+- Only project members can read or post; outsiders get 400.
+- Presence events follow the same opt-out path as prompt events: `spec live off` (per bundle) or `spec live mute` (per machine).
+
+Architecture and full design: [`spec/PROMPT-LIVE-PLAN.md`](../spec/PROMPT-LIVE-PLAN.md).
+
 ### Auth
 
 | Command | Purpose |

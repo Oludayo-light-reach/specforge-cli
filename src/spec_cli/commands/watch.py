@@ -1,0 +1,247 @@
+"""
+``spec watch`` — Spec Live daemon (broadcast + receive teammates' prompts).
+
+Foreground long-running command; ^C / SIGTERM stop it cleanly. Designed
+to be run in a dedicated terminal pane alongside an editor — output is
+quiet, single-line in compact mode, multi-line in default mode.
+
+Wires ``spec_cli.realtime.run_watcher`` into the `click` surface and
+resolves the cloud target the same way ``spec push`` does (manifest
+``cloud.project`` → CLI flag → URL override). On a project that hasn't
+been pushed yet this command will refuse — there's nothing to watch
+until the bundle exists in Cloud.
+"""
+from __future__ import annotations
+
+import click
+
+from ..api import ApiError, CloudClient
+from ..config import (
+    BundleNotFoundError,
+    RemoteUrlError,
+    find_bundle_root,
+    load_credentials,
+    load_manifest,
+    parse_cloud_project,
+)
+from ..preferences import load_preferences
+from ..realtime import WatcherOptions, run_watcher
+from ..ui import dim, fatal, warn
+
+
+@click.command("watch")
+@click.option(
+    "--no-broadcast",
+    is_flag=True,
+    help="Receive only — do not POST any of your local prompts to the team feed.",
+)
+@click.option(
+    "--no-receive",
+    is_flag=True,
+    help="Broadcast only — do not display teammates' incoming prompts.",
+)
+@click.option(
+    "--mirror",
+    is_flag=True,
+    help=(
+        "Append every incoming peer turn to "
+        "`prompts/captured/peers/<handle>/<branch>.prompts`. Local "
+        "cache only — never pushed; gitignored by default."
+    ),
+)
+@click.option(
+    "--verbose-out",
+    is_flag=True,
+    help=(
+        "Broadcast assistant *full text* in addition to summaries. Off "
+        "by default — assistant bodies are big and often sensitive. "
+        "Equivalent to setting `cloud.prompt_stream.verbose: true` in "
+        "spec.yaml for this run only."
+    ),
+)
+@click.option(
+    "--compact",
+    is_flag=True,
+    help="One line per event instead of the multi-line default.",
+)
+@click.option(
+    "--poll",
+    "poll_interval",
+    type=float,
+    default=None,
+    help="Seconds between local-transcript scans (default 2.0).",
+)
+@click.option(
+    "--branch-only",
+    "branch_only",
+    is_flag=True,
+    help=(
+        "Only broadcast turns whose branch matches the current git "
+        "branch. Off by default — quiet branches still benefit from "
+        "showing peer activity, but if you're worried about noise on "
+        "branch switches this is the kill-switch."
+    ),
+)
+@click.option(
+    "--project",
+    "-p",
+    default=None,
+    help=(
+        "Override `cloud.project` from spec.yaml. Accepts `<handle>/<slug>` "
+        "or a bare slug (uses your handle from saved credentials)."
+    ),
+)
+def watch_cmd(
+    no_broadcast: bool,
+    no_receive: bool,
+    mirror: bool,
+    verbose_out: bool,
+    compact: bool,
+    poll_interval: float | None,
+    branch_only: bool,
+    project: str | None,
+) -> None:
+    """Stream prompts to and from your team in real time.
+
+    For each new turn in any local Cursor / Codex / Claude Code session,
+    Spec Live POSTs a redacted event to Spec Cloud. Cloud fans the
+    event out over an SSE stream to every teammate's `spec watch`
+    daemon, which renders it in their terminal within a few seconds.
+
+    Requires `cloud.prompt_stream: enabled` in spec.yaml to broadcast.
+    Receiving is always available to project members. Use `--mirror`
+    to also drop incoming peer events into a local file you can grep.
+    """
+    if no_broadcast and no_receive:
+        fatal(
+            "Both --no-broadcast and --no-receive set — nothing to do. "
+            "Drop one of the flags."
+        )
+        return
+
+    try:
+        root = find_bundle_root()
+    except BundleNotFoundError as e:
+        fatal(str(e))
+        return
+
+    manifest = load_manifest(root)
+    creds = load_credentials()
+    if not creds or not creds.access_token:
+        fatal("Not signed in. Run `spec login` first.")
+        return
+
+    raw = project or manifest.cloud_project
+    if not raw:
+        fatal(
+            "No cloud project configured. Add `cloud.project: <handle>/<slug>` "
+            "to spec.yaml or pass --project <handle>/<slug>."
+        )
+        return
+    try:
+        handle, slug = parse_cloud_project(raw, default_handle=creds.user_handle)
+    except RemoteUrlError as e:
+        fatal(str(e))
+        return
+
+    try:
+        client = CloudClient(creds)
+    except ApiError as e:
+        fatal(str(e))
+        return
+    try:
+        project_info = client.resolve_project(handle, slug)
+    except ApiError as e:
+        fatal(
+            f"Could not resolve project '{handle}/{slug}': {e}\n"
+            f"  · Check your sign-in (`spec login`).\n"
+            f"  · Or push the bundle first (`spec push`) so Cloud knows it."
+        )
+        return
+    project_id = int(project_info["id"])
+
+    # Self-id + display block for echo suppression and the local
+    # team-presence mirror. Best-effort: when the user's own
+    # broadcasts come back over the SSE stream, we filter them by
+    # ``author.user_id == self_user_id``. If the server doesn't return
+    # ``user_id`` from ``/api/auth/me`` (older deploys), echo
+    # suppression silently no-ops and the user sees their own events
+    # — annoying but not broken.
+    self_user_id: int | None = None
+    self_handle: str | None = creds.user_handle
+    self_name: str | None = None
+    try:
+        me = client._request("GET", "/api/auth/me")  # noqa: SLF001
+        if isinstance(me, dict):
+            if isinstance(me.get("id"), int):
+                self_user_id = int(me["id"])
+            handle_val = me.get("handle")
+            if isinstance(handle_val, str) and handle_val:
+                self_handle = handle_val
+            name_val = me.get("name")
+            if isinstance(name_val, str) and name_val:
+                self_name = name_val
+    except ApiError as e:
+        warn(f"could not read /api/auth/me ({e}) — echo suppression off")
+
+    # Broadcasting resolution. Default is ON; two opt-out layers:
+    #   * --no-broadcast on the command line (this run only)
+    #   * the bundle manifest can disable for the whole team
+    #     (`spec live off` writes ``cloud.prompt_stream: disabled``)
+    #   * the user can mute on this machine for every bundle
+    #     (`spec live mute` writes ``~/.spec/preferences.json``)
+    # All three are independent kill-switches; ANY of them off → no broadcast.
+    prefs = load_preferences()
+    broadcast_requested = not no_broadcast
+    project_opted_in = manifest.prompt_stream_enabled
+    user_muted = prefs.prompt_stream_muted
+    broadcast_active = broadcast_requested and project_opted_in and not user_muted
+
+    if broadcast_requested and not project_opted_in:
+        warn(
+            "broadcasting is disabled for this bundle — run `spec live on` "
+            "(or set `cloud.prompt_stream: enabled` in spec.yaml) to share "
+            "your prompts with the team. Running in receive-only mode."
+        )
+    elif broadcast_requested and user_muted:
+        warn(
+            "broadcasting is muted on this machine — run `spec live unmute` "
+            "to share again. Receiving still works."
+        )
+
+    branch_filter = None
+    if branch_only:
+        from ..git import read_git_context
+
+        git = read_git_context(root)
+        branch_filter = git.branch
+        if not branch_filter:
+            warn("--branch-only set but no git branch detected; ignored.")
+
+    project_label = f"{handle}/{slug}"
+    opts = WatcherOptions(
+        project_id=project_id,
+        project_label=project_label,
+        api_base=creds.api_base,
+        access_token=creds.access_token,
+        self_user_id=self_user_id,
+        self_handle=self_handle,
+        self_name=self_name,
+        poll_interval=poll_interval if poll_interval and poll_interval > 0 else 2.0,
+        broadcast=broadcast_active,
+        receive=not no_receive,
+        mirror=mirror,
+        # Presence shares the same gates as prompt broadcasting so a
+        # user who muted Spec Live doesn't unintentionally start
+        # broadcasting their dirty file list. Receiving is always
+        # available so the local mirror still gets populated.
+        presence_enabled=broadcast_active,
+        verbose_assistant=verbose_out or manifest.prompt_stream_verbose,
+        compact_output=compact,
+        project_branch_filter=branch_filter,
+    )
+
+    if mirror:
+        dim("mirror enabled → prompts/captured/peers/")
+
+    raise SystemExit(run_watcher(root, opts))

@@ -238,6 +238,52 @@ class CloudClient:
         data = self._request("GET", f"/api/projects/{project_id}/log")
         return data or []
 
+    # -- prompt events (Spec Live) -------------------------------------
+
+    def list_prompt_events(
+        self,
+        project_id: int,
+        *,
+        since_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read recent prompt events for a project.
+
+        With ``since_id``, returns ascending events with ``id > since_id``
+        (catch-up replay). Without, returns the most recent ``limit``
+        events in descending order — what ``spec team`` uses for a
+        one-shot snapshot.
+        """
+        params: dict[str, Any] = {}
+        if since_id is not None:
+            params["since_id"] = since_id
+        if limit is not None:
+            params["limit"] = limit
+        data = self._request(
+            "GET",
+            f"/api/projects/{project_id}/prompt-events",
+            params=params or None,
+        )
+        return data or []
+
+    def post_prompt_event(
+        self,
+        project_id: int,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one observed turn to the project's live stream.
+
+        Used directly only by tests / one-off scripts; ``spec watch``
+        bypasses this method and uses ``HTTPPoster`` so it can keep a
+        long-lived ``requests.Session`` open across many POSTs without
+        the JSON-decoding round trip.
+        """
+        return self._request(
+            "POST",
+            f"/api/projects/{project_id}/prompt-events",
+            json=body,
+        )
+
     # -- branch reviews ------------------------------------------------
 
     def open_branch_review(

@@ -9,15 +9,20 @@ from .commands.add import add_cmd
 from .commands.compile import compile_cmd
 from .commands.codex import codex_group
 from .commands.git_hooks import git_hooks_group
+from .commands.hooks import hooks_group
 from .commands.init import init_cmd
+from .commands.live import live_group
 from .commands.log import log_cmd
 from .commands.login import login_cmd, logout_cmd
+from .commands.presence import presence_group
 from .commands.prompts import prompts_group
 from .commands.pull import pull_cmd
 from .commands.push import push_cmd
 from .commands.shell import shell_group
+from .commands.team import team_cmd
 from .commands.unstage import unstage_cmd
 from .commands.status import status_cmd
+from .commands.watch import watch_cmd
 
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
@@ -49,6 +54,11 @@ cli.add_command(compile_cmd)
 cli.add_command(codex_group)
 cli.add_command(prompts_group)
 cli.add_command(log_cmd)
+cli.add_command(watch_cmd)
+cli.add_command(team_cmd)
+cli.add_command(live_group)
+cli.add_command(presence_group)
+cli.add_command(hooks_group)
 
 
 def main() -> None:

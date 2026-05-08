@@ -1,0 +1,526 @@
+"""
+The ``spec watch`` orchestrator: producer + consumer.
+
+Two threads on top of a shared ``LiveCursor``:
+
+* **Producer** — every ``poll_interval`` seconds, scans local Cursor /
+  Codex / Claude Code transcripts for the bundle, finds turns that
+  haven't been broadcast yet (per the cursor), redacts them, and POSTs
+  one event per new turn to ``/api/projects/{id}/prompt-events``.
+
+* **Consumer** — holds an SSE connection on
+  ``/api/projects/{id}/prompt-stream``. For each event yielded:
+    - skip if it's an echo of our own broadcast (same ``user_id``).
+    - dispatch to :class:`Notifier` for terminal output.
+    - optionally append to the on-disk peer mirror.
+
+Both threads update the cursor and persist it. On shutdown
+(``SIGINT``, ``SIGTERM``, or ``stop_event.set()``) we drain in-flight
+work and save the cursor before exiting.
+"""
+from __future__ import annotations
+
+import logging
+import signal
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+from ..git import read_git_context
+from ..prompts.schema import Session, Turn
+from ..sources import (
+    ClaudeCodeError,
+    CodexError,
+    CursorError,
+    claude_code_store_root,
+    codex_transcript_store_available,
+    cursor_workspace_storage_root,
+    read_claude_code_sessions,
+    read_codex_sessions,
+    read_cursor_sessions,
+    redact_text,
+)
+from ..stage import historical_bundle_paths, record_bundle_path
+from ..ui import dim
+from .events import OutgoingEvent
+from .mirror import PeerMirror
+from .notifier import Notifier
+from .presence import (
+    PRESENCE_FRESHNESS_SECS,
+    LocalPresence,
+    PresenceCache,
+    compute_local_presence,
+)
+from .presence_mirror import TeamPresenceMirror
+from .tracker import LiveCursor
+from .transport import (
+    HTTPPoster,
+    SSEConsumer,
+    SSEStreamError,
+    run_consumer_in_thread,
+)
+
+log = logging.getLogger(__name__)
+
+
+# How long the producer pauses between local-transcript scans. 2s is
+# the sweet spot in practice: short enough to feel "live" (worst-case
+# 2s + network RTT), long enough that a quiet bundle costs ~nothing.
+DEFAULT_POLL_INTERVAL_SECS = 2.0
+# Presence broadcasts are far less urgent than prompt turns — git diff
+# every 15s is enough for "Alice is in auth.py" to feel instant
+# without spamming the wire while a teammate is mid-typing. The cache
+# expiry is 5 min so a missed 1-2 ticks here is invisible.
+DEFAULT_PRESENCE_INTERVAL_SECS = 15.0
+# Heartbeat for the team-presence.json mirror. We only rewrite the
+# file when the cache changed; this just bounds how often the
+# expiry sweep runs in case no events arrive but a peer aged out.
+DEFAULT_TEAM_PRESENCE_TICK_SECS = 30.0
+# How often the cursor file is fsync'd to disk during steady-state
+# operation. We always save on shutdown, but a periodic save protects
+# against a kill -9 / power loss costing more than a few seconds of
+# replays.
+CURSOR_SAVE_INTERVAL_SECS = 10.0
+# Hard cap on per-event text payload before redaction. The server caps
+# at 512 KB; we cap a hair below to avoid edge-of-frame rejections,
+# leaving room for redaction expanding text by a few bytes.
+MAX_TURN_TEXT_CHARS = 480 * 1024
+# Below this many chars, drop the turn entirely. A 0-char "user" turn
+# is almost always an artefact of an empty draft submit; we don't want
+# to flood the team feed with blanks.
+MIN_TURN_TEXT_CHARS = 1
+
+
+@dataclass
+class WatcherOptions:
+    """User-controlled toggles for ``spec watch``."""
+
+    project_id: int
+    project_label: str
+    api_base: str
+    access_token: str
+    self_user_id: int | None
+    self_handle: str | None = None
+    self_name: str | None = None
+    poll_interval: float = DEFAULT_POLL_INTERVAL_SECS
+    presence_interval: float = DEFAULT_PRESENCE_INTERVAL_SECS
+    broadcast: bool = True
+    receive: bool = True
+    mirror: bool = False
+    presence_enabled: bool = True
+    verbose_assistant: bool = False
+    compact_output: bool = False
+    project_branch_filter: str | None = None
+    user_agent: str = field(
+        default_factory=lambda: "spec-cli/live"
+    )
+
+
+def run_watcher(bundle_root: Path, opts: WatcherOptions) -> int:
+    """Run the watcher to completion (until SIGINT / SIGTERM).
+
+    Returns an exit code suitable for ``sys.exit``: 0 on graceful
+    shutdown, 1 on a fatal stream error (auth, project resolution).
+    """
+    record_bundle_path(bundle_root)
+    cursor = LiveCursor.load(bundle_root, project_id=opts.project_id)
+    cursor.project_id = opts.project_id
+
+    notifier = Notifier(compact=opts.compact_output)
+    notifier.announce_connected(opts.project_label)
+    if not opts.broadcast:
+        notifier.announce_broadcast_disabled()
+
+    stop_event = threading.Event()
+    fatal_error: list[SSEStreamError] = []
+
+    def _request_stop(*_a, **_kw) -> None:
+        stop_event.set()
+
+    # SIGINT / SIGTERM trigger graceful shutdown. We can only install
+    # signal handlers on the main thread; if the watcher is ever
+    # invoked from a worker thread (tests, embedding), the handlers
+    # are skipped — the stop_event is the authoritative knob.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, _request_stop)
+        try:
+            signal.signal(signal.SIGTERM, _request_stop)
+        except (AttributeError, ValueError):
+            pass
+
+    poster: HTTPPoster | None = None
+    consumer: SSEConsumer | None = None
+    consumer_thread: threading.Thread | None = None
+    mirror = PeerMirror(bundle_root) if opts.mirror else None
+
+    # File-level presence cache + on-disk mirror. Always wired up
+    # (receiving doesn't cost anything and the mirror is what AI
+    # tools read), but broadcasting only fires when both
+    # ``presence_enabled`` and ``broadcast`` are true so the user's
+    # opt-out flags reach this path.
+    presence_cache = PresenceCache(freshness_secs=PRESENCE_FRESHNESS_SECS)
+    team_presence = TeamPresenceMirror(bundle_root)
+    last_local_presence: list[LocalPresence] = []  # nonlocal-able mutable handle
+
+    if opts.broadcast:
+        poster = HTTPPoster(
+            opts.api_base, opts.access_token, opts.project_id, user_agent=opts.user_agent
+        )
+
+    if opts.receive:
+        consumer = SSEConsumer(
+            opts.api_base, opts.access_token, opts.project_id, user_agent=opts.user_agent
+        )
+        consumer.set_resume_cursor(cursor.last_received_id)
+
+        def _on_event(event) -> None:  # type: ignore[no-untyped-def]
+            cursor.record_received(event.id)
+            if (
+                opts.self_user_id is not None
+                and event.author_user_id == opts.self_user_id
+            ):
+                # Skip echoes of our own broadcasts. The server fans
+                # out unconditionally; the client filters. We still
+                # advanced the cursor above so the next reconnect
+                # doesn't re-receive this row.
+                return
+            if event.role == "presence":
+                # Presence updates land in the cache (and trigger a
+                # mirror rewrite below); we do NOT print them to the
+                # terminal — the dirty file list churns too much for
+                # a scrolling log to be useful, and the
+                # ``team-presence.json`` writer is the canonical
+                # surface. We'll surface a one-line "alice is now
+                # editing X" only on transitions; that's a §future
+                # polish.
+                if presence_cache.apply_event(event):
+                    _write_team_presence(opts, presence_cache, team_presence,
+                                          last_local_presence, branch_hint=event.branch)
+                return
+            notifier.show(event)
+            if mirror is not None:
+                mirror.write_event(event)
+
+        def _on_fatal(err: SSEStreamError) -> None:
+            fatal_error.append(err)
+            notifier.announce_fatal(str(err))
+            stop_event.set()
+
+        consumer_thread = run_consumer_in_thread(
+            consumer, on_event=_on_event, on_fatal=_on_fatal
+        )
+
+    last_save = time.monotonic()
+    last_presence_broadcast = 0.0
+    last_team_presence_tick = 0.0
+    last_presence_fingerprint = ""
+    try:
+        while not stop_event.is_set():
+            tick_started = time.monotonic()
+            if poster is not None:
+                try:
+                    _producer_tick(
+                        bundle_root=bundle_root,
+                        cursor=cursor,
+                        poster=poster,
+                        opts=opts,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("spec-live: producer tick error: %s", e)
+
+            now = time.monotonic()
+
+            # Presence broadcast — gated by `presence_enabled` so a
+            # user who muted Spec Live entirely doesn't ship presence
+            # either; gated by `broadcast` so a `--no-broadcast`
+            # invocation still populates the local cache + mirror
+            # without spraying outward.
+            if (
+                opts.presence_enabled
+                and poster is not None
+                and now - last_presence_broadcast >= opts.presence_interval
+            ):
+                try:
+                    local = compute_local_presence(bundle_root)
+                    last_local_presence[:] = [local]
+                    if local.fingerprint != last_presence_fingerprint:
+                        if _broadcast_presence(local, poster, opts, bundle_root):
+                            last_presence_fingerprint = local.fingerprint
+                        # Always rewrite the mirror — the local user's
+                        # snapshot has changed even if the broadcast
+                        # didn't reach the server yet.
+                        _write_team_presence(opts, presence_cache, team_presence,
+                                              last_local_presence)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("spec-live: presence tick error: %s", e)
+                last_presence_broadcast = now
+
+            # Periodic mirror tick — picks up cache expiry even if no
+            # new presence events arrive (so a peer who closed their
+            # laptop disappears from the file in bounded time).
+            if now - last_team_presence_tick >= DEFAULT_TEAM_PRESENCE_TICK_SECS:
+                _write_team_presence(opts, presence_cache, team_presence,
+                                      last_local_presence)
+                last_team_presence_tick = now
+
+            if now - last_save >= CURSOR_SAVE_INTERVAL_SECS:
+                cursor.save()
+                last_save = now
+
+            elapsed = time.monotonic() - tick_started
+            sleep_for = max(0.1, opts.poll_interval - elapsed)
+            stop_event.wait(timeout=sleep_for)
+    finally:
+        # Best-effort: broadcast a clean-state event before stopping
+        # so peers can drop our presence row immediately instead of
+        # waiting for the freshness window.
+        if opts.presence_enabled and poster is not None:
+            try:
+                empty = LocalPresence(
+                    files=[],
+                    head_commit=None,
+                    fingerprint="",
+                )
+                _broadcast_presence(empty, poster, opts, bundle_root, force_clean=True)
+            except Exception:  # noqa: BLE001
+                pass
+        cursor.save()
+        if consumer is not None:
+            consumer.stop()
+        if consumer_thread is not None:
+            consumer_thread.join(timeout=2.0)
+        if poster is not None:
+            poster.close()
+        dim("spec watch: stopped")
+
+    return 1 if fatal_error else 0
+
+
+def _write_team_presence(
+    opts: WatcherOptions,
+    cache: PresenceCache,
+    team_presence: TeamPresenceMirror,
+    last_local: list[LocalPresence],
+    *,
+    branch_hint: str | None = None,
+) -> None:
+    """Refresh ``.spec/team-presence.json`` from the cache + last
+    known local snapshot. Quiet on the happy path; logs at debug level
+    on every write so a curious user can ``--verbose`` to see when
+    the mirror is updating."""
+    try:
+        local = last_local[0] if last_local else None
+        team_presence.write(
+            cache,
+            local=local,
+            self_handle=opts.self_handle,
+            self_name=opts.self_name,
+            branch=branch_hint,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("spec-live: team-presence write skipped: %s", e)
+
+
+def _broadcast_presence(
+    local: LocalPresence,
+    poster: HTTPPoster,
+    opts: WatcherOptions,
+    bundle_root: Path,
+    *,
+    force_clean: bool = False,
+) -> bool:
+    """Build and send one presence event. Returns True on success.
+
+    ``force_clean`` is the shutdown path: even when the local
+    snapshot is empty (no diffs), the watcher wants to broadcast
+    one final clean-state event so peers' caches drop the row
+    immediately. The producer-tick path skips clean-state broadcasts
+    when the previous broadcast was already clean (no fingerprint
+    change → no work)."""
+    payload = local.to_payload()
+    if force_clean:
+        payload.is_clean = True
+
+    git = read_git_context(bundle_root)
+    branch = git.branch or None
+
+    file_count = len(payload.files)
+    total_lines = sum(f.lines_added + f.lines_removed for f in payload.files)
+    if payload.is_clean and not payload.files:
+        summary = "working tree clean"
+    elif file_count == 1:
+        f = payload.files[0]
+        summary = f"{f.path} (+{f.lines_added}/-{f.lines_removed})"
+    else:
+        summary = f"{file_count} files, +{total_lines} lines"
+
+    event = OutgoingEvent(
+        # Stable session id so the server-side dedupe (session_id +
+        # role + turn_at) doesn't pile up redundant rows for the
+        # same user across the day.
+        session_id=f"presence:{opts.project_id}",
+        source="git",
+        role="presence",
+        branch=branch,
+        commit_sha=payload.head_commit,
+        summary=summary,
+        text=None,
+        title=None,
+        cwd=str(bundle_root),
+        paths_touched=[f.path for f in payload.files][:64],
+        presence=payload,
+        turn_at=datetime.now(timezone.utc),
+    )
+    return poster.send(event)
+
+
+# ── producer logic ─────────────────────────────────────────────────
+
+
+def _producer_tick(
+    *,
+    bundle_root: Path,
+    cursor: LiveCursor,
+    poster: HTTPPoster,
+    opts: WatcherOptions,
+) -> None:
+    """One pass over local transcripts; broadcast new turns.
+
+    Quiet on the happy path. Errors at the per-source level are
+    swallowed so a transient SQLite lock on Cursor's store doesn't
+    take down the whole watcher.
+    """
+    git = read_git_context(bundle_root)
+    branch = git.branch or "detached"
+    if (
+        opts.project_branch_filter
+        and opts.project_branch_filter != branch
+    ):
+        return  # outside the filter — skip this tick entirely
+    paths = historical_bundle_paths(bundle_root)
+
+    for session in _iter_local_sessions(paths):
+        prev = cursor.turns_broadcast_for(session.id)
+        new_turns = session.turns[prev:]
+        if not new_turns:
+            continue
+
+        for offset, turn in enumerate(new_turns):
+            event = _build_outgoing(session, turn, branch=branch, git=git, opts=opts)
+            if event is None:
+                # Skip empty / undeliverable turn but still advance
+                # the cursor so we don't rescan it forever.
+                cursor.record_broadcast(session.id, prev + offset + 1)
+                continue
+            if not poster.send(event):
+                # Network blip — try this turn again next tick. Don't
+                # advance the cursor; we'd rather double-deliver
+                # (server is idempotent on session_id+role+turn_at)
+                # than skip.
+                return
+            cursor.record_broadcast(session.id, prev + offset + 1)
+
+
+def _iter_local_sessions(paths) -> Iterable[Session]:  # type: ignore[no-untyped-def]
+    """Yield freshly-read local sessions across all three adapters.
+
+    Each adapter is gated on its store existing — we never error out
+    when one isn't installed. ``verbose=True`` ensures assistant turn
+    text is available; per-event redaction / truncation happens in
+    :func:`_build_outgoing`.
+    """
+    if claude_code_store_root().exists():
+        try:
+            yield from read_claude_code_sessions(paths, since=None, verbose=True)
+        except ClaudeCodeError as e:
+            log.debug("spec-live: claude_code adapter skipped: %s", e)
+
+    if cursor_workspace_storage_root().exists():
+        try:
+            yield from read_cursor_sessions(paths, since=None, verbose=True)
+        except CursorError as e:
+            log.debug("spec-live: cursor adapter skipped: %s", e)
+
+    if codex_transcript_store_available():
+        try:
+            yield from read_codex_sessions(paths, since=None, verbose=True)
+        except CodexError as e:
+            log.debug("spec-live: codex adapter skipped: %s", e)
+
+
+def _build_outgoing(
+    session: Session,
+    turn: Turn,
+    *,
+    branch: str,
+    git,
+    opts: WatcherOptions,
+) -> OutgoingEvent | None:
+    """Convert one local :class:`Turn` into an :class:`OutgoingEvent`.
+
+    Returns ``None`` when the turn is undeliverable (empty, or assistant
+    turn with no body in non-verbose mode). The cursor still advances
+    on ``None`` so we don't keep re-considering the same empty turn.
+
+    Redaction: every text field passes through ``redact_text`` (the
+    same ``_SECRET_PATTERNS`` used for ``.prompts`` files on disk) so
+    bearer tokens, OAuth keys, etc. are never streamed.
+    """
+    role = turn.role if turn.role in ("user", "assistant") else None
+    if role is None:
+        return None
+
+    title = (session.title or "").strip() or None
+
+    if role == "user":
+        body = (turn.text or "").strip()
+        if len(body) < MIN_TURN_TEXT_CHARS:
+            return None
+        body = _truncate(redact_text(body), MAX_TURN_TEXT_CHARS)
+        summary = redact_text((turn.summary or "").strip()) or None
+        text_out: str | None = body
+    else:
+        summary = (turn.summary or "").strip() or None
+        if summary is None and (turn.text or "").strip():
+            summary = (turn.text or "").strip().splitlines()[0][:300]
+        if summary is not None:
+            summary = redact_text(summary)
+        if opts.verbose_assistant and turn.text:
+            text_out = _truncate(redact_text(turn.text.strip()), MAX_TURN_TEXT_CHARS)
+        else:
+            text_out = None
+        if not summary and not text_out:
+            return None
+
+    return OutgoingEvent(
+        session_id=session.id,
+        source=session.source if session.source in (
+            "cursor", "codex", "claude_code", "manual"
+        ) else "manual",
+        role=role,
+        branch=branch or None,
+        commit_sha=git.commit_sha if git else None,
+        model=turn.model or session.model,
+        summary=summary,
+        text=text_out,
+        title=title,
+        cwd=session.cwd,
+        paths_touched=list(session.paths_touched or []),
+        turn_at=turn.at or _now_utc(),
+    )
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n[…truncated…]"
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+__all__ = ["WatcherOptions", "run_watcher"]

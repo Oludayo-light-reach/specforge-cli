@@ -91,19 +91,23 @@ class HTTPPoster:
             }
         )
 
-    def send(self, event: OutgoingEvent) -> bool:
+    def send(self, event: OutgoingEvent, *, timeout: float | None = None) -> bool:
         """POST one event. Returns True on success, False on any error.
 
         Caller decides what to do on failure (retry next tick, advance
         the cursor anyway, etc.). For ``spec watch`` we *don't* advance
         the cursor on failure so the next poll re-attempts; eventual
         consistency is fine for telemetry.
+
+        ``timeout`` overrides :data:`POST_TIMEOUT_SECS` for this call.
+        Callers in shutdown paths use a tighter value (a few seconds)
+        so a hung server can't stall the daemon's exit.
         """
         try:
             r = self._session.post(
                 self._url,
                 json=event.to_json(),
-                timeout=POST_TIMEOUT_SECS,
+                timeout=timeout if timeout is not None else POST_TIMEOUT_SECS,
             )
         except requests.RequestException as e:
             log.warning("spec-live: post failed (network): %s", e)
@@ -155,6 +159,15 @@ class SSEConsumer:
         self._last_event_id: int | None = None
         self._retry_delay = RECONNECT_BASE_DELAY_SECS
         self._stop = threading.Event()
+        # Reference to the live ``requests.Response`` for the current
+        # connection, guarded by ``_resp_lock``. Held so :meth:`stop`
+        # can force-close the underlying socket from another thread,
+        # which makes a blocking ``iter_lines()`` raise immediately
+        # instead of waiting up to ``STREAM_READ_TIMEOUT_SECS`` for
+        # the next byte. Without this, a Ctrl+C while the stream is
+        # idle would feel hung.
+        self._resp_lock = threading.Lock()
+        self._active_response: requests.Response | None = None
 
     def set_resume_cursor(self, last_event_id: int | None) -> None:
         """Set the ``Last-Event-ID`` value to send on the next connect.
@@ -164,7 +177,25 @@ class SSEConsumer:
             self._last_event_id = last_event_id
 
     def stop(self) -> None:
+        """Tell the consumer to wind down at the next opportunity.
+
+        Idempotent and thread-safe. We set the flag *and* eagerly close
+        the active streaming response (if any) so the reader thread
+        exits at the boundary of the next ``recv`` instead of waiting
+        out the read timeout. ``requests.Response.close`` is documented
+        as safe to call from any thread — it shuts the underlying
+        socket and causes the iterator to raise, which the consumer
+        then treats as a clean stream-ended signal.
+        """
         self._stop.set()
+        with self._resp_lock:
+            resp = self._active_response
+            self._active_response = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def stream(self) -> Iterator[IncomingEvent]:
         """Yield events forever (until :meth:`stop` is called).
@@ -211,12 +242,23 @@ class SSEConsumer:
         if self._last_event_id is not None:
             headers["Last-Event-ID"] = str(self._last_event_id)
 
-        with requests.get(
+        # Bail before opening the socket if stop() raced us — we
+        # don't want to start a fresh connection only to immediately
+        # tear it down.
+        if self._stop.is_set():
+            return
+
+        resp = requests.get(
             self._url,
             headers=headers,
             stream=True,
             timeout=(STREAM_CONNECT_TIMEOUT_SECS, STREAM_READ_TIMEOUT_SECS),
-        ) as resp:
+        )
+        # Publish the live response *before* parsing so a stop() on
+        # another thread can close it mid-read.
+        with self._resp_lock:
+            self._active_response = resp
+        try:
             if resp.status_code in (401, 403):
                 raise SSEStreamError(
                     f"prompt-stream auth rejected ({resp.status_code}). "
@@ -250,6 +292,16 @@ class SSEConsumer:
                         log.debug("spec-live: dropping unparseable event: %s", e)
                         continue
                     yield event
+        finally:
+            with self._resp_lock:
+                # Clear the published reference whether we exited
+                # cleanly or via close-from-stop. ``resp.close`` is
+                # idempotent so the redundant call below is safe.
+                self._active_response = None
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _sleep_with_stop(self, secs: float) -> None:
         """Wait ``secs`` seconds, but bail early if :meth:`stop` is

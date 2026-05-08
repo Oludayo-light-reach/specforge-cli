@@ -9,7 +9,8 @@ Shape (small, forward-compat — unknown keys are preserved verbatim):
 
     {
       "schema": 1,
-      "prompt_stream": "default" | "muted"
+      "prompt_stream": "default" | "muted",
+      "autostart":     "default" | "off"
     }
 
 Why JSON, not YAML: the credentials file already uses JSON, so users
@@ -25,6 +26,11 @@ The current keys:
   defers to the manifest. The CLI never broadcasts when this is
   ``"muted"`` regardless of any ``spec.yaml`` setting; this is the
   individual-engineer kill-switch.
+
+* ``autostart`` — ``"off"`` disables the shell-hook autostart for
+  ``spec watch`` on this machine. Set by ``spec live autostart off``.
+  Default is ``"default"`` (autostart on whenever the user enters a
+  ``spec init``'d bundle in an interactive shell).
 
 Atomic writes (write-temp + rename) and tolerant reads (missing or
 malformed file = defaults). Same hygiene as ``LiveCursor`` so a kill
@@ -67,6 +73,7 @@ class Preferences:
     """
 
     prompt_stream: str = "default"  # "default" | "muted"
+    autostart: str = "default"  # "default" | "off"
     raw: dict = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -84,6 +91,18 @@ class Preferences:
         muting is the broadcasting kill-switch only.
         """
         return self.prompt_stream == "muted"
+
+    @property
+    def autostart_disabled(self) -> bool:
+        """Should the shell-hook autostart for ``spec watch`` be
+        skipped on this machine?
+
+        ``True`` means the autostart hook should fall through silently
+        regardless of bundle settings. The user can still run
+        ``spec watch`` / ``spec live start`` by hand — this only
+        suppresses the implicit fire-on-cd behaviour.
+        """
+        return self.autostart == "off"
 
     # ── factories ────────────────────────────────────────────
 
@@ -104,7 +123,12 @@ class Preferences:
             ps = prompt_stream_raw
         else:
             ps = "default"
-        return cls(prompt_stream=ps, raw=data)
+        autostart_raw = data.get("autostart")
+        if autostart_raw in ("off", "default"):
+            au = autostart_raw
+        else:
+            au = "default"
+        return cls(prompt_stream=ps, autostart=au, raw=data)
 
     # ── writes ────────────────────────────────────────────────
 
@@ -119,6 +143,7 @@ class Preferences:
         merged = dict(self.raw or {})
         merged["schema"] = PREFERENCES_SCHEMA_VERSION
         merged["prompt_stream"] = self.prompt_stream
+        merged["autostart"] = self.autostart
 
         tmp_fd, tmp_name = tempfile.mkstemp(
             prefix=f"{PREFERENCES_FILENAME}.",

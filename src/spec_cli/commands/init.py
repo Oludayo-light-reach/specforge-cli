@@ -891,11 +891,28 @@ def init_cmd(
         )
 
     if hook_reports:
+        # The labels here have to match what the hooks ACTUALLY do today
+        # (cf. `commands/git_hooks.py` and `commands/prompts.py`):
+        #   * pre-commit  — captures Cursor/Claude/Codex turns into
+        #                   `prompts/<branch>.prompts` AND mirrors
+        #                   `git add` / `git rm` into `spec add` /
+        #                   `spec unstage` for bundle-eligible files.
+        #   * commit-msg  — installed but currently a no-op stub
+        #                   (capture moved into pre-commit).
+        #   * post-commit — deprecated stub; harmless.
+        #   * pre-push    — runs `spec push` on branch-ref pushes
+        #                   (gated on `SKIP_SPEC_PUSH` and tag-only).
+        #   * post-merge  — rolls captured prompts forward across
+        #                   merges so trunk's `.prompts` file stays
+        #                   the canonical narrative.
+        # Don't lie to the user about commit-msg here; the previous
+        # message claimed it ran ``spec git-hooks commit-msg`` which
+        # was true historically but is now a no-op.
         dim(
-            "Git hooks: pre-commit → `spec git-hooks pre-commit` · "
-            "commit-msg → `spec git-hooks commit-msg` · "
-            "pre-push → `spec git-hooks pre-push` "
-            "(skip push: SKIP_SPEC_PUSH=1 or git push --no-verify)"
+            "Git hooks installed: "
+            "pre-commit (capture + mirror staging) · "
+            "pre-push (`spec push`; opt out: SKIP_SPEC_PUSH=1 or git push --no-verify) · "
+            "post-merge (prompts rollup)."
         )
         for label, hook_path, st in hook_reports:
             try:

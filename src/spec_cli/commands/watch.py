@@ -13,6 +13,8 @@ until the bundle exists in Cloud.
 """
 from __future__ import annotations
 
+import os
+
 import click
 
 from ..api import ApiError, CloudClient
@@ -25,8 +27,17 @@ from ..config import (
     parse_cloud_project,
 )
 from ..preferences import load_preferences
-from ..realtime import WatcherOptions, run_watcher
-from ..ui import dim, fatal, warn
+from ..realtime import (
+    WatcherOptions,
+    WatcherStartError,
+    is_running,
+    remove_pid_file,
+    run_watcher,
+    start_in_background,
+    watch_log_path,
+    write_pid_file,
+)
+from ..ui import dim, fatal, info, ok, warn
 
 
 @click.command("watch")
@@ -91,6 +102,28 @@ from ..ui import dim, fatal, warn
         "or a bare slug (uses your handle from saved credentials)."
     ),
 )
+@click.option(
+    "--background",
+    is_flag=True,
+    help=(
+        "Detach into the background and return immediately. The daemon "
+        "writes its PID to `.spec/watch.pid` and its output to "
+        "`.spec/watch.log`. Stop with `spec live stop`. Idempotent — "
+        "if a daemon is already running for this bundle, prints its "
+        "PID and exits 0 without spawning a duplicate."
+    ),
+)
+@click.option(
+    "--background-runner",
+    "background_runner",
+    is_flag=True,
+    hidden=True,
+    help=(
+        "Internal flag used by the autostart machinery — never set this "
+        "by hand. Marks the current process as the spawned daemon and "
+        "tells the watcher to write a PID file before entering the loop."
+    ),
+)
 def watch_cmd(
     no_broadcast: bool,
     no_receive: bool,
@@ -100,6 +133,8 @@ def watch_cmd(
     poll_interval: float | None,
     branch_only: bool,
     project: str | None,
+    background: bool,
+    background_runner: bool,
 ) -> None:
     """Stream prompts to and from your team in real time.
 
@@ -111,6 +146,10 @@ def watch_cmd(
     Requires `cloud.prompt_stream: enabled` in spec.yaml to broadcast.
     Receiving is always available to project members. Use `--mirror`
     to also drop incoming peer events into a local file you can grep.
+
+    By default this runs in the foreground; pass `--background` to
+    detach into a background daemon you can manage with `spec live
+    start/stop/status`.
     """
     if no_broadcast and no_receive:
         fatal(
@@ -118,11 +157,39 @@ def watch_cmd(
             "Drop one of the flags."
         )
         return
+    if background and background_runner:
+        # Defensive: nothing prevents a curious user from passing both,
+        # but the combination is meaningless — ``--background`` spawns
+        # a child that *itself* runs ``--background-runner``.
+        fatal("--background and --background-runner are mutually exclusive.")
+        return
 
     try:
         root = find_bundle_root()
     except BundleNotFoundError as e:
         fatal(str(e))
+        return
+
+    if background:
+        # User asked us to fork+detach. Do that and return — the child
+        # carries the actual `run_watcher` call.
+        try:
+            outcome = start_in_background(root)
+        except WatcherStartError as e:
+            fatal(str(e))
+            return
+        if outcome.already_running:
+            info(
+                f"spec live: already running for this bundle (pid {outcome.pid})."
+            )
+            dim(f"  log: {outcome.log_path}")
+            dim("  stop with `spec live stop`")
+        else:
+            ok(
+                f"spec live: started in background (pid {outcome.pid})."
+            )
+            dim(f"  log: {outcome.log_path}")
+            dim("  stop with `spec live stop` · status: `spec live status`")
         return
 
     manifest = load_manifest(root)
@@ -243,5 +310,40 @@ def watch_cmd(
 
     if mirror:
         dim("mirror enabled → prompts/captured/peers/")
+
+    if background_runner:
+        # We are the spawned daemon. Two extra responsibilities vs. the
+        # foreground path:
+        #   1. Refuse if another daemon is already alive for this
+        #      bundle — protects against double-fork races where the
+        #      autostart hook fires twice.
+        #   2. Write the PID file BEFORE entering the main loop so the
+        #      parent that spawned us can confirm a successful start
+        #      via the file appearing on disk.
+        # The PID file is removed in a ``finally`` block so a clean
+        # exit leaves no stale marker. A kill -9 won't run the
+        # finally; ``is_running`` handles that case via ``kill(pid, 0)``
+        # on the next ensure() call.
+        existing = is_running(root)
+        if existing is not None:
+            sys_msg = (
+                f"spec live: another daemon is already running for this bundle "
+                f"(pid {existing.pid}); refusing to start a duplicate.\n"
+            )
+            click.echo(sys_msg, err=True)
+            raise SystemExit(0)
+
+        log_p = watch_log_path(root)
+        try:
+            write_pid_file(root, pid=os.getpid(), log_path=log_p)
+        except OSError as e:
+            fatal(f"Could not write PID file at {log_p.parent}: {e}")
+            return
+
+        try:
+            exit_code = run_watcher(root, opts)
+        finally:
+            remove_pid_file(root)
+        raise SystemExit(exit_code)
 
     raise SystemExit(run_watcher(root, opts))

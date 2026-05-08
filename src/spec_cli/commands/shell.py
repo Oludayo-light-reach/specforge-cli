@@ -1,23 +1,38 @@
-"""`spec shell` — manage the `git init` → `spec init` shell wrapper.
+"""`spec shell` — manage Spec's shell integrations.
+
+Two integrations live in the same rc-file block:
+
+1. **``git init`` → ``spec init``** wrapper. Git has no post-init hook;
+   wrapping the user's ``git`` shell function is the only way to make
+   ``spec init`` run alongside ``git init`` for fresh repos.
+2. **Autostart hook** for ``spec live``. Fires ``spec live ensure
+   --quiet`` from the shell's prompt-render hook (zsh ``precmd``,
+   bash ``PROMPT_COMMAND``, fish ``__fish_preexec``-class event)
+   so the watcher daemon "flicks on" the moment the user is
+   prompting inside a ``spec init``'d folder. Idempotent — the
+   ensure command short-circuits in <10ms when a daemon is already
+   running.
 
 The curl installer (``install.sh``) runs ``spec shell install`` for you,
 so most users never type these commands directly. They exist for users
 on the manual-install path, for switching shells, for auditing the
 wrapper text, and for clean uninstallation.
 
-Git itself has no post-init hook: the only way to make ``spec init`` run
-"alongside" ``git init`` is to wrap the ``git`` command in the user's
-interactive shell. ``spec shell install`` writes a tiny POSIX shell
-function into the user's rc file between sentinel markers (same pattern
-as the git-hooks installer) so the wrapper is idempotent and removable.
+The combined block is bracketed by the same sentinels as before, so
+``spec shell uninstall`` removes both integrations in one step. No
+opt-out flag is needed for autostart at install time — set
+``SPEC_NO_AUTOSTART=1`` in your environment, run ``spec live
+autostart off``, or remove the rc-file block entirely.
 
-The wrapper is deliberately conservative:
+The wrappers are deliberately conservative:
 
-* Only acts when the first argument is ``init``.
-* Skips ``--bare`` / ``--shared=*`` (those aren't bundle targets).
-* Skips when ``spec.yaml`` already exists at the target dir.
-* Preserves git's exit code regardless of what the spec init step does.
-* Falls back to the unwrapped ``git`` if the ``spec`` binary is gone.
+* ``git`` wrapper only acts when the first argument is ``init``,
+  skips ``--bare`` / ``--shared=*``, skips when ``spec.yaml``
+  already exists, and preserves git's exit code.
+* Autostart hook bails on the fast path the moment ``$PWD`` doesn't
+  contain a ``spec.yaml`` — saves ~50ms on every shell prompt for
+  users in a non-Spec directory.
+* Both fall back gracefully if the ``spec`` binary is missing.
 """
 
 from __future__ import annotations
@@ -39,13 +54,24 @@ SHELL_INTEGRATION_END: str = "# <<< spec shell integration <<<"
 # clobber anything the user may have. The ``return $__spec_rc`` line
 # preserves git's own exit code so callers like ``git init &&
 # something`` keep behaving as before.
+#
+# The autostart hook below is wired into the right per-shell prompt
+# event so it fires once per *prompt render*, not once per command.
+# Walking up to find ``spec.yaml`` is bounded by the depth of the
+# directory tree (~10 stat calls in the worst case) and we abort
+# the moment we cross the home directory, so the fast path is fast.
 SHELL_INTEGRATION_BODY_BASH_ZSH: str = f"""\
 {SHELL_INTEGRATION_BEGIN}
-# Auto-installed by `spec shell install`. Wraps `git init` so a fresh
-# Spec bundle is scaffolded in the same directory immediately after the
-# git worktree is created. Idempotent: skipped when `spec.yaml` already
-# exists at the target. Remove this whole block (sentinels included)
-# or run `spec shell uninstall` to opt out.
+# Auto-installed by `spec shell install`. Two integrations:
+#   1. Wraps `git init` so a fresh Spec bundle is scaffolded
+#      immediately. Skipped when `spec.yaml` already exists at the
+#      target.
+#   2. Auto-starts `spec watch` in the background the first time you
+#      prompt inside a `spec init`'d bundle each shell session. The
+#      daemon is idempotent and runs `spec live ensure --quiet`,
+#      which is a no-op in 99% of prompts. Disable on this machine
+#      with `spec live autostart off` or `export SPEC_NO_AUTOSTART=1`;
+#      remove entirely with `spec shell uninstall`.
 git() {{
   command git "$@"
   local __spec_rc=$?
@@ -66,17 +92,85 @@ git() {{
   fi
   return $__spec_rc
 }}
+
+# Walk up from $PWD looking for spec.yaml; print the bundle root or
+# nothing. Bounded at $HOME so a stray pwd inside / doesn't ever
+# stat a thousand directories. Pure POSIX — no GNU-isms.
+__spec_find_bundle_root() {{
+  local __spec_dir="$PWD"
+  local __spec_home="${{HOME:-/}}"
+  local __spec_steps=0
+  while [ -n "$__spec_dir" ] && [ "$__spec_dir" != "/" ]; do
+    if [ -f "$__spec_dir/spec.yaml" ]; then
+      printf '%s\\n' "$__spec_dir"
+      return 0
+    fi
+    if [ "$__spec_dir" = "$__spec_home" ]; then
+      return 1
+    fi
+    __spec_steps=$((__spec_steps + 1))
+    if [ $__spec_steps -gt 32 ]; then
+      return 1
+    fi
+    __spec_dir="$(dirname "$__spec_dir")"
+  done
+  return 1
+}}
+
+# The actual autostart kick. Runs once per *bundle root* per shell
+# session — once you've kicked off the daemon for ~/work/foo, we
+# never call ``spec live ensure`` for that root again unless you cd
+# out and back in to a different bundle.
+__SPEC_LIVE_ENSURED=""
+__spec_live_autostart() {{
+  # Honour env opt-out and sigil "shut up" knob without spawning
+  # spec at all. Both checks are cheap.
+  if [ "${{SPEC_NO_AUTOSTART:-0}}" = "1" ]; then return 0; fi
+  command -v spec >/dev/null 2>&1 || return 0
+  local __spec_root
+  __spec_root="$(__spec_find_bundle_root)" || return 0
+  if [ -z "$__spec_root" ]; then return 0; fi
+  if [ "$__spec_root" = "$__SPEC_LIVE_ENSURED" ]; then return 0; fi
+  __SPEC_LIVE_ENSURED="$__spec_root"
+  ( cd "$__spec_root" && spec live ensure --quiet </dev/null >/dev/null 2>&1 & ) >/dev/null 2>&1
+}}
+
+# Wire into the right per-shell prompt event. zsh has a native
+# precmd-functions hook; bash uses PROMPT_COMMAND. Both fire once per
+# prompt render — exactly when the user is about to type / has just
+# returned from running something. We append ourselves so user
+# customisations are preserved.
+if [ -n "${{ZSH_VERSION:-}}" ]; then
+  if ! typeset -p precmd_functions >/dev/null 2>&1; then
+    typeset -ga precmd_functions
+  fi
+  case " ${{precmd_functions[*]}} " in
+    *' __spec_live_autostart '*) ;;
+    *) precmd_functions+=( __spec_live_autostart ) ;;
+  esac
+elif [ -n "${{BASH_VERSION:-}}" ]; then
+  case ";${{PROMPT_COMMAND:-}};" in
+    *';__spec_live_autostart;'*) ;;
+    *) PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND;}}__spec_live_autostart" ;;
+  esac
+fi
 {SHELL_INTEGRATION_END}
 """
 
 
 # Fish has its own grammar; we ship the same semantics rewritten in
-# fish so users on fish aren't second-class.
+# fish so users on fish aren't second-class. The autostart side uses
+# fish's ``--on-event fish_prompt`` event so we hook the same render
+# moment the bash/zsh ``PROMPT_COMMAND``/``precmd`` paths do.
 SHELL_INTEGRATION_BODY_FISH: str = f"""\
 {SHELL_INTEGRATION_BEGIN}
-# Auto-installed by `spec shell install`. Wraps `git init` so a fresh
-# Spec bundle is scaffolded in the same directory immediately after the
-# git worktree is created. Run `spec shell uninstall` to remove.
+# Auto-installed by `spec shell install`. Two integrations:
+#   1. Wraps `git init` so a fresh Spec bundle is scaffolded
+#      in the same directory immediately after the git worktree.
+#   2. Auto-starts `spec watch` in the background the first time you
+#      prompt inside a `spec init`'d bundle each shell session.
+# Run `spec shell uninstall` to remove. Disable autostart only with
+# `spec live autostart off` or `set -x SPEC_NO_AUTOSTART 1`.
 function git
     command git $argv
     set -l __spec_rc $status
@@ -99,6 +193,47 @@ function git
         end
     end
     return $__spec_rc
+end
+
+function __spec_find_bundle_root
+    set -l __spec_dir $PWD
+    set -l __spec_home $HOME
+    set -l __spec_steps 0
+    while test -n "$__spec_dir"; and test "$__spec_dir" != "/"
+        if test -f "$__spec_dir/spec.yaml"
+            echo $__spec_dir
+            return 0
+        end
+        if test "$__spec_dir" = "$__spec_home"
+            return 1
+        end
+        set __spec_steps (math $__spec_steps + 1)
+        if test $__spec_steps -gt 32
+            return 1
+        end
+        set __spec_dir (dirname $__spec_dir)
+    end
+    return 1
+end
+
+set -g __SPEC_LIVE_ENSURED ""
+function __spec_live_autostart --on-event fish_prompt
+    if test "$SPEC_NO_AUTOSTART" = "1"
+        return 0
+    end
+    if not type -q spec
+        return 0
+    end
+    set -l __spec_root (__spec_find_bundle_root)
+    if test -z "$__spec_root"
+        return 0
+    end
+    if test "$__spec_root" = "$__SPEC_LIVE_ENSURED"
+        return 0
+    end
+    set -g __SPEC_LIVE_ENSURED $__spec_root
+    fish -c "cd $__spec_root; and spec live ensure --quiet" </dev/null >/dev/null 2>&1 &
+    disown
 end
 {SHELL_INTEGRATION_END}
 """

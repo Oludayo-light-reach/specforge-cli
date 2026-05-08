@@ -119,11 +119,24 @@ class WatcherOptions:
     )
 
 
-def run_watcher(bundle_root: Path, opts: WatcherOptions) -> int:
+def run_watcher(
+    bundle_root: Path,
+    opts: WatcherOptions,
+    *,
+    stop_event: threading.Event | None = None,
+) -> int:
     """Run the watcher to completion (until SIGINT / SIGTERM).
 
     Returns an exit code suitable for ``sys.exit``: 0 on graceful
     shutdown, 1 on a fatal stream error (auth, project resolution).
+
+    ``stop_event`` is an optional externally-owned ``threading.Event``
+    the caller can set to request a graceful shutdown without going
+    through SIGINT. Used by tests (so we don't have to send real
+    signals to the test runner) and by embedding code that runs the
+    watcher inside another process and wants its own stop knob.
+    The internal SIGINT/SIGTERM handlers always set this same event,
+    so external callers and signal handlers compose cleanly.
     """
     record_bundle_path(bundle_root)
     cursor = LiveCursor.load(bundle_root, project_id=opts.project_id)
@@ -134,17 +147,56 @@ def run_watcher(bundle_root: Path, opts: WatcherOptions) -> int:
     if not opts.broadcast:
         notifier.announce_broadcast_disabled()
 
-    stop_event = threading.Event()
+    if stop_event is None:
+        stop_event = threading.Event()
     fatal_error: list[SSEStreamError] = []
 
-    def _request_stop(*_a, **_kw) -> None:
-        stop_event.set()
+    # Two-stage Ctrl+C convention:
+    #   1st SIGINT → request graceful shutdown (set ``stop_event``,
+    #                tell the user we're winding down, restore the
+    #                default SIGINT handler).
+    #   2nd SIGINT → default handler raises ``KeyboardInterrupt`` and
+    #                aborts whatever cleanup step is still running.
+    # Without the second stage, a slow shutdown step (a hung POST, a
+    # network partition during the final clean-state broadcast) would
+    # leave the user with no escape hatch — pressing Ctrl+C again
+    # would silently re-enter ``_request_stop`` and do nothing.
+    is_main_thread = threading.current_thread() is threading.main_thread()
+    original_sigint = signal.getsignal(signal.SIGINT) if is_main_thread else None
+    original_sigterm = (
+        signal.getsignal(signal.SIGTERM) if is_main_thread else None
+    )
 
-    # SIGINT / SIGTERM trigger graceful shutdown. We can only install
-    # signal handlers on the main thread; if the watcher is ever
-    # invoked from a worker thread (tests, embedding), the handlers
-    # are skipped — the stop_event is the authoritative knob.
-    if threading.current_thread() is threading.main_thread():
+    def _request_stop(*_a, **_kw) -> None:
+        if not stop_event.is_set():
+            stop_event.set()
+            try:
+                # Stderr so the message appears even if stdout is
+                # buffered (Rich, pipe to file, etc.). Best-effort:
+                # if even the dim-write fails, we just keep going.
+                dim(
+                    "spec watch: shutting down… (press Ctrl+C again to force quit)"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # Restore the platform default so a second Ctrl+C aborts
+            # any blocking cleanup step. This is the standard "press
+            # twice to escape" UX for long-running daemons.
+            if is_main_thread:
+                try:
+                    signal.signal(signal.SIGINT, signal.default_int_handler)
+                except (AttributeError, ValueError):
+                    pass
+                try:
+                    signal.signal(signal.SIGTERM, signal.default_int_handler)
+                except (AttributeError, ValueError):
+                    pass
+
+    # We can only install signal handlers on the main thread; if the
+    # watcher is ever invoked from a worker thread (tests, embedding),
+    # the handlers are skipped — the ``stop_event`` is still the
+    # authoritative knob.
+    if is_main_thread:
         signal.signal(signal.SIGINT, _request_stop)
         try:
             signal.signal(signal.SIGTERM, _request_stop)
@@ -227,6 +279,7 @@ def run_watcher(bundle_root: Path, opts: WatcherOptions) -> int:
                         cursor=cursor,
                         poster=poster,
                         opts=opts,
+                        stop_event=stop_event,
                     )
                 except Exception as e:  # noqa: BLE001
                     log.warning("spec-live: producer tick error: %s", e)
@@ -274,9 +327,24 @@ def run_watcher(bundle_root: Path, opts: WatcherOptions) -> int:
             sleep_for = max(0.1, opts.poll_interval - elapsed)
             stop_event.wait(timeout=sleep_for)
     finally:
+        # Tear down in an order that maximises responsiveness to a
+        # second Ctrl+C: stop the consumer FIRST (so the SSE socket
+        # closes and the receiver thread exits), then do best-effort
+        # network cleanup, then save the cursor. The consumer thread
+        # is a daemon, so even if join() times out we won't block
+        # process exit.
+        if consumer is not None:
+            consumer.stop()
+        if consumer_thread is not None:
+            consumer_thread.join(timeout=1.5)
+
         # Best-effort: broadcast a clean-state event before stopping
         # so peers can drop our presence row immediately instead of
-        # waiting for the freshness window.
+        # waiting for the freshness window. We use a tight 3s timeout
+        # here (vs. the default 15s) so a slow / dead network can't
+        # stall the daemon's exit. If we miss the broadcast, peers'
+        # caches still expire after the freshness window — annoying
+        # but correct.
         if opts.presence_enabled and poster is not None:
             try:
                 empty = LocalPresence(
@@ -284,16 +352,32 @@ def run_watcher(bundle_root: Path, opts: WatcherOptions) -> int:
                     head_commit=None,
                     fingerprint="",
                 )
-                _broadcast_presence(empty, poster, opts, bundle_root, force_clean=True)
+                _broadcast_presence(
+                    empty,
+                    poster,
+                    opts,
+                    bundle_root,
+                    force_clean=True,
+                    timeout=3.0,
+                )
             except Exception:  # noqa: BLE001
                 pass
         cursor.save()
-        if consumer is not None:
-            consumer.stop()
-        if consumer_thread is not None:
-            consumer_thread.join(timeout=2.0)
         if poster is not None:
             poster.close()
+        # Restore the signal handlers we replaced so a host process
+        # (tests, embedding) sees its original behaviour after the
+        # watcher returns.
+        if is_main_thread:
+            try:
+                signal.signal(signal.SIGINT, original_sigint or signal.default_int_handler)
+            except (AttributeError, ValueError, TypeError):
+                pass
+            try:
+                if original_sigterm is not None:
+                    signal.signal(signal.SIGTERM, original_sigterm)
+            except (AttributeError, ValueError, TypeError):
+                pass
         dim("spec watch: stopped")
 
     return 1 if fatal_error else 0
@@ -331,6 +415,7 @@ def _broadcast_presence(
     bundle_root: Path,
     *,
     force_clean: bool = False,
+    timeout: float | None = None,
 ) -> bool:
     """Build and send one presence event. Returns True on success.
 
@@ -339,7 +424,12 @@ def _broadcast_presence(
     one final clean-state event so peers' caches drop the row
     immediately. The producer-tick path skips clean-state broadcasts
     when the previous broadcast was already clean (no fingerprint
-    change → no work)."""
+    change → no work).
+
+    ``timeout`` overrides the default POST timeout for this call —
+    the shutdown path uses a tight value so a slow network doesn't
+    stall the daemon's exit.
+    """
     payload = local.to_payload()
     if force_clean:
         payload.is_clean = True
@@ -374,7 +464,7 @@ def _broadcast_presence(
         presence=payload,
         turn_at=datetime.now(timezone.utc),
     )
-    return poster.send(event)
+    return poster.send(event, timeout=timeout)
 
 
 # ── producer logic ─────────────────────────────────────────────────
@@ -386,13 +476,23 @@ def _producer_tick(
     cursor: LiveCursor,
     poster: HTTPPoster,
     opts: WatcherOptions,
+    stop_event: threading.Event,
 ) -> None:
     """One pass over local transcripts; broadcast new turns.
 
     Quiet on the happy path. Errors at the per-source level are
     swallowed so a transient SQLite lock on Cursor's store doesn't
     take down the whole watcher.
+
+    Honours ``stop_event`` between every session and every turn so a
+    Ctrl+C can break out within a single network RTT, even when the
+    tick is mid-way through a backlog of dozens of turns. Each
+    ``poster.send`` is a 15s-timeout HTTP call; without these checks
+    a fresh ``spec watch`` against a long-quiet bundle could spend
+    minutes ignoring the user's Ctrl+C.
     """
+    if stop_event.is_set():
+        return
     git = read_git_context(bundle_root)
     branch = git.branch or "detached"
     if (
@@ -403,12 +503,16 @@ def _producer_tick(
     paths = historical_bundle_paths(bundle_root)
 
     for session in _iter_local_sessions(paths):
+        if stop_event.is_set():
+            return
         prev = cursor.turns_broadcast_for(session.id)
         new_turns = session.turns[prev:]
         if not new_turns:
             continue
 
         for offset, turn in enumerate(new_turns):
+            if stop_event.is_set():
+                return
             event = _build_outgoing(session, turn, branch=branch, git=git, opts=opts)
             if event is None:
                 # Skip empty / undeliverable turn but still advance

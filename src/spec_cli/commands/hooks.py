@@ -343,9 +343,29 @@ def install_claude_settings(bundle_root: Path, *, block_mode: bool) -> Path:
                  }
                ]
              }
+           ],
+           "UserPromptSubmit": [
+             {
+               "hooks": [
+                 {
+                   "type": "command",
+                   "command": "spec live ensure --quiet",
+                   "spec_managed": true,
+                   "spec_version": 1
+                 }
+               ]
+             }
            ]
          }
        }
+
+    Two hooks today, both Spec-managed:
+
+    * ``PreToolUse`` — warn (or block, with ``--block``) before Claude
+      edits a file a teammate is currently in.
+    * ``UserPromptSubmit`` — autostart the live watcher daemon on the
+      user's first prompt of each Claude session, so receiving works
+      even for Claude-only users who never open a terminal.
 
     The ``spec_managed`` / ``spec_version`` markers are how we identify
     the entry on subsequent runs — anything else under ``hooks`` is
@@ -370,32 +390,68 @@ def install_claude_settings(bundle_root: Path, *, block_mode: bool) -> Path:
         hooks_section = {}
         existing["hooks"] = hooks_section
 
+    # ── PreToolUse: presence-warning hook ──────────────────────────
     pre_tool_use = hooks_section.get("PreToolUse")
     if not isinstance(pre_tool_use, list):
         pre_tool_use = []
         hooks_section["PreToolUse"] = pre_tool_use
 
-    command = "spec hooks claude-pre-tool-use"
+    pre_command = "spec hooks claude-pre-tool-use"
     if block_mode:
-        command += " --block"
+        pre_command += " --block"
 
-    spec_block = {
+    pre_block = {
         "matcher": "Edit|MultiEdit|Write|NotebookEdit",
         "hooks": [
             {
                 "type": "command",
-                "command": command,
+                "command": pre_command,
                 "spec_managed": True,
                 "spec_version": CLAUDE_HOOK_VERSION,
             }
         ],
     }
+    hooks_section["PreToolUse"] = _replace_spec_managed(pre_tool_use, pre_block)
 
-    # Replace any existing Spec-managed PreToolUse entry; leave the
-    # rest. We identify our own by walking each ``matcher`` block's
-    # ``hooks`` list for the marker.
+    # ── UserPromptSubmit: autostart hook ───────────────────────────
+    # The autostart command bails fast on opt-out / not-in-bundle —
+    # quietly OK to fire from every Claude prompt. When Claude is
+    # the user's only IDE (no terminal in front of them), this is
+    # the path that actually starts the daemon for them.
+    user_prompt_submit = hooks_section.get("UserPromptSubmit")
+    if not isinstance(user_prompt_submit, list):
+        user_prompt_submit = []
+        hooks_section["UserPromptSubmit"] = user_prompt_submit
+
+    autostart_block = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": "spec live ensure --quiet",
+                "spec_managed": True,
+                "spec_version": CLAUDE_HOOK_VERSION,
+            }
+        ],
+    }
+    hooks_section["UserPromptSubmit"] = _replace_spec_managed(
+        user_prompt_submit, autostart_block
+    )
+
+    settings_path.write_text(
+        json.dumps(existing, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return settings_path
+
+
+def _replace_spec_managed(existing: list, new_block: dict) -> list:
+    """Replace any Spec-managed entry in a Claude hook list, preserving
+    everything else. Used by both ``PreToolUse`` and
+    ``UserPromptSubmit`` slots so re-running ``install-claude``
+    bumps Spec's blocks in place without touching user-authored ones.
+    """
     pruned: list = []
-    for entry in pre_tool_use:
+    for entry in existing:
         if not isinstance(entry, dict):
             pruned.append(entry)
             continue
@@ -408,11 +464,5 @@ def install_claude_settings(bundle_root: Path, *, block_mode: bool) -> Path:
         )
         if not is_spec:
             pruned.append(entry)
-    pruned.append(spec_block)
-    hooks_section["PreToolUse"] = pruned
-
-    settings_path.write_text(
-        json.dumps(existing, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return settings_path
+    pruned.append(new_block)
+    return pruned

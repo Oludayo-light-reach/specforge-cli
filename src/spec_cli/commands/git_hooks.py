@@ -249,6 +249,13 @@ def run_git_hook_pre_commit() -> None:
        file but git ignored the change because the tree was already
        built. The user then had to commit twice. See
        :func:`run_capture_for_pre_commit_hook` for the design notes.
+
+    Emits a single summary line (``spec: <changes>``) at the end so a
+    user running ``git commit`` can actually *see* Spec doing its job;
+    silent on a no-op commit (no captures, no bundle-eligible paths in
+    the index). Visibility was the gap behind multiple "I committed but
+    nothing seemed to happen on the spec side" reports — the work was
+    happening, the user just couldn't see it.
     """
     top = repo_toplevel(Path.cwd())
     if top is None:
@@ -267,6 +274,10 @@ def run_git_hook_pre_commit() -> None:
         manifest = {}
     prefix = _spec_cmd_prefix()
 
+    # Summary counters — what the user gets to see at the end.
+    n_added = 0
+    n_unstaged = 0
+
     for status, path1, path2 in _iter_git_diff_cached_name_status(top):
         if not status:
             continue
@@ -278,8 +289,10 @@ def run_git_hook_pre_commit() -> None:
             new_inner = _repo_relative_path_under_bundle(top, bundle, path2)
             if kind == "R" and old_inner and _hook_should_drop_from_spec_index(old_inner, manifest):
                 _run_spec(bundle, prefix, "unstage", old_inner, timeout=60)
+                n_unstaged += 1
             if new_inner and _hook_should_spec_add(bundle, new_inner, manifest):
                 _run_spec(bundle, prefix, "add", new_inner)
+                n_added += 1
             continue
 
         if kind == "D":
@@ -288,6 +301,7 @@ def run_git_hook_pre_commit() -> None:
                 continue
             if _hook_should_drop_from_spec_index(inner, manifest):
                 _run_spec(bundle, prefix, "unstage", inner, timeout=60)
+                n_unstaged += 1
             continue
 
         # A/M/T/… — single-path updates (added, modified, type-change).
@@ -296,6 +310,22 @@ def run_git_hook_pre_commit() -> None:
             continue
         if _hook_should_spec_add(bundle, inner, manifest):
             _run_spec(bundle, prefix, "add", inner)
+            n_added += 1
+
+    if n_added or n_unstaged:
+        # One line on stderr — visible alongside git's own output but
+        # doesn't pollute things like `git commit -m "foo" 2>/dev/null`.
+        # ``console.print`` would respect Rich theming, but pre-commit
+        # may run under environments where Rich's autodetect mis-fires
+        # (cron-like git GUIs); a plain print to stderr is the lowest-
+        # common-denominator that the user always sees.
+        bits: list[str] = []
+        if n_added:
+            bits.append(f"+{n_added} staged")
+        if n_unstaged:
+            bits.append(f"-{n_unstaged} unstaged")
+        sys.stderr.write(f"spec: {' · '.join(bits)} (mirrored from git index)\n")
+        sys.stderr.flush()
 
 
 def run_git_hook_commit_msg(commit_msg_file: str) -> None:

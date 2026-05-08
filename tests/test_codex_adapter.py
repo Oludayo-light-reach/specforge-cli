@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
+from click.testing import CliRunner
+
+from spec_cli.cli import cli
+from spec_cli.prompts import read_prompts_file
 from spec_cli.sources.codex import encode_bundle_path, read_codex_sessions
+from spec_cli.sources.codex import (
+    list_recent_codex_sessions,
+    read_codex_rollout_session,
+    redact_text,
+)
 
 
 def _write_transcript(
@@ -54,7 +64,10 @@ def test_read_codex_sessions_extracts_turns(tmp_path, monkeypatch):
                 "role": "assistant",
                 "message": {
                     "content": [
-                            {"type": "text", "text": "Mapping call sites first. Then I will refactor."}
+                            {
+                                "type": "text",
+                                "text": "Mapping call sites first. Then I will refactor.",
+                            }
                     ]
                 },
             },
@@ -146,3 +159,211 @@ def test_read_codex_sessions_honors_cursor_home_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
     sessions = list(read_codex_sessions(bundle))
     assert [s.id for s in sessions] == [sid]
+
+
+def _write_rollout(path: Path, *, sid: str, cwd: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "timestamp": "2026-05-08T08:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": sid,
+                "cwd": str(cwd),
+                "model": "gpt-5.5",
+            },
+        },
+        {
+            "timestamp": "2026-05-08T08:01:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "Capture this Codex chat. Authorization: Bearer secret-token",
+            },
+        },
+        {
+            "timestamp": "2026-05-08T08:02:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Done. I will write the prompts file.",
+                    }
+                ],
+            },
+        },
+    ]
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _write_codex_state(home: Path, *, sid: str, title: str, cwd: Path, rollout: Path) -> None:
+    db = home / "state_5.sqlite"
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            model_provider TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            title TEXT NOT NULL,
+            sandbox_policy TEXT NOT NULL,
+            approval_mode TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER,
+            model TEXT
+        )
+        """
+    )
+    con.execute(
+        """
+        INSERT INTO threads (
+            id, rollout_path, created_at, updated_at, source, model_provider,
+            cwd, title, sandbox_policy, approval_mode, archived, updated_at_ms, model
+        ) VALUES (?, ?, 1, 1, 'vscode', 'openai', ?, ?, '', '', 0, ?, ?)
+        """,
+        (sid, str(rollout), str(cwd), title, 1778227200000, "gpt-5.5"),
+    )
+    con.commit()
+    con.close()
+
+
+def test_read_codex_rollout_session_extracts_and_redacts(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sid = "019e0000-0000-7000-9000-000000000000"
+    rollout = tmp_path / "rollout.jsonl"
+    _write_rollout(rollout, sid=sid, cwd=bundle)
+
+    session = read_codex_rollout_session(rollout, verbose=True)
+
+    assert session is not None
+    assert session.id == sid
+    assert session.source == "codex"
+    assert session.cwd == str(bundle)
+    assert session.model == "gpt-5.5"
+    assert [t.role for t in session.turns] == ["user", "assistant"]
+    assert "secret-token" not in session.turns[0].text
+    assert "Authorization: Bearer [REDACTED]" in session.turns[0].text
+    assert session.turns[1].text == "Done. I will write the prompts file."
+
+
+def test_list_recent_codex_sessions_from_state_db(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sid = "019e1111-1111-7111-9111-111111111111"
+    rollout = home / "sessions" / "2026" / "05" / "08" / "rollout.jsonl"
+    _write_rollout(rollout, sid=sid, cwd=bundle)
+    _write_codex_state(home, sid=sid, title="Capture current chat", cwd=bundle, rollout=rollout)
+    monkeypatch.setenv("CODEX_CLI_HOME", str(home))
+
+    recent = list_recent_codex_sessions(bundle)
+
+    assert len(recent) == 1
+    assert recent[0].id == sid
+    assert recent[0].title == "Capture current chat"
+    assert recent[0].turn_count == 2
+
+
+def test_read_codex_sessions_includes_codex_desktop_rollouts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sid = "019e1333-1111-7111-9111-111111111111"
+    rollout = home / "sessions" / "2026" / "05" / "08" / "rollout.jsonl"
+    _write_rollout(rollout, sid=sid, cwd=bundle)
+    _write_codex_state(home, sid=sid, title="Desktop auto capture", cwd=bundle, rollout=rollout)
+    monkeypatch.setenv("CODEX_CLI_HOME", str(home))
+
+    sessions = list(read_codex_sessions(bundle, verbose=True))
+
+    assert len(sessions) == 1
+    assert sessions[0].id == sid
+    assert sessions[0].source == "codex"
+    assert sessions[0].title == "Desktop auto capture"
+
+
+def test_redact_text_common_secret_patterns() -> None:
+    text = "api_key=abc123 Authorization: Bearer token123 sk-abcdefghijklmnopqrstuvwxyz"
+    redacted = redact_text(text)
+    assert "abc123" not in redacted
+    assert "token123" not in redacted
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in redacted
+
+
+def test_codex_capture_command_imports_selected_recent_chat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "spec.yaml").write_text(
+        'schema: "spec/v0.1"\nname: Test\nspec:\n  entry: docs/product.md\n',
+        encoding="utf-8",
+    )
+    sid = "019e2222-2222-7222-9222-222222222222"
+    rollout = home / "sessions" / "2026" / "05" / "08" / "rollout.jsonl"
+    _write_rollout(rollout, sid=sid, cwd=bundle)
+    _write_codex_state(home, sid=sid, title="Codex capture command", cwd=bundle, rollout=rollout)
+    monkeypatch.setenv("CODEX_CLI_HOME", str(home))
+    monkeypatch.chdir(bundle)
+
+    result = CliRunner().invoke(
+        cli,
+        ["codex", "capture", "--index", "1"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    dest = bundle / "prompts" / "detached.prompts"
+    pf = read_prompts_file(dest)
+    assert len(pf.sessions) == 1
+    assert pf.sessions[0].id == sid
+    assert pf.sessions[0].source == "codex"
+    assert pf.sessions[0].title == "Codex capture command"
+
+
+def test_prompts_capture_source_codex_reads_desktop_rollouts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "spec.yaml").write_text(
+        'schema: "spec/v0.1"\nname: Test\nspec:\n  entry: docs/product.md\n',
+        encoding="utf-8",
+    )
+    sid = "019e3333-3333-7333-9333-333333333333"
+    rollout = home / "sessions" / "2026" / "05" / "08" / "rollout.jsonl"
+    _write_rollout(rollout, sid=sid, cwd=bundle)
+    _write_codex_state(home, sid=sid, title="All-source capture", cwd=bundle, rollout=rollout)
+    monkeypatch.setenv("CODEX_CLI_HOME", str(home))
+    monkeypatch.chdir(bundle)
+
+    result = CliRunner().invoke(
+        cli,
+        ["prompts", "capture", "--source", "codex"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    dest = bundle / "prompts" / "detached.prompts"
+    pf = read_prompts_file(dest)
+    assert len(pf.sessions) == 1
+    assert pf.sessions[0].id == sid
+    assert pf.sessions[0].source == "codex"

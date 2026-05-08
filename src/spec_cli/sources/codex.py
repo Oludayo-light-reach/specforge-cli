@@ -1,8 +1,17 @@
 """
 Codex adapter.
 
-Reads Cursor agent transcript JSONL files and produces
-``spec_cli.prompts.Session`` objects.
+Reads Codex Desktop rollout JSONL files and Cursor agent transcript JSONL
+files, then produces ``spec_cli.prompts.Session`` objects.
+
+Store layout (Codex Desktop, observed):
+
+  ~/.codex/state_5.sqlite
+  ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl
+
+The SQLite DB indexes recent threads (title, cwd, rollout path, model). The
+rollout JSONL is the source of truth for turns. This format is local and not
+part of the Spec schema contract, so parsing is intentionally defensive.
 
 Store layout (Cursor):
 
@@ -22,8 +31,11 @@ cwd field, so directory scoping is the primary signal.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,8 +54,22 @@ from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 # This adapter currently reads Codex transcripts from Cursor's
 # `agent-transcripts` storage layout.
 _DEFAULT_CURSOR_HOME = "~/.cursor"
+_DEFAULT_CODEX_HOME = "~/.codex"
 _SUMMARY_CHARS: int = 200
 _PREVIEW_CHARS: int = 4000
+
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
+    (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/=-]+"), True),
+    (
+        re.compile(
+            r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret)\s*[=:]\s*)[^\s'\"`]+"
+        ),
+        True,
+    ),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), False),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"), False),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), False),
+)
 
 
 class CodexError(RuntimeError):
@@ -59,6 +85,30 @@ def codex_store_root() -> Path:
     override = os.environ.get("CODEX_HOME") or os.environ.get("CURSOR_HOME")
     base = Path(override).expanduser() if override else Path(_DEFAULT_CURSOR_HOME).expanduser()
     return base / "projects"
+
+
+def codex_cli_home() -> Path:
+    """Codex Desktop / CLI home directory."""
+    override = os.environ.get("CODEX_CLI_HOME")
+    if override:
+        return Path(override).expanduser()
+    # ``CODEX_HOME`` already existed in this adapter as a test/store override.
+    # If it points at a Desktop-shaped home, use it; otherwise keep the legacy
+    # Cursor-projects meaning for ``codex_store_root`` intact.
+    home = os.environ.get("CODEX_HOME")
+    if home:
+        return Path(home).expanduser()
+    return Path(_DEFAULT_CODEX_HOME).expanduser()
+
+
+def codex_desktop_index_path() -> Path:
+    """SQLite thread index used by Codex Desktop."""
+    return _codex_state_db()
+
+
+def codex_transcript_store_available() -> bool:
+    """Whether any supported Codex transcript store exists locally."""
+    return codex_store_root().exists() or codex_desktop_index_path().exists()
 
 
 def encode_bundle_path(bundle_root: Path) -> str:
@@ -85,6 +135,18 @@ def _parse_timestamp(raw: Any) -> datetime | None:
         except (ValueError, OverflowError, OSError):
             return None
     return None
+
+
+def redact_text(text: str) -> str:
+    """Redact common secrets before text is written into `.prompts`."""
+    out = text
+    for pat, keep_prefix in _SECRET_PATTERNS:
+        out = pat.sub(
+            lambda m: (m.group(1) if keep_prefix and m.lastindex else "")
+            + "[REDACTED]",
+            out,
+        )
+    return out
 
 
 def _first_sentence(text: str) -> str:
@@ -114,7 +176,7 @@ def _preview(text: str) -> str:
 
 def _extract_text(content: Any) -> str:
     if isinstance(content, str):
-        return sanitize_for_toml_text(content)
+        return sanitize_for_toml_text(redact_text(content))
     if not isinstance(content, list):
         return ""
     out: list[str] = []
@@ -125,7 +187,7 @@ def _extract_text(content: Any) -> str:
             continue
         text = block.get("text")
         if isinstance(text, str):
-            out.append(sanitize_for_toml_text(text))
+            out.append(sanitize_for_toml_text(redact_text(text)))
     return "\n\n".join(t for t in out if t.strip())
 
 
@@ -163,6 +225,17 @@ def _iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 yield row
 
 
+@dataclass(frozen=True)
+class CodexRecentSession:
+    id: str
+    title: str
+    cwd: str
+    path: Path
+    updated_at: datetime | None = None
+    model: str | None = None
+    turn_count: int = 0
+
+
 @dataclass
 class _SessionBuilder:
     id: str
@@ -171,6 +244,9 @@ class _SessionBuilder:
     started_at: datetime | None = None
     ended_at: datetime | None = None
     model: str | None = None
+    title: str | None = None
+    cwd: str | None = None
+    paths_touched: list[str] = field(default_factory=list)
 
     def observe_timestamp(self, ts: datetime | None) -> None:
         if ts is None:
@@ -180,7 +256,12 @@ class _SessionBuilder:
         if self.ended_at is None or ts > self.ended_at:
             self.ended_at = ts
 
-    def to_session(self, *, verbose: bool, cwd: str) -> Session | None:
+    def observe_paths_from_call(self, call: ToolCall) -> None:
+        p = call.args.get("path")
+        if isinstance(p, str) and p and p not in self.paths_touched:
+            self.paths_touched.append(p)
+
+    def to_session(self, *, verbose: bool, cwd: str | None) -> Session | None:
         if not self.turns:
             return None
         marker = verbose or any(t.role == "assistant" and t.text for t in self.turns)
@@ -191,9 +272,240 @@ class _SessionBuilder:
             started_at=self.started_at,
             ended_at=self.ended_at,
             model=self.model,
-            cwd=cwd,
+            cwd=cwd or self.cwd,
+            title=self.title,
+            paths_touched=self.paths_touched,
             verbose=marker,
         )
+
+
+def _content_text_from_response_item(content: Any) -> str:
+    if isinstance(content, str):
+        return sanitize_for_toml_text(redact_text(content))
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype not in {"output_text", "input_text", "text"}:
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(sanitize_for_toml_text(redact_text(text)))
+    return "\n\n".join(p for p in parts if p.strip())
+
+
+def _session_id_from_rollout_path(path: Path) -> str:
+    stem = path.stem
+    # rollout-2026-05-08T16-10-21-<uuid-ish>
+    parts = stem.split("-")
+    if len(parts) >= 8:
+        return "-".join(parts[-5:])
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    return f"codex-{digest}"
+
+
+def _build_codex_rollout_session(
+    path: Path,
+    *,
+    cwd: str | None = None,
+    title: str | None = None,
+    model: str | None = None,
+    verbose: bool = False,
+) -> Session | None:
+    builder = _SessionBuilder(id=_session_id_from_rollout_path(path))
+    builder.cwd = cwd
+    builder.title = title
+    builder.model = model
+
+    for row in _iter_jsonl(path):
+        ts = _parse_timestamp(row.get("timestamp"))
+        builder.observe_timestamp(ts)
+        rtype = row.get("type")
+        payload = row.get("payload")
+        if rtype == "session_meta" and isinstance(payload, dict):
+            sid = payload.get("id")
+            if isinstance(sid, str) and sid.strip():
+                builder.id = sid.strip()
+            pcwd = payload.get("cwd")
+            if builder.cwd is None and isinstance(pcwd, str) and pcwd.strip():
+                builder.cwd = pcwd.strip()
+            pmodel = payload.get("model") or payload.get("model_slug")
+            if builder.model is None and isinstance(pmodel, str) and pmodel.strip():
+                builder.model = pmodel.strip()[:MAX_TURN_MODEL_CHARS]
+            continue
+
+        if rtype == "event_msg" and isinstance(payload, dict):
+            ptype = payload.get("type")
+            if ptype == "user_message":
+                text = payload.get("message")
+                if isinstance(text, str) and text.strip():
+                    builder.turns.append(
+                        Turn(
+                            role="user",
+                            text=sanitize_for_toml_text(redact_text(text)),
+                            at=ts,
+                        )
+                    )
+            continue
+
+        if rtype != "response_item" or not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "message":
+            continue
+        role = payload.get("role")
+        if role == "user":
+            text = _content_text_from_response_item(payload.get("content"))
+            if text.strip():
+                builder.turns.append(Turn(role="user", text=text, at=ts))
+            continue
+        if role != "assistant":
+            continue
+        text = _content_text_from_response_item(payload.get("content"))
+        if not text.strip():
+            continue
+        summary = _first_sentence(text)
+        preview_text = _preview(text) if verbose else None
+        builder.turns.append(
+            Turn(
+                role="assistant",
+                summary=summary or None,
+                text=preview_text,
+                at=ts,
+                model=builder.model,
+            )
+        )
+
+    session = builder.to_session(verbose=verbose, cwd=builder.cwd)
+    if session is None:
+        return None
+    if not session.title:
+        first_user = next((t.text for t in session.turns if t.role == "user" and t.text), None)
+        session.title = _first_sentence(first_user or "")[:120] or path.stem
+    validate_session(session)
+    return session
+
+
+def _path_intersects_bundle(cwd: str | None, bundle_paths: Iterable[Path]) -> bool:
+    if not cwd:
+        return False
+    try:
+        c = Path(cwd).expanduser().resolve()
+    except OSError:
+        return False
+    for root in bundle_paths:
+        try:
+            r = root.resolve()
+        except OSError:
+            continue
+        if c == r:
+            return True
+        try:
+            c.relative_to(r)
+            return True
+        except ValueError:
+            pass
+        try:
+            r.relative_to(c)
+            return True
+        except ValueError:
+            pass
+    return False
+
+
+def _codex_state_db(home: Path | None = None) -> Path:
+    return (home or codex_cli_home()) / "state_5.sqlite"
+
+
+def list_recent_codex_sessions(
+    bundle_paths: Path | Iterable[Path],
+    *,
+    limit: int = 20,
+) -> list[CodexRecentSession]:
+    """Return recent Codex Desktop chats whose cwd intersects this bundle."""
+    roots: list[Path] = [bundle_paths] if isinstance(bundle_paths, Path) else list(bundle_paths)
+    db = _codex_state_db()
+    if not db.is_file():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = con.execute(
+            """
+            SELECT id, title, cwd, rollout_path, updated_at_ms, model
+            FROM threads
+            WHERE archived = 0
+            ORDER BY updated_at_ms DESC, id DESC
+            LIMIT 200
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    out: list[CodexRecentSession] = []
+    for sid, title, cwd, rollout_path, updated_ms, model in rows:
+        if not isinstance(rollout_path, str) or not rollout_path:
+            continue
+        path = Path(rollout_path).expanduser()
+        if not path.is_file():
+            continue
+        if not _path_intersects_bundle(cwd if isinstance(cwd, str) else None, roots):
+            continue
+        updated = _parse_timestamp(updated_ms)
+        turn_count = _count_codex_rollout_turns(path)
+        out.append(
+            CodexRecentSession(
+                id=str(sid),
+                title=(title if isinstance(title, str) and title.strip() else "(untitled)"),
+                cwd=str(cwd) if isinstance(cwd, str) else "",
+                path=path,
+                updated_at=updated,
+                model=model if isinstance(model, str) and model.strip() else None,
+                turn_count=turn_count,
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _count_codex_rollout_turns(path: Path) -> int:
+    n = 0
+    for row in _iter_jsonl(path):
+        rtype = row.get("type")
+        payload = row.get("payload")
+        if (
+            rtype == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "user_message"
+        ):
+            if isinstance(payload.get("message"), str) and payload.get("message", "").strip():
+                n += 1
+        elif rtype == "response_item" and isinstance(payload, dict):
+            if payload.get("type") == "message" and payload.get("role") in {"user", "assistant"}:
+                if _content_text_from_response_item(payload.get("content")).strip():
+                    n += 1
+    return n
+
+
+def read_codex_rollout_session(
+    path: Path,
+    *,
+    verbose: bool = True,
+    title: str | None = None,
+    cwd: str | None = None,
+    model: str | None = None,
+) -> Session | None:
+    """Read one Codex Desktop rollout JSONL file."""
+    return _build_codex_rollout_session(
+        path, cwd=cwd, title=title, model=model, verbose=verbose
+    )
 
 
 def _project_dir_candidates(bundle_paths: Iterable[Path]) -> list[tuple[Path, Path]]:
@@ -245,6 +557,8 @@ def _build_session(path: Path, *, cwd: Path, verbose: bool) -> Session | None:
         if isinstance(model_raw, str) and model_raw.strip():
             turn_model = model_raw.strip()[:MAX_TURN_MODEL_CHARS]
         calls = _extract_tool_calls(content)
+        for call in calls:
+            builder.observe_paths_from_call(call)
         summary = _first_sentence(text)
         preview_text = _preview(text) if (verbose and text) else None
         if not summary and not preview_text and not calls:
@@ -285,11 +599,34 @@ def read_codex_sessions(
     roots: list[Path] = [bundle_paths] if isinstance(bundle_paths, Path) else list(bundle_paths)
     if not roots:
         return  # type: ignore[return-value]
+    yielded: set[str] = set()
+
+    for recent in list_recent_codex_sessions(roots, limit=1000):
+        if recent.id in yielded:
+            continue
+        try:
+            session = read_codex_rollout_session(
+                recent.path,
+                verbose=verbose,
+                title=recent.title,
+                cwd=recent.cwd,
+                model=recent.model,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise CodexError(
+                f"{recent.path.name}: could not build session — {e}"
+            ) from e
+        if session is None:
+            continue
+        if since is not None and session.started_at is not None and session.started_at < since:
+            continue
+        yielded.add(session.id)
+        yield session
+
     candidates = _project_dir_candidates(roots)
     if not candidates:
-        return  # type: ignore[return-value]
+        return
 
-    yielded: set[str] = set()
     for project_dir, anchor in candidates:
         transcripts_dir = project_dir / "agent-transcripts"
         if not transcripts_dir.is_dir():

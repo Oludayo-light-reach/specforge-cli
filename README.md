@@ -138,9 +138,33 @@ the compiler sees on the next run — see
 
 | Command | Purpose |
 |---|---|
-| `spec prompts sync` | Pull sessions from `~/.claude/projects/<encoded-cwd>/` into `prompts/sessions/`. Deterministic; re-running doesn't rewrite existing files unless `--force`. |
+| `spec prompts capture --source claude_code\|cursor\|codex\|all` | Append new local agent sessions to `prompts/<branch>.prompts`. Deterministic; re-running skips sessions already captured at the same turn count. |
 | `spec prompts validate` | Check every `.prompt` file against the schema. Exit 1 on error. |
 | `spec prompts simulate` | (Contract-only in v0.1) Replay a session through the compiler in a read-only sandbox. |
+
+### Codex capture
+
+```bash
+# Show recent Codex chats for this bundle, pick one by number, and import it.
+spec codex capture
+
+# Non-interactive: import the first recent chat.
+spec codex capture --index 1
+
+# Preview without writing.
+spec codex capture --dry-run
+```
+
+`spec codex capture` reads Codex Desktop's local thread index
+(`~/.codex/state_5.sqlite`) and rollout logs (`~/.codex/sessions/...`), filters
+to chats whose working directory matches this bundle, then appends the selected
+chat as one `source = "codex"` session in `prompts/<branch>.prompts`. Common
+tokens and Authorization headers are redacted before serialization.
+
+For the normal git-like workflow, you usually do not need the Codex-specific
+command: `spec add .`, `git commit` with Spec hooks, and
+`spec prompts capture --source all` scan the local Claude Code, Cursor, and
+Codex Desktop stores for sessions that belong to the current bundle.
 
 ### Auth
 
@@ -261,6 +285,7 @@ args only, no file contents or command output.
 | `SPEC_HOME` | Override the credentials directory (default `~/.spec`). |
 | `SPEC_OAUTH_CLIENT_ID` | Override the embedded Google OAuth client ID. |
 | `CLAUDE_HOME` | Override the Claude Code project store location (default `~/.claude`). |
+| `CODEX_CLI_HOME` | Override the Codex Desktop home used by `spec codex capture` (default `~/.codex`). |
 
 ## Design notes
 
@@ -270,8 +295,8 @@ args only, no file contents or command output.
 - **Shared extension allow-list.** The same `SPEC_EXTENSIONS` + filename live
   here (`spec_cli/constants.py`), in the compiler, and on Cloud. Server
   is still the source of truth — this is a fast-fail.
-- **Prompt capture is read-only.** The Claude Code adapter reads JSONL from
-  `~/.claude/projects/…` and never writes there. Sync is safe to re-run.
+- **Prompt capture is read-only.** The Claude Code and Codex adapters read
+  local JSONL / SQLite stores and never write there. Capture is safe to re-run.
 - **Tool-call args are summaries, not payloads.** We never capture file
   contents, shell output, or diffs. The format only stores what an auditor
   needs to reason about why the model did what it did.

@@ -7,6 +7,7 @@ import click
 from . import __version__
 from .commands.add import add_cmd
 from .commands.compile import compile_cmd
+from .commands.codex import codex_group
 from .commands.git_hooks import git_hooks_group
 from .commands.init import init_cmd
 from .commands.log import log_cmd
@@ -45,6 +46,7 @@ cli.add_command(unstage_cmd)
 cli.add_command(push_cmd)
 cli.add_command(pull_cmd)
 cli.add_command(compile_cmd)
+cli.add_command(codex_group)
 cli.add_command(prompts_group)
 cli.add_command(log_cmd)
 

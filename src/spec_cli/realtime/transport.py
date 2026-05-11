@@ -143,13 +143,21 @@ class SSEConsumer:
         self,
         api_base: str,
         access_token: str,
-        project_id: int,
+        project_id: int | None = None,
         *,
+        workspace: bool = False,
+        include_presence: bool = False,
         user_agent: str = "spec-cli/live",
     ) -> None:
-        self._url = (
-            f"{api_base.rstrip('/')}/api/projects/{project_id}/prompt-stream"
-        )
+        base = api_base.rstrip("/")
+        if workspace:
+            self._url = f"{base}/api/me/prompt-stream"
+            if include_presence:
+                self._url += "?include_presence=true"
+        else:
+            if project_id is None:
+                raise ValueError("project_id is required unless workspace=True")
+            self._url = f"{base}/api/projects/{project_id}/prompt-stream"
         self._headers = {
             "Authorization": f"Bearer {access_token}",
             "User-Agent": user_agent,

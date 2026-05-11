@@ -52,12 +52,18 @@ class Notifier:
         author = event.author_display
         branch = event.branch or "-"
         source = event.source
+        bundle = (
+            f" [sf.muted]· {event.bundle_label}[/]"
+            if event.bundle_label
+            else ""
+        )
 
         if event.role == "user":
             preview = (event.text or event.summary or "").strip()
             preview = _truncate(preview, 280 if not self._compact else 120)
             head = (
                 f"[sf.point]{author}[/] [sf.muted]· {source} · {branch} · {time_label}[/]"
+                f"{bundle}"
             )
         else:
             preview = (event.summary or event.text or "").strip()
@@ -65,6 +71,7 @@ class Notifier:
             model = event.model or "assistant"
             head = (
                 f"[sf.label]{author}[/] [sf.muted]· {model} · {branch} · {time_label}[/]"
+                f"{bundle}"
             )
 
         with self._lock:

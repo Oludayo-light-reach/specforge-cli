@@ -204,6 +204,7 @@ spec live on        # re-enable for this bundle (with --verbose for full assista
 |---|---|
 | `spec watch` | Long-running daemon. Broadcasts your prompts + dirty files; renders teammates' in your terminal. `--mirror` also writes incoming events to `prompts/captured/peers/<handle>/`. |
 | `spec team` | Snapshot of recent prompt activity (no SSE). |
+| `spec team watch` | Live workspace-wide SSE tail (`GET /api/me/prompt-stream`). Receive-only; no bundle directory required. |
 | `spec presence show` | Show every teammate's current dirty-file list with `+/-` line counts. |
 | `spec presence check <path>` | Exit code is the contract: 0 = clear, 2 = a teammate is editing the path. |
 | `spec hooks install-claude` | Wire the Spec Live `PreToolUse` hook into Claude Code (`spec init` does this for you on first run). Add `--block` to refuse edits on conflict instead of just warning. |
@@ -227,8 +228,13 @@ vectors today:
   with `alwaysApply: true`. Cursor's model voluntarily runs `spec presence
   check` before suggesting edits.
 - **Any AI agent** — `AGENTS.md` (also written by `spec init`) instructs any
-  model-driven agent to call `spec presence check <path>` before making
+  model-driven agent to call `spec locks check <path>` before making
   destructive edits and surface the warning to the user.
+
+**Workspace-wide live tail:** `spec team watch` opens one SSE connection to
+`GET /api/me/prompt-stream` (every bundle you can read on Cloud, with
+`bundle_label` on each event). `spec watch` in a repo still tails that bundle
+only and can broadcast your local turns.
 
 When `spec watch` isn't running, `team-presence.json` is missing → all three
 vectors **fail open** (exit 0, silent). We never block work because the daemon

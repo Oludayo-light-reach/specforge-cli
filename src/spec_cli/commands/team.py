@@ -1,14 +1,12 @@
 """
-``spec team`` — snapshot of recent team prompt activity.
-
-A one-shot read of the most recent N prompt events for the bundle's
-project, or (with ``--org``) across every bundle in your Spec workspace
-via ``GET /api/me/prompt-events``. Same data the SSE stream serves,
-just frozen in time.
+``spec team`` — snapshot of recent team prompt activity, plus
+``spec team watch`` for a workspace-wide live SSE tail.
 """
 from __future__ import annotations
 
 import re
+import signal
+import threading
 from datetime import datetime, timezone
 
 import click
@@ -23,6 +21,8 @@ from ..config import (
     parse_cloud_project,
 )
 from ..realtime.events import IncomingEvent
+from ..realtime.notifier import Notifier
+from ..realtime.transport import SSEConsumer, SSEStreamError, run_consumer_in_thread
 from ..ui import console, dim, fatal
 
 
@@ -55,55 +55,7 @@ def _event_matches_user_filter(ev: IncomingEvent, needle: str) -> bool:
     return n in handle or n in name or n in display
 
 
-@click.command("team")
-@click.option(
-    "--limit",
-    "-n",
-    "limit",
-    default=20,
-    show_default=True,
-    type=click.IntRange(1, 200),
-    help="Number of recent events to show.",
-)
-@click.option(
-    "--branch",
-    "branch_filter",
-    default=None,
-    help="Only show events on this branch. Substring match (case-insensitive).",
-)
-@click.option(
-    "--role",
-    "role_filter",
-    type=click.Choice(["user", "assistant"]),
-    default=None,
-    help="Only show user or assistant turns.",
-)
-@click.option(
-    "--project",
-    "-p",
-    default=None,
-    help="Override `cloud.project` from spec.yaml (ignored with `--org`).",
-)
-@click.option(
-    "--org",
-    "org_wide",
-    is_flag=True,
-    help=(
-        "Workspace-wide feed: all bundles you can see on Spec Cloud, "
-        "one API round trip (`GET /api/me/prompt-events`). Does not "
-        "require standing inside a bundle directory."
-    ),
-)
-@click.option(
-    "--user",
-    "user_filter",
-    default=None,
-    help=(
-        "Only events from this teammate — matches handle (substring), "
-        "display name, or @handle (case-insensitive)."
-    ),
-)
-def team_cmd(
+def _run_team_snapshot(
     limit: int,
     branch_filter: str | None,
     role_filter: str | None,
@@ -111,19 +63,6 @@ def team_cmd(
     org_wide: bool,
     user_filter: str | None,
 ) -> None:
-    """Print recent Spec Live prompt activity for this bundle or your whole workspace.
-
-    Reads from ``/api/projects/{id}/prompt-events`` or, with ``--org``,
-    ``/api/me/prompt-events``. Use ``--user alice`` to narrow the list to
-    one teammate's turns (client-side filter, substring-friendly).
-
-    \b
-    Examples:
-      spec team
-      spec team --org --limit 50
-      spec team --user alice
-      spec team --org --user bob
-    """
     creds = load_credentials()
     if not creds or not creds.access_token:
         fatal("Not signed in. Run `spec login` first.")
@@ -187,7 +126,6 @@ def team_cmd(
         needle = branch_filter.lower()
         events = [e for e in events if e.branch and needle in e.branch.lower()]
     if role_filter and not org_wide:
-        # Org path already applied role server-side when set.
         events = [e for e in events if e.role == role_filter]
     if user_filter:
         events = [e for e in events if _event_matches_user_filter(e, user_filter)]
@@ -220,3 +158,150 @@ def team_cmd(
             if len(short) > 200:
                 short = short[:200].rstrip() + "…"
             console.print(f"      [sf.muted]{short}[/]")
+
+
+@click.group(name="team", invoke_without_command=True)
+@click.pass_context
+@click.option(
+    "--limit",
+    "-n",
+    "limit",
+    default=20,
+    show_default=True,
+    type=click.IntRange(1, 200),
+    help="Number of recent events to show (snapshot only).",
+)
+@click.option(
+    "--branch",
+    "branch_filter",
+    default=None,
+    help="Only show events on this branch. Substring match (case-insensitive).",
+)
+@click.option(
+    "--role",
+    "role_filter",
+    type=click.Choice(["user", "assistant"]),
+    default=None,
+    help="Only show user or assistant turns.",
+)
+@click.option(
+    "--project",
+    "-p",
+    default=None,
+    help="Override `cloud.project` from spec.yaml (ignored with `--org`).",
+)
+@click.option(
+    "--org",
+    "org_wide",
+    is_flag=True,
+    help=(
+        "Workspace-wide feed: all bundles you can see on Spec Cloud, "
+        "one API round trip (`GET /api/me/prompt-events`). Does not "
+        "require standing inside a bundle directory."
+    ),
+)
+@click.option(
+    "--user",
+    "user_filter",
+    default=None,
+    help=(
+        "Only events from this teammate — matches handle (substring), "
+        "display name, or @handle (case-insensitive)."
+    ),
+)
+def team_group(
+    ctx: click.Context,
+    limit: int,
+    branch_filter: str | None,
+    role_filter: str | None,
+    project: str | None,
+    org_wide: bool,
+    user_filter: str | None,
+) -> None:
+    """Print recent Spec Live prompt activity, or stream the whole workspace.
+
+    Default (no subcommand): same as before — snapshot from
+    ``/api/projects/{id}/prompt-events`` or ``/api/me/prompt-events`` with
+    ``--org``.
+
+    \b
+    Examples:
+      spec team
+      spec team --org --limit 50
+      spec team --user alice
+      spec team watch
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    _run_team_snapshot(
+        limit,
+        branch_filter,
+        role_filter,
+        project,
+        org_wide,
+        user_filter,
+    )
+
+
+@team_group.command("watch")
+@click.option(
+    "--compact",
+    is_flag=True,
+    help="One line per event instead of the multi-line default.",
+)
+@click.option(
+    "--include-presence",
+    is_flag=True,
+    help="Include presence pings in the stream (very noisy).",
+)
+def team_watch_cmd(compact: bool, include_presence: bool) -> None:
+    """Live SSE tail across every bundle you can see (workspace-wide).
+
+    Connects to ``GET /api/me/prompt-stream``. Receive-only — does not
+    require a bundle directory. Ctrl+C to stop.
+
+    \b
+    Examples:
+      spec team watch
+      spec team watch --compact
+    """
+    creds = load_credentials()
+    if not creds or not creds.access_token:
+        fatal("Not signed in. Run `spec login` first.")
+        return
+
+    notifier = Notifier(compact=compact)
+    consumer = SSEConsumer(
+        creds.api_base,
+        creds.access_token,
+        None,
+        workspace=True,
+        include_presence=include_presence,
+    )
+
+    def on_fatal(err: SSEStreamError) -> None:
+        notifier.announce_fatal(str(err))
+
+    def on_event(ev: IncomingEvent) -> None:
+        if not include_presence and ev.role == "presence":
+            return
+        notifier.show(ev)
+
+    notifier.announce_connected("workspace (all bundles)")
+
+    t = run_consumer_in_thread(consumer, on_event, on_fatal)
+
+    def _stop(_signum: int, _frame: object | None) -> None:
+        consumer.stop()
+
+    signal.signal(signal.SIGINT, _stop)
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+    except (AttributeError, ValueError):
+        pass
+
+    t.join()
+
+
+# Backwards-compatible export name for cli.py
+team_cmd = team_group

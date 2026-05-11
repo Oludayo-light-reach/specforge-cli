@@ -121,7 +121,8 @@ from ..ui import dim, fatal, info, ok, warn
     help=(
         "Internal flag used by the autostart machinery — never set this "
         "by hand. Marks the current process as the spawned daemon and "
-        "tells the watcher to write a PID file before entering the loop."
+        "writes `.spec/watch.pid` before cloud init so the parent can "
+        "confirm startup quickly."
     ),
 )
 def watch_cmd(
@@ -192,138 +193,12 @@ def watch_cmd(
             dim("  stop with `spec live stop` · status: `spec live status`")
         return
 
-    manifest = load_manifest(root)
-    creds = load_credentials()
-    if not creds or not creds.access_token:
-        fatal("Not signed in. Run `spec login` first.")
-        return
-
-    raw = project or manifest.cloud_project
-    if not raw:
-        fatal(
-            "No cloud project configured. Add `cloud.project: <handle>/<slug>` "
-            "to spec.yaml or pass --project <handle>/<slug>."
-        )
-        return
-    try:
-        handle, slug = parse_cloud_project(raw, default_handle=creds.user_handle)
-    except RemoteUrlError as e:
-        fatal(str(e))
-        return
-
-    try:
-        client = CloudClient(creds)
-    except ApiError as e:
-        fatal(str(e))
-        return
-    try:
-        project_info = client.resolve_project(handle, slug)
-    except ApiError as e:
-        fatal(
-            f"Could not resolve project '{handle}/{slug}': {e}\n"
-            f"  · Check your sign-in (`spec login`).\n"
-            f"  · Or push the bundle first (`spec push`) so Cloud knows it."
-        )
-        return
-    project_id = int(project_info["id"])
-
-    # Self-id + display block for echo suppression and the local
-    # team-presence mirror. Best-effort: when the user's own
-    # broadcasts come back over the SSE stream, we filter them by
-    # ``author.user_id == self_user_id``. If the server doesn't return
-    # ``user_id`` from ``/api/auth/me`` (older deploys), echo
-    # suppression silently no-ops and the user sees their own events
-    # — annoying but not broken.
-    self_user_id: int | None = None
-    self_handle: str | None = creds.user_handle
-    self_name: str | None = None
-    try:
-        me = client._request("GET", "/api/auth/me")  # noqa: SLF001
-        if isinstance(me, dict):
-            if isinstance(me.get("id"), int):
-                self_user_id = int(me["id"])
-            handle_val = me.get("handle")
-            if isinstance(handle_val, str) and handle_val:
-                self_handle = handle_val
-            name_val = me.get("name")
-            if isinstance(name_val, str) and name_val:
-                self_name = name_val
-    except ApiError as e:
-        warn(f"could not read /api/auth/me ({e}) — echo suppression off")
-
-    # Broadcasting resolution. Default is ON; two opt-out layers:
-    #   * --no-broadcast on the command line (this run only)
-    #   * the bundle manifest can disable for the whole team
-    #     (`spec live off` writes ``cloud.prompt_stream: disabled``)
-    #   * the user can mute on this machine for every bundle
-    #     (`spec live mute` writes ``~/.spec/preferences.json``)
-    # All three are independent kill-switches; ANY of them off → no broadcast.
-    prefs = load_preferences()
-    broadcast_requested = not no_broadcast
-    project_opted_in = manifest.prompt_stream_enabled
-    user_muted = prefs.prompt_stream_muted
-    broadcast_active = broadcast_requested and project_opted_in and not user_muted
-
-    if broadcast_requested and not project_opted_in:
-        warn(
-            "broadcasting is disabled for this bundle — run `spec live on` "
-            "(or set `cloud.prompt_stream: enabled` in spec.yaml) to share "
-            "your prompts with the team. Running in receive-only mode."
-        )
-    elif broadcast_requested and user_muted:
-        warn(
-            "broadcasting is muted on this machine — run `spec live unmute` "
-            "to share again. Receiving still works."
-        )
-
-    branch_filter = None
-    if branch_only:
-        from ..git import read_git_context
-
-        git = read_git_context(root)
-        branch_filter = git.branch
-        if not branch_filter:
-            warn("--branch-only set but no git branch detected; ignored.")
-
-    project_label = f"{handle}/{slug}"
-    opts = WatcherOptions(
-        project_id=project_id,
-        project_label=project_label,
-        api_base=creds.api_base,
-        access_token=creds.access_token,
-        self_user_id=self_user_id,
-        self_handle=self_handle,
-        self_name=self_name,
-        poll_interval=poll_interval if poll_interval and poll_interval > 0 else 2.0,
-        broadcast=broadcast_active,
-        receive=not no_receive,
-        mirror=mirror,
-        # Presence shares the same gates as prompt broadcasting so a
-        # user who muted Spec Live doesn't unintentionally start
-        # broadcasting their dirty file list. Receiving is always
-        # available so the local mirror still gets populated.
-        presence_enabled=broadcast_active,
-        verbose_assistant=verbose_out or manifest.prompt_stream_verbose,
-        compact_output=compact,
-        project_branch_filter=branch_filter,
-    )
-
-    if mirror:
-        dim("mirror enabled → prompts/captured/peers/")
-
+    # For the spawned daemon, claim the PID file *before* manifest/API
+    # work. ``start_in_background`` polls for this file — if we only
+    # wrote it after ``resolve_project``, slow networks would exceed the
+    # wait window and the parent would SIGTERM a healthy child.
+    pid_owned = False
     if background_runner:
-        # We are the spawned daemon. Two extra responsibilities vs. the
-        # foreground path:
-        #   1. Refuse if another daemon is already alive for this
-        #      bundle — protects against double-fork races where the
-        #      autostart hook fires twice.
-        #   2. Write the PID file BEFORE entering the main loop so the
-        #      parent that spawned us can confirm a successful start
-        #      via the file appearing on disk.
-        # The PID file is removed in a ``finally`` block so a clean
-        # exit leaves no stale marker. A kill -9 won't run the
-        # finally; ``is_running`` handles that case via ``kill(pid, 0)``
-        # on the next ensure() call.
         existing = is_running(root)
         if existing is not None:
             sys_msg = (
@@ -332,18 +207,135 @@ def watch_cmd(
             )
             click.echo(sys_msg, err=True)
             raise SystemExit(0)
-
         log_p = watch_log_path(root)
         try:
             write_pid_file(root, pid=os.getpid(), log_path=log_p)
         except OSError as e:
             fatal(f"Could not write PID file at {log_p.parent}: {e}")
             return
+        pid_owned = True
+
+    try:
+        manifest = load_manifest(root)
+        creds = load_credentials()
+        if not creds or not creds.access_token:
+            fatal("Not signed in. Run `spec login` first.")
+            return
+
+        raw = project or manifest.cloud_project
+        if not raw:
+            fatal(
+                "No cloud project configured. Add `cloud.project: <handle>/<slug>` "
+                "to spec.yaml or pass --project <handle>/<slug>."
+            )
+            return
+        try:
+            handle, slug = parse_cloud_project(raw, default_handle=creds.user_handle)
+        except RemoteUrlError as e:
+            fatal(str(e))
+            return
 
         try:
-            exit_code = run_watcher(root, opts)
-        finally:
-            remove_pid_file(root)
-        raise SystemExit(exit_code)
+            client = CloudClient(creds)
+        except ApiError as e:
+            fatal(str(e))
+            return
+        try:
+            project_info = client.resolve_project(handle, slug)
+        except ApiError as e:
+            fatal(
+                f"Could not resolve project '{handle}/{slug}': {e}\n"
+                f"  · Check your sign-in (`spec login`).\n"
+                f"  · Or push the bundle first (`spec push`) so Cloud knows it."
+            )
+            return
+        project_id = int(project_info["id"])
 
-    raise SystemExit(run_watcher(root, opts))
+        # Self-id + display block for echo suppression and the local
+        # team-presence mirror. Best-effort: when the user's own
+        # broadcasts come back over the SSE stream, we filter them by
+        # ``author.user_id == self_user_id``. If the server doesn't return
+        # ``user_id`` from ``/api/auth/me`` (older deploys), echo
+        # suppression silently no-ops and the user sees their own events
+        # — annoying but not broken.
+        self_user_id: int | None = None
+        self_handle: str | None = creds.user_handle
+        self_name: str | None = None
+        try:
+            me = client._request("GET", "/api/auth/me")  # noqa: SLF001
+            if isinstance(me, dict):
+                if isinstance(me.get("id"), int):
+                    self_user_id = int(me["id"])
+                handle_val = me.get("handle")
+                if isinstance(handle_val, str) and handle_val:
+                    self_handle = handle_val
+                name_val = me.get("name")
+                if isinstance(name_val, str) and name_val:
+                    self_name = name_val
+        except ApiError as e:
+            warn(f"could not read /api/auth/me ({e}) — echo suppression off")
+
+        # Broadcasting resolution. Default is ON; two opt-out layers:
+        #   * --no-broadcast on the command line (this run only)
+        #   * the bundle manifest can disable for the whole team
+        #     (`spec live off` writes ``cloud.prompt_stream: disabled``)
+        #   * the user can mute on this machine for every bundle
+        #     (`spec live mute` writes ``~/.spec/preferences.json``)
+        # All three are independent kill-switches; ANY of them off → no broadcast.
+        prefs = load_preferences()
+        broadcast_requested = not no_broadcast
+        project_opted_in = manifest.prompt_stream_enabled
+        user_muted = prefs.prompt_stream_muted
+        broadcast_active = broadcast_requested and project_opted_in and not user_muted
+
+        if broadcast_requested and not project_opted_in:
+            warn(
+                "broadcasting is disabled for this bundle — run `spec live on` "
+                "(or set `cloud.prompt_stream: enabled` in spec.yaml) to share "
+                "your prompts with the team. Running in receive-only mode."
+            )
+        elif broadcast_requested and user_muted:
+            warn(
+                "broadcasting is muted on this machine — run `spec live unmute` "
+                "to share again. Receiving still works."
+            )
+
+        branch_filter = None
+        if branch_only:
+            from ..git import read_git_context
+
+            git = read_git_context(root)
+            branch_filter = git.branch
+            if not branch_filter:
+                warn("--branch-only set but no git branch detected; ignored.")
+
+        project_label = f"{handle}/{slug}"
+        opts = WatcherOptions(
+            project_id=project_id,
+            project_label=project_label,
+            api_base=creds.api_base,
+            access_token=creds.access_token,
+            self_user_id=self_user_id,
+            self_handle=self_handle,
+            self_name=self_name,
+            poll_interval=poll_interval if poll_interval and poll_interval > 0 else 2.0,
+            broadcast=broadcast_active,
+            receive=not no_receive,
+            mirror=mirror,
+            # Presence shares the same gates as prompt broadcasting so a
+            # user who muted Spec Live doesn't unintentionally start
+            # broadcasting their dirty file list. Receiving is always
+            # available so the local mirror still gets populated.
+            presence_enabled=broadcast_active,
+            verbose_assistant=verbose_out or manifest.prompt_stream_verbose,
+            compact_output=compact,
+            project_branch_filter=branch_filter,
+        )
+
+        if mirror:
+            dim("mirror enabled → prompts/captured/peers/")
+
+        raise SystemExit(run_watcher(root, opts))
+    finally:
+        if pid_owned:
+            remove_pid_file(root)

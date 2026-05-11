@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,9 @@ def _write_team_presence(bundle_root: Path, files_index: dict) -> None:
     spec_dir.mkdir(parents=True, exist_ok=True)
     body = {
         "schema": 1,
-        "updated_at": "2026-05-08T10:00:00+00:00",
+        "updated_at": datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(),
         "self": None,
         "members": [],
         "files_index": files_index,

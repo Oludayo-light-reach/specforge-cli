@@ -186,6 +186,7 @@ class IncomingEvent:
     author_name: str
     author_avatar_url: str | None
     presence: PresencePayload | None = None
+    bundle_label: str | None = None
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "IncomingEvent":
@@ -214,6 +215,7 @@ class IncomingEvent:
             author_name=str(author.get("name") or "(unknown)"),
             author_avatar_url=_str_or_none(author.get("avatar_url")),
             presence=PresencePayload.from_json(payload.get("presence")),
+            bundle_label=_str_or_none(payload.get("bundle_label")),
         )
 
     @property

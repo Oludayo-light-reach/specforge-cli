@@ -1,5 +1,6 @@
 """
-Disk mirror of the live ``PresenceCache`` — ``.spec/team-presence.json``.
+Disk mirror of the live ``PresenceCache`` — ``.spec/team-presence.json``
+(plus ``.spec/team-editing-brief.md``, regenerated in lockstep).
 
 The whole point of this file is to give *every* AI tool a single,
 boring, parseable place to read "who is editing what" without having
@@ -35,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .presence import LocalPresence, PeerPresence, PresenceCache
+from .team_editing_brief import write_team_editing_brief
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +136,8 @@ class TeamPresenceMirror:
                     "spec-live: team-presence mirror write failed: %s", e
                 )
                 return False
+            if not write_team_editing_brief(self._bundle_root, body):
+                log.info("spec-live: team-editing-brief write skipped")
             self._last_payload = equality_key
             return True
 

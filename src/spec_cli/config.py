@@ -7,7 +7,10 @@ Reads/writes the two config surfaces the CLI owns:
 
   2. `~/.spec/credentials` — a JSON file holding the Spec session token,
      the Cloud API base URL, and the signed-in user's public handle.
-     0600 perms.
+     0600 perms. For CI (GitHub Actions, cron on a headless host), you can
+     instead set ``SPEC_ACCESS_TOKEN`` (and optionally ``SPEC_API``,
+     ``SPEC_USER_HANDLE``) in the environment — those override the file
+     when present.
 
 Everything path-related is resolved from the bundle root, which we find by
 walking up from cwd looking for a `spec.yaml`.
@@ -249,6 +252,23 @@ class Credentials:
 
 
 def load_credentials() -> Credentials | None:
+    """Load saved session credentials.
+
+    When ``SPEC_ACCESS_TOKEN`` is set (non-empty), returns in-memory
+    credentials from the environment so CI jobs never have to write
+    ``~/.spec/credentials``. Otherwise reads ``~/.spec/credentials``.
+    """
+    token = os.environ.get("SPEC_ACCESS_TOKEN", "").strip()
+    if token:
+        api = os.environ.get("SPEC_API", "").strip()
+        return Credentials(
+            api_base=api or default_api_base(),
+            access_token=token,
+            refresh_token=os.environ.get("SPEC_REFRESH_TOKEN", "").strip() or None,
+            user_email=os.environ.get("SPEC_USER_EMAIL", "").strip() or None,
+            user_name=os.environ.get("SPEC_USER_NAME", "").strip() or None,
+            user_handle=os.environ.get("SPEC_USER_HANDLE", "").strip() or None,
+        )
     path = _creds_path()
     if not path.is_file():
         return None

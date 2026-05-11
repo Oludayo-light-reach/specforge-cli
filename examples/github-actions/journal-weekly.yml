@@ -1,0 +1,52 @@
+# Copy to `.github/workflows/spec-journal-weekly.yml` in YOUR bundle repo
+# (the repo that contains `spec.yaml` at its root).
+#
+# Prerequisites:
+#   1. Repository secret `SPEC_ACCESS_TOKEN` — JWT from `~/.spec/credentials`
+#      after `spec login` on a dev machine (same value as `access_token`).
+#   2. Optional repository variable `SPEC_API` if you do not use the default host.
+#   3. Optional secret `SPEC_USER_HANDLE` if `cloud.project` in spec.yaml is a
+#      bare slug (no `handle/` prefix) — mirrors the handle in credentials.
+#
+# The job rewrites `docs/spec-journal/weekly-rollup.md` and commits it weekly.
+
+name: Spec journal weekly rollup
+
+on:
+  schedule:
+    # 07:15 UTC every Monday — tweak as needed.
+    - cron: "15 7 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  rollup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Spec CLI
+        run: curl -LsSf https://spec.lightreach.io/install.sh | sh
+
+      - name: Generate rollup
+        env:
+          SPEC_ACCESS_TOKEN: ${{ secrets.SPEC_ACCESS_TOKEN }}
+          SPEC_API: ${{ vars.SPEC_API }}
+          SPEC_USER_HANDLE: ${{ vars.SPEC_USER_HANDLE }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          spec journal rollup --weeks 2
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/spec-journal/weekly-rollup.md || true
+          if git diff --staged --quiet; then
+            echo "No rollup changes."
+          else
+            git commit -m "chore: spec journal weekly rollup"
+            git push
+          fi

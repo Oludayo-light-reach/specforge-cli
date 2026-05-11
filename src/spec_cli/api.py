@@ -284,6 +284,30 @@ class CloudClient:
             json=body,
         )
 
+    def list_my_prompt_events(
+        self,
+        *,
+        limit: int = 50,
+        author_handle: str | None = None,
+        role: str | None = None,
+        include_presence: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Cross-bundle Spec Live events for the signed-in user's workspace.
+
+        Wraps ``GET /api/me/prompt-events`` — one round trip instead of
+        iterating every project.
+        """
+        params: dict[str, Any] = {
+            "limit": limit,
+            "include_presence": "true" if include_presence else "false",
+        }
+        if author_handle:
+            params["author_handle"] = author_handle
+        if role:
+            params["role"] = role
+        data = self._request("GET", "/api/me/prompt-events", params=params)
+        return data or []
+
     # -- branch reviews ------------------------------------------------
 
     def open_branch_review(

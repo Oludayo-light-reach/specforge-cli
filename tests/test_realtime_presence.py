@@ -34,6 +34,7 @@ from spec_cli.realtime.presence_mirror import (
     TeamPresenceMirror,
     read_team_presence,
 )
+from spec_cli.realtime.team_editing_brief import TEAM_EDITING_BRIEF_FILENAME
 
 
 # ── helpers ────────────────────────────────────────────────────────
@@ -348,6 +349,10 @@ def test_team_presence_mirror_writes_canonical_shape(tmp_path):
     assert any(e["handle"] == "alice" and e["self"] is False for e in auth)
     schemas = body["files_index"]["schemas.py"]
     assert any(e["handle"] == "me" and e["self"] is True for e in schemas)
+
+    brief = tmp_path / ".spec" / TEAM_EDITING_BRIEF_FILENAME
+    assert brief.is_file()
+    assert "auth.py" in brief.read_text(encoding="utf-8")
 
 
 def test_team_presence_mirror_idempotent_when_unchanged(tmp_path):

@@ -3,60 +3,20 @@
 from __future__ import annotations
 
 import os
-import re
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
+from ..config import BundleNotFoundError, find_bundle_root
 from ..constants import MANIFEST_FILENAME, PROMPTS_DIRNAME
-from ..git import find_git_dir
+from ..git import find_git_dir, repo_name_from_remote_url
 from ..sources.claude_code import claude_code_store_root
 from ..ui import dim, fatal, info, ok, pointer
 
 
 AGENTS_FILENAME: str = "AGENTS.md"
-
-
-# Strip the trailing ``.git`` and pull the last path segment out of any
-# remote URL git itself accepts on the CLI:
-#   - ssh-shorthand: ``git@github.com:owner/repo.git`` (note the ``:``)
-#   - https:         ``https://github.com/owner/repo.git``
-#   - ssh-with-scheme: ``ssh://git@github.com/owner/repo.git``
-#   - file://, gitlab, bitbucket, custom hosts — anything whose path ends
-#     in ``…/<repo>`` or ``…/<repo>.git`` works; we don't validate hosts.
-# A best-effort match: pathological inputs (empty, ``.``, ``.git``) fall
-# through to ``None`` so the caller can default to ``Path.cwd().name``.
-_REPO_NAME_RE = re.compile(
-    r"""
-    (?:[:/])               # `:` for ssh-shorthand, `/` otherwise
-    (?P<repo>[^/:\s]+?)    # the last path segment (lazy, no separators)
-    (?:\.git)?             # optional .git suffix
-    /*\s*$                 # trailing slashes / whitespace, end of string
-    """,
-    re.VERBOSE,
-)
-
-
-def _repo_name_from_remote(url: str | None) -> str | None:
-    """Infer a sensible bundle name from a git remote URL.
-
-    Returns ``None`` for empty / unparseable / pathological inputs so
-    callers can fall back to ``Path.cwd().name`` cleanly. The extracted
-    name is *not* slugified — bundle names are free-form text in
-    ``spec.yaml`` and the cloud only cares about the slug, which is
-    derived server-side.
-    """
-    if not url or not isinstance(url, str):
-        return None
-    match = _REPO_NAME_RE.search(url.strip())
-    if not match:
-        return None
-    name = match.group("repo").strip()
-    if not name or name in (".", "..", ".git"):
-        return None
-    return name
 
 
 # `.gitignore` block — Spec-managed, idempotent. Re-running `spec init`
@@ -352,29 +312,32 @@ _CURSOR_RULES_DIRNAME: str = ".cursor/rules"
 _CURSOR_RULE_FILENAME: str = "spec-team-presence.mdc"
 _CURSOR_RULE_BODY: str = """\
 ---
-description: Spec Live presence check before file edits
+description: Spec Live locks check before file edits
 alwaysApply: true
 ---
 
-# Spec Live — check team presence before editing
+# Spec Live — check coordination before editing
 
 This bundle uses **Spec Live**. Before you edit any file in this
 project, run:
 
 ```bash
-spec presence check <bundle-relative-path>
+spec locks check <bundle-relative-path>
 ```
 
 The exit code is the contract:
 
-- **0** → no teammate is currently editing the file. Proceed.
-- **2** → at least one teammate has the file dirty in their working
-  tree. Show the printed warning to the user and ask whether to
-  proceed before editing.
+- **0** → safe to proceed (no teammate on that file, or no fresh mirror).
+- **2** → at least one teammate likely has the file dirty. Show the
+  warning and ask the user before overwriting.
 
-If the command exits with code **0** because the file
-`.spec/team-presence.json` is missing, that simply means no teammate
-is currently running `spec watch` — proceed normally; do not block.
+`spec locks check` ignores a **stale** `.spec/team-presence.json` (for
+example when `spec watch` is not running) so you do not act on zombie
+data. For a readable summary you can also open
+`.spec/team-editing-brief.md` (updated by `spec watch`).
+
+Legacy: `spec presence check` is still available — same exit codes,
+but it does not apply the stale-mirror guard.
 
 You do **not** need to run this for files you are creating fresh
 under your own scaffolding (no path conflict possible). Only run it
@@ -432,17 +395,27 @@ code for this bundle:
 
 This bundle uses **Spec Live**: when teammates are running
 `spec watch`, their currently-dirty files (and per-file `+/-` line
-counts) are mirrored to `.spec/team-presence.json`. Before you
-modify any file in this bundle, you should check whether a teammate
-already has uncommitted work in it.
+counts) are mirrored to `.spec/team-presence.json` and summarized in
+`.spec/team-editing-brief.md`. Before you modify any file in this
+bundle, check whether a teammate already has uncommitted work in it.
 
-The mechanical contract:
+The mechanical contract (prefer the locks command — it ignores a
+stale mirror when `spec watch` is not running):
 
 ```bash
-spec presence check <bundle-relative-path>
+spec locks check <bundle-relative-path>
 # exit 0 → clear
-# exit 2 → a teammate is currently editing it (warning printed)
+# exit 2 → a teammate is likely editing it (warning printed)
 ```
+
+Legacy: `spec presence check` uses the same exit codes without the
+stale-mirror guard.
+
+## Team journal (optional)
+
+Run `spec journal sync` to materialize recent Spec Live prompt events
+from Cloud into per-day files under `docs/spec-journal/` (git-friendly
+bundle history).
 
 Use this in two situations:
 
@@ -709,13 +682,51 @@ def _stage_scaffold_for_push(
     is_flag=True,
     help="Don't add the Spec-managed `.gitignore` block at the repo root.",
 )
+@click.option(
+    "--upgrade-rules",
+    is_flag=True,
+    help=(
+        "Refresh Spec Live coordination files only: overwrite "
+        "`.cursor/rules/spec-team-presence.mdc` and re-apply the Spec-managed "
+        "Claude Code hook block in `.claude/settings.json`. "
+        "Does not touch spec.yaml or docs — for CLI upgrades in existing bundles."
+    ),
+)
 def init_cmd(
     name: str | None,
     force: bool,
     skip_git_hook: bool,
     skip_gitignore: bool,
+    upgrade_rules: bool,
 ) -> None:
     """Scaffold a starter bundle in the current directory."""
+    if upgrade_rules:
+        try:
+            bundle_root = find_bundle_root()
+        except BundleNotFoundError as e:
+            fatal(str(e))
+            return
+        cursor_rule_path = bundle_root / _CURSOR_RULES_DIRNAME / _CURSOR_RULE_FILENAME
+        try:
+            cursor_rule_path.parent.mkdir(parents=True, exist_ok=True)
+            cursor_rule_path.write_text(_CURSOR_RULE_BODY, encoding="utf-8")
+        except OSError as e:
+            fatal(f"Could not write Cursor rule: {e}")
+            return
+        try:
+            from .hooks import install_claude_settings
+
+            install_claude_settings(bundle_root, block_mode=False)
+        except OSError as e:
+            fatal(f"Could not update Claude settings: {e}")
+            return
+        ok(
+            "Spec Live rules refreshed — `.cursor/rules/spec-team-presence.mdc` "
+            "and `.claude/settings.json` (Spec-managed hooks)."
+        )
+        dim(f"bundle root: {bundle_root}")
+        return
+
     root = Path.cwd().resolve()
 
     manifest_path = root / MANIFEST_FILENAME
@@ -744,7 +755,7 @@ def init_cmd(
         origin_url: str | None = None
         if git_ctx.is_repo:
             origin_url = read_origin_url(root)
-            inferred = _repo_name_from_remote(origin_url)
+            inferred = repo_name_from_remote_url(origin_url)
         if inferred:
             bundle_name = inferred
             name_origin = "git"

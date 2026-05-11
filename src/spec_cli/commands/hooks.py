@@ -18,7 +18,8 @@ The two surfaces that exist today:
 * ``spec hooks claude-pre-tool-use`` — Claude Code ``PreToolUse``
   hook. Reads stdin (Claude's hook protocol), parses out the file
   path being edited, and warns when a teammate is currently editing
-  it. Exit 0 by default (warn-only); ``--block`` exits non-zero so
+  it (using the same stale-mirror guard as ``spec locks check``).
+  Exit 0 by default (warn-only); ``--block`` exits non-zero so
   Claude refuses to proceed without an explicit override.
 
 * ``spec hooks install-claude`` — write the per-bundle ``.claude/
@@ -35,6 +36,7 @@ because they don't take stdin from the AI IDE — Cursor reads
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -42,12 +44,26 @@ import click
 
 from ..config import BundleNotFoundError, find_bundle_root
 from ..realtime.presence_mirror import read_team_presence
+from ..realtime.team_editing_brief import (
+    DEFAULT_LOCKS_MIRROR_STALE_SECS,
+    team_presence_mirror_stale,
+)
 from ..ui import dim
 
 
 CLAUDE_HOOK_VERSION = 1
 CLAUDE_SETTINGS_DIR = ".claude"
 CLAUDE_SETTINGS_FILENAME = "settings.json"
+
+
+def _locks_max_mirror_age_secs() -> float:
+    raw = os.environ.get("SPEC_LOCKS_MAX_MIRROR_AGE_SECS", "").strip()
+    if not raw:
+        return DEFAULT_LOCKS_MIRROR_STALE_SECS
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_LOCKS_MIRROR_STALE_SECS
 
 
 @click.group("hooks")
@@ -120,6 +136,10 @@ def claude_pre_tool_use_cmd(block_mode: bool) -> None:
         sys.exit(0)
     body = read_team_presence(bundle_root)
     if body is None:
+        sys.exit(0)
+    if team_presence_mirror_stale(
+        body, max_age_secs=_locks_max_mirror_age_secs()
+    ):
         sys.exit(0)
 
     conflicts: list[tuple[str, list[dict]]] = []

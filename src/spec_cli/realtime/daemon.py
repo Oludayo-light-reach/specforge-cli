@@ -75,12 +75,11 @@ WATCH_PID_SCHEMA_VERSION = 1
 # like a foreground command.
 DEFAULT_STOP_GRACE_SECS = 4.0
 
-# How long the autostart fast-path is willing to wait for the
-# subprocess to write a PID file before giving up. We never want
-# autostart to feel slower than a normal shell prompt; if the daemon
-# can't get to disk in this window, the user is on a much bigger
-# problem than spec live.
-AUTOSTART_WAIT_SECS = 1.5
+# How long ``start_in_background`` waits for the child to write
+# ``watch.pid``. The child writes this immediately after resolving the
+# bundle root (before cloud API calls); remaining slack covers cold
+# Python startup on slow machines.
+AUTOSTART_WAIT_SECS = 8.0
 
 
 @dataclass(frozen=True)
@@ -413,9 +412,10 @@ def start_in_background(
         pass
     raise WatcherStartError(
         "spec watch --background-runner did not write a PID file within "
-        f"{AUTOSTART_WAIT_SECS:.1f}s. Your installed `spec` might be older "
-        "than this CLI; run `uv tool install --force git+https://github.com/Unit237/specforge-cli.git` "
-        "and try again."
+        f"{AUTOSTART_WAIT_SECS:.1f}s. Common causes: an outdated `spec` on PATH "
+        "(missing `--background-runner` — reinstall with "
+        "`uv tool install --force git+https://github.com/Unit237/specforge-cli.git`), "
+        "or an extremely slow shell/Python startup. Check `.spec/watch.log` in the bundle."
     )
 
 

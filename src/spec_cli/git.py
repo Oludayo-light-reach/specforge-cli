@@ -16,10 +16,24 @@ raise on the happy path, so a missing git never breaks `spec push` or
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+# Infer ``repo`` from any ``git remote`` URL git accepts on the CLI.
+# Used by ``spec init`` / ``spec bundle sync-name`` so bundle names
+# align with GitHub-style repo slugs when possible.
+_REPO_NAME_RE = re.compile(
+    r"""
+    (?:[:/])               # `:` for ssh-shorthand, `/` otherwise
+    (?P<repo>[^/:\s]+?)    # the last path segment (lazy, no separators)
+    (?:\.git)?             # optional .git suffix
+    /*\s*$                 # trailing slashes / whitespace, end of string
+    """,
+    re.VERBOSE,
+)
 
 
 @dataclass
@@ -156,6 +170,22 @@ def read_git_context(root: Path) -> GitContext:
     return ctx
 
 
+def repo_name_from_remote_url(url: str | None) -> str | None:
+    """Return the last path segment of a remote URL (the repo name).
+
+    ``None`` for empty / unparseable / pathological inputs so callers
+    can fall back to the directory name."""
+    if not url or not isinstance(url, str):
+        return None
+    match = _REPO_NAME_RE.search(url.strip())
+    if not match:
+        return None
+    name = match.group("repo").strip()
+    if not name or name in (".", "..", ".git"):
+        return None
+    return name
+
+
 def read_origin_url(root: Path) -> str | None:
     """Return the URL configured for the ``origin`` remote, or ``None``.
 
@@ -220,5 +250,6 @@ __all__ = [
     "predict_commit_object_sha",
     "read_git_context",
     "read_origin_url",
+    "repo_name_from_remote_url",
     "repo_toplevel",
 ]

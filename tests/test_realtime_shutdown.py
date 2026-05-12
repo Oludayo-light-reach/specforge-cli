@@ -61,7 +61,9 @@ class _StubPoster:
         self.events.append(event)
         if self.post_delay > 0:
             time.sleep(self.post_delay)
-        return True
+        # Mirror real ``HTTPPoster.send`` — success plus monotonic ids.
+        self._seq = getattr(self, "_seq", 0) + 1
+        return True, self._seq
 
     def close(self) -> None:
         self.closed = True
@@ -391,6 +393,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
     holds: dict = {}
     stop_event = threading.Event()
 
+    cloud_ids: dict[str, int] = {}
     _producer_tick(
         bundle_root=tmp_path,
         cursor=cursor,
@@ -398,6 +401,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         opts=_make_opts(),
         stop_event=stop_event,
         assistant_tail_holds=holds,
+        last_assistant_cloud_ids=cloud_ids,
     )
     assert len(poster.events) == 2
     assert cursor.turns_broadcast_for(sid) == 1
@@ -411,6 +415,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         opts=_make_opts(),
         stop_event=stop_event,
         assistant_tail_holds=holds,
+        last_assistant_cloud_ids=cloud_ids,
     )
     assert len(poster.events) == 3
     assert cursor.turns_broadcast_for(sid) == 1
@@ -423,8 +428,11 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         opts=_make_opts(),
         stop_event=stop_event,
         assistant_tail_holds=holds,
+        last_assistant_cloud_ids=cloud_ids,
     )
-    assert len(poster.events) == 3
+    assert len(poster.events) == 4
+    assert poster.events[-1].role == "assistant_closed"
+    assert poster.events[-1].closes_event_id == 3
     assert cursor.turns_broadcast_for(sid) == 2
 
 

@@ -116,6 +116,48 @@ def _assistant_text_fingerprint(text: str | None) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
+def _post_assistant_closed(
+    poster: HTTPPoster,
+    session: Session,
+    *,
+    branch: str,
+    git,
+    opts: WatcherOptions,
+    last_assistant_cloud_id: int | None,
+) -> None:
+    """POST ``role=assistant_closed`` so receivers flush coalesced Q/A.
+
+    The optional ``last_assistant_cloud_id`` ties the sentinel to the
+    last assistant row returned by ``POST /prompt-events`` for this
+    session (when the HTTP response included ``id``).
+    """
+    src = (
+        session.source
+        if session.source in ("cursor", "codex", "claude_code", "manual")
+        else "manual"
+    )
+    evt = OutgoingEvent(
+        session_id=session.id,
+        source=src,
+        role="assistant_closed",
+        branch=branch or None,
+        commit_sha=git.commit_sha if git else None,
+        model=session.model,
+        summary=None,
+        text=None,
+        title=(session.title or "").strip() or None,
+        cwd=session.cwd,
+        paths_touched=list(session.paths_touched or []),
+        turn_at=_now_utc(),
+        closes_event_id=last_assistant_cloud_id,
+    )
+    ok, _ = poster.send(evt)
+    if not ok:
+        log.warning(
+            "spec-live: assistant_closed POST failed for session %s",
+            (session.id or "")[:32],
+        )
+
 
 @dataclass
 class WatcherOptions:
@@ -315,6 +357,7 @@ def run_watcher(
     last_save = time.monotonic()
     last_presence_broadcast = 0.0
     assistant_tail_holds: dict[str, _AssistantTailHold] = {}
+    last_assistant_cloud_ids: dict[str, int] = {}
     # First loop iteration should run the team-presence mirror tick so
     # hooks see a fresh file quickly; peers still expire on schedule.
     last_team_presence_tick = time.monotonic() - DEFAULT_TEAM_PRESENCE_TICK_SECS
@@ -344,6 +387,7 @@ def run_watcher(
                         opts=opts,
                         stop_event=stop_event,
                         assistant_tail_holds=assistant_tail_holds,
+                        last_assistant_cloud_ids=last_assistant_cloud_ids,
                     )
                 except Exception as e:  # noqa: BLE001
                     log.warning("spec-live: producer tick error: %s", e)
@@ -540,7 +584,7 @@ def _broadcast_presence(
         presence=payload,
         turn_at=datetime.now(timezone.utc),
     )
-    return poster.send(event, timeout=timeout)
+    return poster.send(event, timeout=timeout)[0]
 
 
 # ── producer logic ─────────────────────────────────────────────────
@@ -554,6 +598,7 @@ def _producer_tick(
     opts: WatcherOptions,
     stop_event: threading.Event,
     assistant_tail_holds: dict[str, _AssistantTailHold] | None = None,
+    last_assistant_cloud_ids: dict[str, int] | None = None,
 ) -> None:
     """One pass over local transcripts; broadcast new turns.
 
@@ -584,6 +629,9 @@ def _producer_tick(
         return  # outside the filter — skip this tick entirely
     paths = historical_bundle_paths(bundle_root)
     holds = assistant_tail_holds if assistant_tail_holds is not None else {}
+    cloud_ids = (
+        last_assistant_cloud_ids if last_assistant_cloud_ids is not None else {}
+    )
 
     for session in _iter_local_sessions(paths):
         if stop_event.is_set():
@@ -638,14 +686,26 @@ def _producer_tick(
                     ):
                         holds.pop(session.id, None)
                         cursor.record_broadcast(session.id, turn_idx + 1)
+                        _post_assistant_closed(
+                            poster,
+                            session,
+                            branch=branch,
+                            git=git,
+                            opts=opts,
+                            last_assistant_cloud_id=cloud_ids.get(session.id),
+                        )
                     continue
 
-            if not poster.send(event):
+            ok, created_id = poster.send(event)
+            if not ok:
                 # Network blip — try this turn again next tick. Don't
                 # advance the cursor; we'd rather double-deliver
                 # (server is idempotent on session_id+role+turn_at)
                 # than skip.
                 return
+
+            if turn.role == "assistant" and created_id is not None:
+                cloud_ids[session.id] = created_id
 
             if is_tail_assistant:
                 fp = _assistant_text_fingerprint(turn.text)
@@ -658,6 +718,15 @@ def _producer_tick(
 
             holds.pop(session.id, None)
             cursor.record_broadcast(session.id, turn_idx + 1)
+            if turn.role == "assistant":
+                _post_assistant_closed(
+                    poster,
+                    session,
+                    branch=branch,
+                    git=git,
+                    opts=opts,
+                    last_assistant_cloud_id=cloud_ids.get(session.id),
+                )
 
 
 def _iter_local_sessions(paths) -> Iterable[Session]:  # type: ignore[no-untyped-def]

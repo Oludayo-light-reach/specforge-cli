@@ -153,6 +153,7 @@ def _run_team_snapshot(
         label = f"{handle}/{slug}"
 
     events = [IncomingEvent.from_json(r) for r in rows if isinstance(r, dict)]
+    events = [e for e in events if e.role != "assistant_closed"]
 
     if branch_filter:
         needle = branch_filter.lower()
@@ -368,8 +369,11 @@ class _TeamWatchQAState:
     """Coalesce streaming assistant rows into one readable Q/A block.
 
     The user always sees their ``USER`` row immediately; assistant
-    chunks merge until a flush boundary (idle quiet, next user
-    message, ``error``, or exit) — see :meth:`Notifier.show_completed_pair`.
+    chunks merge until a flush boundary: ``assistant_closed`` from the
+    broadcaster's ``spec watch`` (tail stability), the next user
+    message, ``error``, ``/pair``, process exit, or (unless
+    ``--assistant-quiet-secs 0``) idle quiet after the last assistant
+    chunk — see :meth:`Notifier.show_completed_pair`.
     """
 
     def __init__(self) -> None:
@@ -382,15 +386,31 @@ class _TeamWatchQAState:
         if not chunks:
             raise ValueError("merge requires non-empty chunks")
         by_id = max(chunks, key=lambda e: e.id)
-        by_text = max(chunks, key=lambda e: len((e.text or "").strip()))
-        text_src = by_text if (by_text.text or "").strip() else by_id
-        text = (text_src.text or "").strip() or None
+        # Prefer the longest non-empty ``text``; break ties by highest
+        # event id so the newest cumulative snapshot wins when lengths match
+        # (avoids picking an older partial over a newer full body).
+        text_candidates = [c for c in chunks if (c.text or "").strip()]
+        if text_candidates:
+            text_src = max(
+                text_candidates,
+                key=lambda e: (len((e.text or "").strip()), e.id),
+            )
+            text = (text_src.text or "").strip() or None
+        else:
+            text = (by_id.text or "").strip() or None
         summary = (by_id.summary or "").strip() or None
         if not summary:
-            summary = (by_text.summary or "").strip() or None
+            by_sum = max(
+                chunks,
+                key=lambda e: len((e.summary or "").strip()),
+            )
+            summary = (by_sum.summary or "").strip() or None
         tool_calls = list(by_id.tool_calls or [])
-        if not tool_calls and by_text.tool_calls:
-            tool_calls = list(by_text.tool_calls)
+        if not tool_calls:
+            for c in sorted(chunks, key=lambda e: e.id):
+                if c.tool_calls:
+                    tool_calls = list(c.tool_calls)
+                    break
         return replace(
             by_id,
             text=text,
@@ -427,6 +447,32 @@ class _TeamWatchQAState:
             return False
         self.assistant_chunks.append(ev)
         self.last_assistant_mono = time.monotonic()
+        return True
+
+    def flush_on_assistant_closed(
+        self,
+        ev: IncomingEvent,
+        notifier: Notifier,
+        last_output_at: list[float],
+    ) -> bool:
+        """Flush when ``spec watch`` posts ``role=assistant_closed`` for this session."""
+        if ev.role != "assistant_closed":
+            return False
+        if self.pending_user is None or not self.assistant_chunks:
+            return False
+        if (self.pending_user.project_id, self.pending_user.session_id) != (
+            ev.project_id,
+            ev.session_id,
+        ):
+            return False
+        cid = ev.closes_event_id
+        if cid is not None:
+            a_ids = [c.id for c in self.assistant_chunks]
+            lo, hi = min(a_ids), max(a_ids)
+            if cid < lo or cid > hi:
+                return False
+        self.flush_pair(notifier)
+        last_output_at[0] = time.monotonic()
         return True
 
     def tick_quiet_flush(
@@ -635,14 +681,14 @@ def team_watch_cmd(
 
     **Q/A coalescing (live SSE only):** each user prompt is printed as
     soon as it arrives. Assistant chunks merge until a flush boundary:
-    the next user message, an ``error`` row, ``/pair``, process exit, or
-    (unless ``--assistant-quiet-secs 0``) that many idle seconds after
-    the last assistant chunk. There is no wire-perfect "model finished"
-    detector today — the idle window is a best-effort heuristic; use
-    ``/pair`` when you know the reply is done, or ``0`` to rely only on
-    structure + ``/pair``. The paired block always uses the **full merged**
-    assistant body received so far. REST warm-up keeps the old per-event
-    layout.
+    an ``assistant_closed`` row from the teammate's ``spec watch`` (when
+    their tail assistant bubble stabilizes), the next user message, an
+    ``error`` row, ``/pair``, process exit, or (unless
+    ``--assistant-quiet-secs 0``) that many idle seconds after the last
+    assistant chunk. The idle window remains a fallback when the
+    broadcaster runs an older CLI that does not emit ``assistant_closed``.
+    The paired block always uses the **full merged** assistant body
+    received so far. REST warm-up keeps the old per-event layout.
 
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
@@ -760,7 +806,8 @@ def team_watch_cmd(
             notifier.show_command_result(
                 "interactive commands enabled — type /help for the list. "
                 "Use /pair when the assistant reply looks done but the paired "
-                "block has not printed yet. Two-stage Ctrl+C still exits.",
+                "block has not printed yet (older broadcasters without "
+                "assistant_closed). Two-stage Ctrl+C still exits.",
                 kind="info",
             )
         last_output_at[0] = time.monotonic()
@@ -818,6 +865,10 @@ def team_watch_cmd(
             force_show_assistant = True
 
         use_qa_coalesce = tick_clock
+
+        if use_qa_coalesce and ev.role == "assistant_closed":
+            qa.flush_on_assistant_closed(ev, notifier, last_output_at)
+            return
 
         if use_qa_coalesce and ev.role == "user":
             qa.on_user(ev, notifier, last_output_at)

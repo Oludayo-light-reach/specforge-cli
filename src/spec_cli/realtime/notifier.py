@@ -387,7 +387,7 @@ class Notifier:
         """
         if event.role == "user":
             self._remember_open_session(event)
-        elif event.role in ("assistant", "error"):
+        elif event.role in ("assistant", "error", "assistant_closed"):
             self._mark_session_replied(event)
 
     @staticmethod
@@ -428,7 +428,7 @@ class Notifier:
             # If a prior assistant/error in the same session is closer
             # to ``event`` than the user prompt, this row is a chain
             # continuation — the echo already happened, suppress it.
-            if ev.role in ("assistant", "error"):
+            if ev.role in ("assistant", "error", "assistant_closed"):
                 return None
             if ev.role != "user":
                 continue

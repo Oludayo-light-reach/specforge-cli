@@ -91,17 +91,17 @@ class HTTPPoster:
             }
         )
 
-    def send(self, event: OutgoingEvent, *, timeout: float | None = None) -> bool:
-        """POST one event. Returns True on success, False on any error.
+    def send(
+        self, event: OutgoingEvent, *, timeout: float | None = None
+    ) -> tuple[bool, int | None]:
+        """POST one event. Returns ``(ok, created_event_id)``.
 
-        Caller decides what to do on failure (retry next tick, advance
-        the cursor anyway, etc.). For ``spec watch`` we *don't* advance
-        the cursor on failure so the next poll re-attempts; eventual
-        consistency is fine for telemetry.
+        ``created_event_id`` is parsed from the JSON body on success when
+        the server returns an ``id`` field (Spec Cloud prompt events).
+        ``None`` means success without a usable id (legacy proxy) or
+        parse failure — callers may still treat the POST as delivered.
 
-        ``timeout`` overrides :data:`POST_TIMEOUT_SECS` for this call.
-        Callers in shutdown paths use a tighter value (a few seconds)
-        so a hung server can't stall the daemon's exit.
+        On failure returns ``(False, None)``.
         """
         try:
             r = self._session.post(
@@ -111,7 +111,7 @@ class HTTPPoster:
             )
         except requests.RequestException as e:
             log.warning("spec-live: post failed (network): %s", e)
-            return False
+            return False, None
         if r.status_code >= 400:
             body = r.text[:200]
             log.warning(
@@ -119,8 +119,17 @@ class HTTPPoster:
                 r.status_code,
                 body,
             )
-            return False
-        return True
+            return False, None
+        created: int | None = None
+        try:
+            data = r.json()
+            if isinstance(data, dict):
+                raw_id = data.get("id")
+                if isinstance(raw_id, int) and raw_id >= 1:
+                    created = raw_id
+        except (TypeError, ValueError):
+            pass
+        return True, created
 
     def close(self) -> None:
         try:

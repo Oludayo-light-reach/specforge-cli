@@ -178,9 +178,12 @@ class OutgoingEvent:
     # when ``--show-tool-runs`` is on; the wire always carries them
     # so the toggle can be flipped without re-fetching history.
     tool_calls: list[ToolCallPayload] = field(default_factory=list)
+    # ``role == "assistant_closed"`` only — references the last assistant
+    # row id returned by ``POST /prompt-events`` for this session.
+    closes_event_id: int | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "session_id": self.session_id,
             "source": self.source,
             "role": self.role,
@@ -196,6 +199,9 @@ class OutgoingEvent:
             "turn_at": _isoformat(self.turn_at),
             "tool_calls": [c.to_json() for c in (self.tool_calls or [])],
         }
+        if self.closes_event_id is not None and self.closes_event_id >= 1:
+            out["closes_event_id"] = self.closes_event_id
+        return out
 
 
 @dataclass
@@ -275,6 +281,7 @@ class IncomingEvent:
     presence: PresencePayload | None = None
     bundle_label: str | None = None
     tool_calls: list[ToolCallPayload] = field(default_factory=list)
+    closes_event_id: int | None = None
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "IncomingEvent":
@@ -288,6 +295,10 @@ class IncomingEvent:
                 tc = ToolCallPayload.from_json(entry)
                 if tc is not None:
                     tool_calls.append(tc)
+        raw_close = payload.get("closes_event_id")
+        closes_event_id: int | None = None
+        if isinstance(raw_close, int) and raw_close >= 1:
+            closes_event_id = raw_close
         return cls(
             id=int(payload["id"]),
             project_id=int(payload["project_id"]),
@@ -312,6 +323,7 @@ class IncomingEvent:
             presence=PresencePayload.from_json(payload.get("presence")),
             bundle_label=_str_or_none(payload.get("bundle_label")),
             tool_calls=tool_calls,
+            closes_event_id=closes_event_id,
         )
 
     @property

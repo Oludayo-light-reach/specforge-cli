@@ -254,8 +254,13 @@ def run_watcher(
                 # editing X" only on transitions; that's a §future
                 # polish.
                 if presence_cache.apply_event(event):
-                    _write_team_presence(opts, presence_cache, team_presence,
-                                          last_local_presence, branch_hint=event.branch)
+                    _write_team_presence(
+                        bundle_root,
+                        opts,
+                        presence_cache,
+                        team_presence,
+                        last_local_presence,
+                    )
                 return
             notifier.show(event)
             if mirror is not None:
@@ -272,8 +277,23 @@ def run_watcher(
 
     last_save = time.monotonic()
     last_presence_broadcast = 0.0
-    last_team_presence_tick = 0.0
+    # First loop iteration should run the team-presence mirror tick so
+    # hooks see a fresh file quickly; peers still expire on schedule.
+    last_team_presence_tick = time.monotonic() - DEFAULT_TEAM_PRESENCE_TICK_SECS
     last_presence_fingerprint = ""
+    # Prime the mirror with one local snapshot so ``self`` (branch +
+    # dirty files) exists before the first 15s presence POST tick.
+    try:
+        last_local_presence[:] = [compute_local_presence(bundle_root)]
+    except Exception:  # noqa: BLE001
+        pass
+    _write_team_presence(
+        bundle_root,
+        opts,
+        presence_cache,
+        team_presence,
+        last_local_presence,
+    )
     try:
         while not stop_event.is_set():
             tick_started = time.monotonic()
@@ -310,8 +330,13 @@ def run_watcher(
                         # Always rewrite the mirror — the local user's
                         # snapshot has changed even if the broadcast
                         # didn't reach the server yet.
-                        _write_team_presence(opts, presence_cache, team_presence,
-                                              last_local_presence)
+                        _write_team_presence(
+                            bundle_root,
+                            opts,
+                            presence_cache,
+                            team_presence,
+                            last_local_presence,
+                        )
                 except Exception as e:  # noqa: BLE001
                     log.warning("spec-live: presence tick error: %s", e)
                 last_presence_broadcast = now
@@ -320,8 +345,13 @@ def run_watcher(
             # new presence events arrive (so a peer who closed their
             # laptop disappears from the file in bounded time).
             if now - last_team_presence_tick >= DEFAULT_TEAM_PRESENCE_TICK_SECS:
-                _write_team_presence(opts, presence_cache, team_presence,
-                                      last_local_presence)
+                _write_team_presence(
+                    bundle_root,
+                    opts,
+                    presence_cache,
+                    team_presence,
+                    last_local_presence,
+                )
                 last_team_presence_tick = now
 
             if now - last_save >= CURSOR_SAVE_INTERVAL_SECS:
@@ -389,12 +419,11 @@ def run_watcher(
 
 
 def _write_team_presence(
+    bundle_root: Path,
     opts: WatcherOptions,
     cache: PresenceCache,
     team_presence: TeamPresenceMirror,
     last_local: list[LocalPresence],
-    *,
-    branch_hint: str | None = None,
 ) -> None:
     """Refresh ``.spec/team-presence.json`` from the cache + last
     known local snapshot. Quiet on the happy path; logs at debug level
@@ -402,12 +431,15 @@ def _write_team_presence(
     the mirror is updating."""
     try:
         local = last_local[0] if last_local else None
+        # Always derive ``self.branch`` from this machine's git — never
+        # from inbound SSE (that would be a peer's branch name).
+        branch = read_git_context(bundle_root).branch
         team_presence.write(
             cache,
             local=local,
             self_handle=opts.self_handle,
             self_name=opts.self_name,
-            branch=branch_hint,
+            branch=branch,
         )
     except Exception as e:  # noqa: BLE001
         log.debug("spec-live: team-presence write skipped: %s", e)

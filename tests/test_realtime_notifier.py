@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from collections import deque
 from io import StringIO
 from unittest.mock import MagicMock
 
@@ -248,6 +249,67 @@ def test_second_assistant_does_not_repeat_stale_prompt(monkeypatch):
     n.show(a1)
     n.show(a2)
     assert cap.export_text().count("⤷ prompt") == 1
+
+
+def test_assistant_pairs_prompt_from_buffer_when_pending_missing(
+    monkeypatch,
+):
+    """If the USER row never hit ``_pending_user_prompt``, scan buffer."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    pid = 77
+    sid = "cursor-sess-buf"
+    user = IncomingEvent(
+        id=10,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="First user instruction that must echo under the assistant.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    assistant = IncomingEvent(
+        id=11,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Short headline.",
+        text="The assistant reply body.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    buf = deque([user, assistant], maxlen=50)
+    n = Notifier(critic_enabled=False, pairing_buffer=buf)
+    n.show(assistant)
+    out = cap.export_text()
+    assert "⤷ prompt" in out
+    assert "First user instruction" in out
 
 
 def test_assistant_prefers_full_text_over_one_line_summary(monkeypatch):

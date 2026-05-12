@@ -308,14 +308,11 @@ _BUBBLE_TYPE_ASSISTANT = 2
 # captured `.prompts` files visually consistent across sources.
 _SUMMARY_CHARS: int = 200
 
-# Default cap on the assistant `text` *preview* when `verbose=True`. The
-# whole point of capturing `text` (vs. `summary` only) is to give a
-# reviewer enough context to evaluate what the agent actually said, not
-# to mirror the full transcript. 4000 chars is roughly the first 600
-# words — long enough to read the AI's reasoning, short enough that
-# `.prompts` files stay diff-friendly. The schema's hard cap
-# (`MAX_TURN_TEXT_CHARS = 512 KiB`) still applies.
-_PREVIEW_CHARS: int = 4000
+# Default cap on the assistant `text` *preview* when `verbose=True`.
+# Large enough for team review + Spec Live; still below the schema hard
+# cap (`MAX_TURN_TEXT_CHARS = 512 KiB`). The watcher truncates again
+# before POSTing prompt events.
+_PREVIEW_CHARS: int = 48_000
 
 
 def _first_sentence(text: str) -> str:

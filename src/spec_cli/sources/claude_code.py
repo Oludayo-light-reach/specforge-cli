@@ -133,10 +133,10 @@ def _iter_jsonl(path: Path) -> Iterator[_RawEntry]:
 # "short bounded text" contract in docs/prompt-format.md.
 _SUMMARY_CHARS: int = 200
 
-# Default preview cap for `text` when `verbose=True`. See cursor.py for
-# the rationale — same number on both adapters so captured files read
-# consistently regardless of which agent produced them.
-_PREVIEW_CHARS: int = 4000
+# Default preview cap for `text` when `verbose=True`. Large enough for
+# typical assistant rows on the Spec Live wire; watcher truncates again
+# to ``MAX_TURN_TEXT_CHARS`` before POST. Kept aligned across adapters.
+_PREVIEW_CHARS: int = 48_000
 
 
 def _first_sentence(text: str) -> str:

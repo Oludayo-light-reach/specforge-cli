@@ -24,6 +24,7 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from ..ui import console
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
@@ -148,13 +149,13 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit].rstrip() + "…"
 
 
-# Terminal preview limits. User prompts stay relatively short; assistant
-# bodies can be large when the broadcaster + SSE ``verbose`` pipeline
-# ships full ``text`` — we must not collapse that back to the one-line
-# ``summary`` or a 200-char cap or reviewers never see the actual reply.
-_PREVIEW_USER = (400, 120)  # (non-compact, compact)
-_PREVIEW_ASSISTANT = (48_000, 500)  # (non-compact, compact)
-_PREVIEW_ERROR = (12_000, 120)
+# Terminal preview limits (chars, excluding the trailing ellipsis).
+# Defaults favour team review: long user prompts and large assistant
+# replies stay readable without ``--compact``; compact mode stays
+# bounded so one-line logging stays usable.
+_PREVIEW_USER = (48_000, 2_000)  # (non-compact, compact)
+_PREVIEW_ASSISTANT = (96_000, 8_000)  # (non-compact, compact)
+_PREVIEW_ERROR = (24_000, 800)
 
 # How long we wait for an assistant follow-up to a user prompt before
 # we surface a "no AI reply seen yet" hint. 90 seconds is a sweet
@@ -197,6 +198,7 @@ class Notifier:
         compact: bool = False,
         critic_enabled: bool = True,
         notify: bool = False,
+        pairing_buffer: Any = None,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
@@ -221,6 +223,10 @@ class Notifier:
         self._pending_user_prompt: dict[
             tuple[int, str], tuple[str, str]
         ] = {}
+        # Optional bounded deque of recent events (``spec team watch``).
+        # When the warm-up window skipped the triggering USER row, we
+        # still recover the prompt for ``⤷ prompt`` by scanning back.
+        self._pairing_buffer = pairing_buffer
 
     def set_critic_enabled(self, enabled: bool) -> None:
         """Toggle the auto-critic at runtime. Used by the ``/critic``
@@ -236,6 +242,36 @@ class Notifier:
             # one session's prompt into another on the same project.
             sid = f"_ev:{event.id}"
         return (event.project_id, sid)
+
+    def _pairing_prompt_from_buffer(
+        self, event: IncomingEvent
+    ) -> tuple[str, str] | None:
+        """Find the most recent user turn for this session with ``id``
+        strictly before ``event`` — used when ``_pending_user_prompt``
+        missed the USER frame (bootstrap gap, reconnect, or bursty
+        assistant rows)."""
+        buf = self._pairing_buffer
+        if buf is None:
+            return None
+        key = self._session_pair_key(event)
+        try:
+            tail = reversed(buf)
+        except TypeError:
+            return None
+        for ev in tail:
+            if ev.id >= event.id:
+                continue
+            if ev.role != "user":
+                continue
+            if self._session_pair_key(ev) != key:
+                continue
+            preview = (ev.text or ev.summary or "").strip()
+            if not preview:
+                continue
+            lim_u, lim_uc = _PREVIEW_USER
+            preview = _truncate(preview, lim_uc if self._compact else lim_u)
+            return (ev.author_display, preview)
+        return None
 
     def show(self, event: IncomingEvent) -> None:
         time_label = _short_time(event.turn_at or event.received_at)
@@ -315,6 +351,8 @@ class Notifier:
             if self._critic_enabled:
                 critiques = critique_event(event)
             pending_prompt = self._pending_user_prompt.pop(pair_key, None)
+            if pending_prompt is None:
+                pending_prompt = self._pairing_prompt_from_buffer(event)
         else:
             # Prefer full ``text`` over ``summary`` — both are usually set
             # for assistant turns, and the summary is only a headline.
@@ -340,6 +378,8 @@ class Notifier:
             if self._critic_enabled:
                 critiques = critique_event(event)
             pending_prompt = self._pending_user_prompt.pop(pair_key, None)
+            if pending_prompt is None:
+                pending_prompt = self._pairing_prompt_from_buffer(event)
 
         with self._lock:
             if self._compact:

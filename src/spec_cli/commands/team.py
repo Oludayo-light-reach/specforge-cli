@@ -207,9 +207,9 @@ def _run_team_snapshot(
             if event.role == "assistant":
                 # Same preference as :class:`Notifier` — ``summary`` is a
                 # headline; ``text`` carries the reply reviewers skim for.
-                budget, max_lines = 4000, 24
+                budget, max_lines = 96_000, 120
             else:
-                budget, max_lines = 200, 1
+                budget, max_lines = 48_000, 80
             lines: list[str] = []
             used = 0
             for line in raw.splitlines():
@@ -332,8 +332,10 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # connect that cursor is empty — so we prime the pane from REST once
 # (same bundles as the stream) and then resume the socket from the
 # newest id so reviewers still see the user prompt that kicked off a
-# thread they joined mid-flight.
-_TEAM_WATCH_BOOTSTRAP_LIMIT = 40
+# thread they joined mid-flight. Keep this comfortably above bursty
+# assistant-only streaks (Claude Code JSONL) so the USER row is still
+# in the warm-up batch.
+_TEAM_WATCH_BOOTSTRAP_LIMIT = 250
 
 
 def _stdin_is_interactive() -> bool:
@@ -511,21 +513,24 @@ def team_watch_cmd(
         fatal("Not signed in. Run `spec login` first.")
         return
 
+    # Bounded in-memory event memory shared with the command layer:
+    # /summarize, /replay, /status all read from this. Updated in
+    # the consumer callback, so command handlers see exactly what
+    # has been received in this session. The notifier reads the same
+    # deque to attach ``⤷ prompt`` when the REST warm-up skipped the
+    # USER row before an assistant reply.
+    event_buffer = make_buffer()
     notifier = Notifier(
         compact=compact,
         critic_enabled=critic_enabled,
         notify=notify,
+        pairing_buffer=event_buffer,
     )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle
     # heartbeat printer doesn't fire on top of fresh content.
     last_output_at = [time.monotonic()]
 
-    # Bounded in-memory event memory shared with the command layer:
-    # /summarize, /replay, /status all read from this. Updated in
-    # the consumer callback, so command handlers see exactly what
-    # has been received in this session.
-    event_buffer = make_buffer()
     watch_state = WatchState(critic_enabled=critic_enabled)
 
     # Map event_id → project_id so /flag can post against the right

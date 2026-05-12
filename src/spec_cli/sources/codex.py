@@ -56,7 +56,7 @@ from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 _DEFAULT_CURSOR_HOME = "~/.cursor"
 _DEFAULT_CODEX_HOME = "~/.codex"
 _SUMMARY_CHARS: int = 200
-_PREVIEW_CHARS: int = 4000
+_PREVIEW_CHARS: int = 48_000
 
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/=-]+"), True),

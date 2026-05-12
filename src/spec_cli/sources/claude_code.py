@@ -31,7 +31,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from ..prompts.schema import MAX_TURN_MODEL_CHARS, Session, ToolCall, Turn, validate_session
+from ..prompts.schema import (
+    MAX_TURN_MODEL_CHARS,
+    MAX_TURN_TEXT_CHARS,
+    Session,
+    ToolCall,
+    Turn,
+    validate_session,
+)
 from ..prompts.text_sanitize import sanitize_for_toml_text
 from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 
@@ -133,11 +140,6 @@ def _iter_jsonl(path: Path) -> Iterator[_RawEntry]:
 # "short bounded text" contract in docs/prompt-format.md.
 _SUMMARY_CHARS: int = 200
 
-# Default preview cap for `text` when `verbose=True`. Large enough for
-# typical assistant rows on the Spec Live wire; watcher truncates again
-# to ``MAX_TURN_TEXT_CHARS`` before POST. Kept aligned across adapters.
-_PREVIEW_CHARS: int = 48_000
-
 
 def _first_sentence(text: str) -> str:
     """Extract a sentence-ish prefix for the `summary` field."""
@@ -156,15 +158,15 @@ def _first_sentence(text: str) -> str:
 
 
 def _preview(text: str) -> str:
-    """Truncate to the preview window, adding an ellipsis when we cut."""
+    """Truncate to schema max; watcher may truncate again before POST."""
     stripped = text.strip()
-    if len(stripped) <= _PREVIEW_CHARS:
+    if len(stripped) <= MAX_TURN_TEXT_CHARS:
         return stripped
-    cut = stripped.rfind("\n\n", 0, _PREVIEW_CHARS)
-    if cut < _PREVIEW_CHARS // 2:
-        cut = stripped.rfind("\n", 0, _PREVIEW_CHARS)
-    if cut < _PREVIEW_CHARS // 2:
-        cut = _PREVIEW_CHARS
+    cut = stripped.rfind("\n\n", 0, MAX_TURN_TEXT_CHARS)
+    if cut < MAX_TURN_TEXT_CHARS // 2:
+        cut = stripped.rfind("\n", 0, MAX_TURN_TEXT_CHARS)
+    if cut < MAX_TURN_TEXT_CHARS // 2:
+        cut = MAX_TURN_TEXT_CHARS
     return stripped[:cut].rstrip() + "\n\n[…truncated…]"
 
 

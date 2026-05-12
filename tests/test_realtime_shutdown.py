@@ -335,6 +335,96 @@ def test_producer_tick_bails_between_turns(tmp_path, monkeypatch):
     assert sent_count[0] == 1
 
 
+def test_producer_tail_assistant_reposts_then_advances_when_stable(
+    tmp_path, monkeypatch
+):
+    """Cursor streams one assistant bubble: text grows on disk while
+    ``broadcast_turns`` must stay pinned so we POST again; only after
+    the fingerprint is quiet for ``TAIL_ASSISTANT_STABILITY_SECS`` do
+    we advance the cursor."""
+    from spec_cli.prompts.schema import Session, Turn
+    from spec_cli.realtime.tracker import LiveCursor
+
+    u = Turn(role="user", text="hello", at=None)
+    a = Turn(role="assistant", text="part", at=None)
+    session = Session(
+        id="s1",
+        source="cursor",
+        title="t",
+        turns=[u, a],
+        cwd=str(tmp_path),
+        paths_touched=[],
+        verbose=True,
+    )
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher._iter_local_sessions",
+        lambda _paths: iter([session]),
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.historical_bundle_paths",
+        lambda _root: [],
+    )
+
+    class _StubGit:
+        branch = "main"
+        commit_sha = None
+        author_name = "test"
+        author_email = "test@example.com"
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.read_git_context", lambda _root: _StubGit()
+    )
+
+    clock = [0.0]
+
+    def _mono() -> float:
+        return clock[0]
+
+    monkeypatch.setattr("spec_cli.realtime.watcher.time.monotonic", _mono)
+
+    poster = _StubPoster()
+    cursor = LiveCursor.load(tmp_path, project_id=1)
+    holds: dict = {}
+    stop_event = threading.Event()
+
+    _producer_tick(
+        bundle_root=tmp_path,
+        cursor=cursor,
+        poster=poster,
+        opts=_make_opts(),
+        stop_event=stop_event,
+        assistant_tail_holds=holds,
+    )
+    assert len(poster.events) == 2
+    assert cursor.turns_broadcast_for("s1") == 1
+
+    clock[0] = 0.1
+    a.text = "part — full reply"
+    _producer_tick(
+        bundle_root=tmp_path,
+        cursor=cursor,
+        poster=poster,
+        opts=_make_opts(),
+        stop_event=stop_event,
+        assistant_tail_holds=holds,
+    )
+    assert len(poster.events) == 3
+    assert cursor.turns_broadcast_for("s1") == 1
+
+    clock[0] = 1.0
+    _producer_tick(
+        bundle_root=tmp_path,
+        cursor=cursor,
+        poster=poster,
+        opts=_make_opts(),
+        stop_event=stop_event,
+        assistant_tail_holds=holds,
+    )
+    assert len(poster.events) == 3
+    assert cursor.turns_broadcast_for("s1") == 2
+
+
 # ── Issue 3: run_watcher exits promptly on stop_event ──────────────
 
 

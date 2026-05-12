@@ -43,6 +43,7 @@ from typing import Any, Iterable, Iterator
 
 from ..prompts.schema import (
     MAX_TURN_MODEL_CHARS,
+    MAX_TURN_TEXT_CHARS,
     Session,
     ToolCall,
     Turn,
@@ -56,7 +57,6 @@ from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 _DEFAULT_CURSOR_HOME = "~/.cursor"
 _DEFAULT_CODEX_HOME = "~/.codex"
 _SUMMARY_CHARS: int = 200
-_PREVIEW_CHARS: int = 48_000
 
 _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/=-]+"), True),
@@ -164,13 +164,13 @@ def _first_sentence(text: str) -> str:
 
 def _preview(text: str) -> str:
     stripped = text.strip()
-    if len(stripped) <= _PREVIEW_CHARS:
+    if len(stripped) <= MAX_TURN_TEXT_CHARS:
         return stripped
-    cut = stripped.rfind("\n\n", 0, _PREVIEW_CHARS)
-    if cut < _PREVIEW_CHARS // 2:
-        cut = stripped.rfind("\n", 0, _PREVIEW_CHARS)
-    if cut < _PREVIEW_CHARS // 2:
-        cut = _PREVIEW_CHARS
+    cut = stripped.rfind("\n\n", 0, MAX_TURN_TEXT_CHARS)
+    if cut < MAX_TURN_TEXT_CHARS // 2:
+        cut = stripped.rfind("\n", 0, MAX_TURN_TEXT_CHARS)
+    if cut < MAX_TURN_TEXT_CHARS // 2:
+        cut = MAX_TURN_TEXT_CHARS
     return stripped[:cut].rstrip() + "\n\n[…truncated…]"
 
 

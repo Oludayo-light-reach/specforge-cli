@@ -28,6 +28,7 @@ from typing import Any
 
 from rich.markup import escape
 
+from ..prompts.schema import MAX_TURN_TEXT_CHARS
 from ..ui import console
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
 from .events import IncomingEvent, IncomingFlag
@@ -156,7 +157,9 @@ def _truncate(text: str, limit: int) -> str:
 # replies stay readable without ``--compact``; compact mode stays
 # bounded so one-line logging stays usable.
 _PREVIEW_USER = (48_000, 2_000)  # (non-compact, compact)
-_PREVIEW_ASSISTANT = (96_000, 8_000)  # (non-compact, compact)
+# Match schema / capture adapters so long in-chat code blocks are not
+# clipped in the pane before the wire payload would be.
+_PREVIEW_ASSISTANT = (MAX_TURN_TEXT_CHARS, 12_000)  # (non-compact, compact)
 _PREVIEW_ERROR = (24_000, 800)
 
 # How long we wait for an assistant follow-up to a user prompt before

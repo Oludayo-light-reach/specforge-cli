@@ -20,6 +20,7 @@ work and save the cursor before exiting.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import signal
 import threading
@@ -92,6 +93,26 @@ MAX_TURN_TEXT_CHARS = 480 * 1024
 # is almost always an artefact of an empty draft submit; we don't want
 # to flood the team feed with blanks.
 MIN_TURN_TEXT_CHARS = 1
+# Final assistant turns (Cursor streams into one bubble) may grow on
+# disk between producer polls. We POST updates while ``text``
+# changes, then delay advancing ``broadcast_turns`` until the body
+# stays unchanged for this quiet window so the last POST carries the
+# full reply.
+TAIL_ASSISTANT_STABILITY_SECS = 0.85
+
+
+@dataclass
+class _AssistantTailHold:
+    """Tracks the last assistant bubble while it may still be streaming."""
+
+    turn_idx: int
+    fp: str
+    last_fp_change: float  # ``time.monotonic()`` when ``fp`` last changed
+
+
+def _assistant_text_fingerprint(text: str | None) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
 
 
 @dataclass
@@ -277,6 +298,7 @@ def run_watcher(
 
     last_save = time.monotonic()
     last_presence_broadcast = 0.0
+    assistant_tail_holds: dict[str, _AssistantTailHold] = {}
     # First loop iteration should run the team-presence mirror tick so
     # hooks see a fresh file quickly; peers still expire on schedule.
     last_team_presence_tick = time.monotonic() - DEFAULT_TEAM_PRESENCE_TICK_SECS
@@ -305,6 +327,7 @@ def run_watcher(
                         poster=poster,
                         opts=opts,
                         stop_event=stop_event,
+                        assistant_tail_holds=assistant_tail_holds,
                     )
                 except Exception as e:  # noqa: BLE001
                     log.warning("spec-live: producer tick error: %s", e)
@@ -514,6 +537,7 @@ def _producer_tick(
     poster: HTTPPoster,
     opts: WatcherOptions,
     stop_event: threading.Event,
+    assistant_tail_holds: dict[str, _AssistantTailHold] | None = None,
 ) -> None:
     """One pass over local transcripts; broadcast new turns.
 
@@ -538,6 +562,7 @@ def _producer_tick(
     ):
         return  # outside the filter — skip this tick entirely
     paths = historical_bundle_paths(bundle_root)
+    holds = assistant_tail_holds if assistant_tail_holds is not None else {}
 
     for session in _iter_local_sessions(paths):
         if stop_event.is_set():
@@ -554,15 +579,48 @@ def _producer_tick(
             if event is None:
                 # Skip empty / undeliverable turn but still advance
                 # the cursor so we don't rescan it forever.
+                holds.pop(session.id, None)
                 cursor.record_broadcast(session.id, prev + offset + 1)
                 continue
+
+            turn_idx = prev + offset
+            is_tail_assistant = (
+                turn.role == "assistant"
+                and turn_idx == len(session.turns) - 1
+            )
+
+            if is_tail_assistant:
+                fp = _assistant_text_fingerprint(turn.text)
+                hold = holds.get(session.id)
+                now_m = time.monotonic()
+                if (
+                    hold is not None
+                    and hold.turn_idx == turn_idx
+                    and fp == hold.fp
+                ):
+                    if now_m - hold.last_fp_change >= TAIL_ASSISTANT_STABILITY_SECS:
+                        holds.pop(session.id, None)
+                        cursor.record_broadcast(session.id, turn_idx + 1)
+                    continue
+
             if not poster.send(event):
                 # Network blip — try this turn again next tick. Don't
                 # advance the cursor; we'd rather double-deliver
                 # (server is idempotent on session_id+role+turn_at)
                 # than skip.
                 return
-            cursor.record_broadcast(session.id, prev + offset + 1)
+
+            if is_tail_assistant:
+                fp = _assistant_text_fingerprint(turn.text)
+                holds[session.id] = _AssistantTailHold(
+                    turn_idx=turn_idx,
+                    fp=fp,
+                    last_fp_change=time.monotonic(),
+                )
+                continue
+
+            holds.pop(session.id, None)
+            cursor.record_broadcast(session.id, turn_idx + 1)
 
 
 def _iter_local_sessions(paths) -> Iterable[Session]:  # type: ignore[no-untyped-def]

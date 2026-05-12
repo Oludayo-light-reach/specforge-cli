@@ -65,7 +65,13 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
-from ..prompts.schema import MAX_TURN_MODEL_CHARS, Session, Turn, validate_session
+from ..prompts.schema import (
+    MAX_TURN_MODEL_CHARS,
+    MAX_TURN_TEXT_CHARS,
+    Session,
+    Turn,
+    validate_session,
+)
 from ..prompts.text_sanitize import sanitize_for_toml_text
 
 
@@ -378,12 +384,6 @@ def _bubble_has_assistant_activity(bubble: dict[str, Any]) -> bool:
             return True
     return False
 
-# Default cap on the assistant `text` *preview* when `verbose=True`.
-# Large enough for team review + Spec Live; still below the schema hard
-# cap (`MAX_TURN_TEXT_CHARS = 512 KiB`). The watcher truncates again
-# before POSTing prompt events.
-_PREVIEW_CHARS: int = 48_000
-
 
 def _first_sentence(text: str) -> str:
     stripped = text.strip()
@@ -399,17 +399,22 @@ def _first_sentence(text: str) -> str:
 
 
 def _preview(text: str) -> str:
-    """Truncate to the preview window, adding an ellipsis when we cut."""
+    """Truncate to the schema max turn size, adding a marker when we cut.
+
+    Uses :data:`MAX_TURN_TEXT_CHARS` so Spec Live and ``.prompts`` capture
+    can ship long assistant replies (large markdown code blocks, pasted
+    logs) without an extra 48 KiB adapter-specific ceiling. The watcher
+    still applies its own outbound cap before POST."""
     stripped = text.strip()
-    if len(stripped) <= _PREVIEW_CHARS:
+    if len(stripped) <= MAX_TURN_TEXT_CHARS:
         return stripped
     # Try to break at a paragraph or newline boundary so the preview
     # ends at a natural reading point, not mid-sentence.
-    cut = stripped.rfind("\n\n", 0, _PREVIEW_CHARS)
-    if cut < _PREVIEW_CHARS // 2:
-        cut = stripped.rfind("\n", 0, _PREVIEW_CHARS)
-    if cut < _PREVIEW_CHARS // 2:
-        cut = _PREVIEW_CHARS
+    cut = stripped.rfind("\n\n", 0, MAX_TURN_TEXT_CHARS)
+    if cut < MAX_TURN_TEXT_CHARS // 2:
+        cut = stripped.rfind("\n", 0, MAX_TURN_TEXT_CHARS)
+    if cut < MAX_TURN_TEXT_CHARS // 2:
+        cut = MAX_TURN_TEXT_CHARS
     return stripped[:cut].rstrip() + "\n\n[…truncated…]"
 
 

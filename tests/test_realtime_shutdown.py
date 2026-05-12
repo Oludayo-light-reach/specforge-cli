@@ -425,6 +425,73 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
     assert cursor.turns_broadcast_for("s1") == 2
 
 
+def test_producer_does_not_skip_empty_tail_assistant_slot(tmp_path, monkeypatch):
+    """Cursor can list a final assistant turn before any body is on disk.
+    Advancing past it would drop the reply entirely (team watch shows
+    only heartbeats after the user row)."""
+    from spec_cli.prompts.schema import Session, Turn
+    from spec_cli.realtime.tracker import LiveCursor
+
+    u = Turn(role="user", text="hello", at=None)
+    a = Turn(role="assistant", text="", at=None, summary=None)
+    session = Session(
+        id="s2",
+        source="cursor",
+        title="t",
+        turns=[u, a],
+        cwd=str(tmp_path),
+        paths_touched=[],
+        verbose=True,
+    )
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher._iter_local_sessions",
+        lambda _paths: iter([session]),
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.historical_bundle_paths",
+        lambda _root: [],
+    )
+
+    class _StubGit:
+        branch = "main"
+        commit_sha = None
+        author_name = "test"
+        author_email = "test@example.com"
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.read_git_context", lambda _root: _StubGit()
+    )
+
+    poster = _StubPoster()
+    cursor = LiveCursor.load(tmp_path, project_id=1)
+    holds: dict = {}
+    stop_event = threading.Event()
+
+    _producer_tick(
+        bundle_root=tmp_path,
+        cursor=cursor,
+        poster=poster,
+        opts=_make_opts(),
+        stop_event=stop_event,
+        assistant_tail_holds=holds,
+    )
+    assert len(poster.events) == 1
+    assert cursor.turns_broadcast_for("s2") == 1
+
+    a.text = "finally"
+    _producer_tick(
+        bundle_root=tmp_path,
+        cursor=cursor,
+        poster=poster,
+        opts=_make_opts(),
+        stop_event=stop_event,
+        assistant_tail_holds=holds,
+    )
+    assert len(poster.events) == 2
+    assert cursor.turns_broadcast_for("s2") == 1
+
+
 # ── Issue 3: run_watcher exits promptly on stop_event ──────────────
 
 

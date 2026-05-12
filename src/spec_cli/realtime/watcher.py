@@ -579,8 +579,19 @@ def _producer_tick(
                 return
             event = _build_outgoing(session, turn, branch=branch, git=git, opts=opts)
             if event is None:
-                # Skip empty / undeliverable turn but still advance
-                # the cursor so we don't rescan it forever.
+                # Skip empty / undeliverable turn but still advance the
+                # cursor so we don't rescan it forever.
+                #
+                # Exception: Cursor often materialises the assistant row
+                # before ``text`` / tool summaries exist on disk. If we
+                # advance past that slot, the real reply never POSTs and
+                # ``spec team watch`` shows only heartbeats after the user
+                # prompt. Retry next poll until the turn becomes shippable.
+                if (
+                    turn.role == "assistant"
+                    and (prev + offset) == len(session.turns) - 1
+                ):
+                    continue
                 holds.pop(session.id, None)
                 cursor.record_broadcast(session.id, prev + offset + 1)
                 continue

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
-from spec_cli.commands.team import _TeamWatchQAState
+from spec_cli.commands.team import (
+    _TeamWatchQAState,
+    _resolve_assistant_quiet_secs,
+)
 from spec_cli.realtime.events import IncomingEvent
 
 
@@ -58,3 +62,35 @@ def test_merge_assistant_chunks_single() -> None:
 def test_merge_assistant_chunks_empty_raises() -> None:
     with pytest.raises(ValueError):
         _TeamWatchQAState._merge_assistant_chunks([])
+
+
+def test_resolve_assistant_quiet_secs_cli_overrides_env(monkeypatch) -> None:
+    monkeypatch.setenv("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS", "99")
+    assert _resolve_assistant_quiet_secs(12.0) == 12.0
+
+
+def test_resolve_assistant_quiet_secs_env(monkeypatch) -> None:
+    monkeypatch.setenv("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS", "3600")
+    assert _resolve_assistant_quiet_secs(None) == 3600.0
+
+
+def test_resolve_assistant_quiet_secs_zero_means_timer_off(monkeypatch) -> None:
+    monkeypatch.delenv("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS", raising=False)
+    assert _resolve_assistant_quiet_secs(0.0) == 0.0
+
+
+def test_resolve_assistant_quiet_secs_default_zero_without_env(monkeypatch) -> None:
+    monkeypatch.delenv("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS", raising=False)
+    assert _resolve_assistant_quiet_secs(None) == 0.0
+
+
+def test_tick_quiet_flush_skipped_when_quiet_secs_zero(monkeypatch) -> None:
+    """``quiet_secs=0`` never flushes on idle — only user/error/shutdown."""
+    monkeypatch.setattr("time.monotonic", lambda: 1e12)
+    qa = _TeamWatchQAState()
+    qa.pending_user = _ev(id=1, role="user", text="hi")
+    qa.assistant_chunks = [_ev(id=2, role="assistant", text="yo")]
+    qa.last_assistant_mono = 0.0
+    n = MagicMock()
+    qa.tick_quiet_flush(n, [0.0], quiet_secs=0.0)
+    n.show_completed_pair.assert_not_called()

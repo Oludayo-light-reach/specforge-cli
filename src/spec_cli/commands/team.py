@@ -17,6 +17,7 @@ Subcommands:
 """
 from __future__ import annotations
 
+import os
 import re
 import signal
 import sys
@@ -338,20 +339,38 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # in the warm-up batch.
 _TEAM_WATCH_BOOTSTRAP_LIMIT = 250
 
-# Seconds with no new assistant chunk on the wire before we treat the
-# reply as finished and print the paired Q/A block. 18s survives model
-# pauses between list items better than the broadcaster's 5s tail
-# heuristic; ``spec team watch`` is review-first, not token streaming.
-_TEAM_WATCH_ASSISTANT_QUIET_SECS = 18.0
+# Default ``0`` = never flush the paired block on a timer alone; we only
+# flush on the next user message, an ``error`` row, or process exit. That
+# way a single assistant run can pause for hours or days without ever
+# splitting mid-reply — the merged body is always whatever chunks have
+# arrived so far. Set ``--assistant-quiet-secs`` or
+# ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS`` to a positive number if you want
+# an idle timeout (e.g. 1800) so a lone prompt still pairs without a follow-up.
+_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 0.0
+
+
+def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
+    """CLI wins, then env ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS``, then default.
+
+    ``0`` disables idle-based flush (pair only on next user, error, or exit).
+    """
+    if cli_value is not None:
+        return max(0.0, float(cli_value))
+    raw = (os.environ.get("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT
 
 
 class _TeamWatchQAState:
     """Coalesce streaming assistant rows into one readable Q/A block.
 
-    The user always sees their ``USER`` row immediately; once assistant
-    chunks go quiet (or a new user message arrives), we print the prompt
-    again bundled with the merged assistant body — see
-    :meth:`Notifier.show_completed_pair`.
+    The user always sees their ``USER`` row immediately; assistant
+    chunks merge until a flush boundary (idle quiet, next user
+    message, ``error``, or exit) — see :meth:`Notifier.show_completed_pair`.
     """
 
     def __init__(self) -> None:
@@ -417,6 +436,10 @@ class _TeamWatchQAState:
         last_output_at: list[float],
         quiet_secs: float,
     ) -> None:
+        # ``0`` = never flush on idle — wait for next user message, error,
+        # or shutdown so a single turn can run arbitrarily long (hours).
+        if quiet_secs <= 0:
+            return
         if (
             self.pending_user is None
             or not self.assistant_chunks
@@ -581,6 +604,18 @@ def _stdin_reader(ctx: "CommandContext", stop_event: threading.Event) -> None:
         "on when you can't keep eyes on the pane."
     ),
 )
+@click.option(
+    "--assistant-quiet-secs",
+    type=float,
+    default=None,
+    help=(
+        "Seconds with no new assistant chunk before printing the paired "
+        "Q/A block without another user message. Default 0 (wait only for "
+        "the next user message, error, or exit). Set a positive value or "
+        "SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS (e.g. 1800) for an idle "
+        "timeout so a solo thread still pairs without a follow-up prompt."
+    ),
+)
 def team_watch_cmd(
     compact: bool,
     include_presence: bool,
@@ -591,6 +626,7 @@ def team_watch_cmd(
     show_tool_runs: bool,
     commands_enabled: bool,
     notify: bool,
+    assistant_quiet_secs: float | None,
 ) -> None:
     """Live SSE tail across every bundle you can see (workspace-wide).
 
@@ -600,11 +636,13 @@ def team_watch_cmd(
     second press forces.
 
     **Q/A coalescing (live SSE only):** each user prompt is printed as
-    soon as it arrives. Assistant rows for that prompt are buffered
-    until the stream is quiet for about 18 seconds (or until a new user
-    message / error), then the prompt is shown again together with the
-    merged assistant body in one ``paired reply`` block. REST warm-up
-    uses the old per-event layout.
+    soon as it arrives. Assistant chunks merge in memory until a flush
+    boundary: the next user message, an ``error`` row, process exit, or
+    (if ``--assistant-quiet-secs`` / env is positive) that many idle
+    seconds with no new assistant chunk. The paired block always repeats
+    the prompt with the **full merged** assistant body received so far.
+    Default quiet is ``0`` (no idle flush). REST warm-up keeps the old
+    per-event layout.
 
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
@@ -634,6 +672,8 @@ def team_watch_cmd(
     if not creds or not creds.access_token:
         fatal("Not signed in. Run `spec login` first.")
         return
+
+    assistant_quiet_resolved = _resolve_assistant_quiet_secs(assistant_quiet_secs)
 
     # Bounded in-memory event memory shared with the command layer:
     # /summarize, /replay, /status all read from this. Updated in
@@ -870,7 +910,7 @@ def team_watch_cmd(
             qa.tick_quiet_flush(
                 notifier,
                 last_output_at,
-                _TEAM_WATCH_ASSISTANT_QUIET_SECS,
+                assistant_quiet_resolved,
             )
             # Surface "AI has not replied" hints on every loop tick.
             # Cheap (O(open_sessions)) and only prints on the first

@@ -349,6 +349,104 @@ def test_show_tool_runs_renders_each_tool_call_under_body(monkeypatch):
     assert 'Bash "pytest -q"' in out
 
 
+def test_show_tool_runs_compact_still_renders_tool_calls(monkeypatch):
+    """``--compact`` used to ``return`` before ``_render_tool_calls``,
+    so ``spec team watch --compact --show-tool-runs`` silently dropped
+    the tool list — the flag must still expand tools under the one-line
+    summary."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    ev = IncomingEvent(
+        id=203,
+        project_id=1,
+        session_id="sess-tools-compact",
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Done.",
+        text="Done.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+        tool_calls=[ToolCallPayload(name="Read", args={"path": "x.py"})],
+    )
+    n = Notifier(critic_enabled=False, compact=True, show_tool_runs=True)
+    n.show(ev)
+    out = cap.export_text()
+    assert "1 tool run" in out
+    assert "Read x.py" in out
+
+
+def test_show_completed_pair_renders_paired_banner(monkeypatch):
+    """``show_completed_pair`` is the second-pass Q/A bundle for team watch."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    user = IncomingEvent(
+        id=300,
+        project_id=1,
+        session_id="sess-pair",
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="Why is this broken?",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    assistant = IncomingEvent(
+        id=301,
+        project_id=1,
+        session_id="sess-pair",
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Fixed.",
+        text="Fixed.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    n = Notifier(critic_enabled=False)
+    n.show_completed_pair(user, assistant)
+    out = cap.export_text()
+    assert "paired reply" in out
+    assert "#300" in out and "#301" in out
+    assert "Why is this broken?" in out
+    assert "Fixed." in out
+    assert len(n._recent_completed_pairs) == 1
+
+
 def test_default_team_watch_does_not_render_tool_calls(monkeypatch):
     """Without ``--show-tool-runs``, the structured tool list must not
     leak into the pane — the default view is prose only."""

@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections import deque
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -357,6 +358,12 @@ class Notifier:
         # Signed-in viewer (``spec team watch`` only). Skip no-reply
         # tracking for your own user prompts — the hint is for teammates.
         self._viewer_handle = (viewer_handle or "").strip().lower() or None
+        # ``spec team watch`` QA coalescing stores the last merged pairs so a
+        # future slash command (e.g. summary → full body) can re-print without
+        # another Cloud round trip.
+        self._recent_completed_pairs: deque[
+            tuple[IncomingEvent, IncomingEvent]
+        ] = deque(maxlen=50)
 
     def set_critic_enabled(self, enabled: bool) -> None:
         """Toggle the auto-critic at runtime. Used by the ``/critic``
@@ -568,6 +575,15 @@ class Notifier:
                     tail = f"  [sf.muted]⤷ {prev_txt}[/]{tail}"
                 ctx_compact = f"  {ctx_line}" if ctx_line else ""
                 console.print(f"{head}{tail}{ctx_compact}")
+                # Compact is still one summary line for the header + body;
+                # ``--show-tool-runs`` would otherwise never reach
+                # ``_render_tool_calls`` (we used to ``return`` early).
+                if (
+                    event.role == "assistant"
+                    and self._show_tool_runs
+                    and event.tool_calls
+                ):
+                    self._render_tool_calls(event.tool_calls)
                 self._render_critiques(event, critiques)
                 return
             console.print()
@@ -617,6 +633,150 @@ class Notifier:
                 self._render_tool_calls(event.tool_calls)
             self._render_critiques(event, critiques)
 
+    def show_completed_pair(
+        self,
+        user: IncomingEvent,
+        assistant: IncomingEvent,
+    ) -> None:
+        """Print the user prompt again bundled with the merged assistant reply.
+
+        Used by ``spec team watch`` after the user already saw their prompt
+        immediately: this second block is the readable Q/A unit once
+        streaming has gone quiet. The first ``show(user)`` already ran the
+        auto-critic — we skip critic on the echoed user row to avoid
+        duplicate noise.
+
+        Appends to :attr:`_recent_completed_pairs` for a future in-pane
+        ``/expand`` (summary → full body) without re-fetching Cloud.
+        """
+        self._recent_completed_pairs.append((user, assistant))
+
+        def _ctx_line(ev: IncomingEvent) -> str:
+            cwd_chip = _short_cwd(ev.cwd)
+            paths_chip = _paths_chip(ev.paths_touched)
+            session_chip = _short_session(ev.session_id)
+            session_color = _session_color(ev.session_id)
+            parts: list[str] = []
+            if cwd_chip:
+                parts.append(f"[sf.muted]cwd[/] [sf.label]{cwd_chip}[/]")
+            if paths_chip:
+                parts.append(f"[sf.muted]touched[/] [sf.label]{paths_chip}[/]")
+            if session_chip:
+                parts.append(
+                    f"[sf.muted]session[/] [bold {session_color}]{session_chip}[/]"
+                )
+            return "  ".join(parts) if parts else ""
+
+        u_author = user.author_display
+        u_branch = user.branch or "-"
+        u_src = _source_label(user.source)
+        u_bundle = (
+            f" [sf.muted]· {user.bundle_label}[/]" if user.bundle_label else ""
+        )
+        u_time = _short_time(user.turn_at or user.received_at)
+        u_head = (
+            f"{_USER_BADGE} [bold #3ddab4]{u_author}[/] "
+            f"[sf.muted]· prompt to[/] {u_src} "
+            f"[sf.muted]· {u_branch} · {u_time}[/]"
+            f"{u_bundle}"
+        )
+        u_preview_raw = (user.text or user.summary or "").strip()
+        lim_u, lim_uc = _PREVIEW_USER
+        u_preview = _truncate(u_preview_raw, lim_uc if self._compact else lim_u)
+        u_ctx = _ctx_line(user)
+
+        a_author = assistant.author_display
+        a_branch = assistant.branch or "-"
+        a_src = _source_label(assistant.source)
+        a_bundle = (
+            f" [sf.muted]· {assistant.bundle_label}[/]"
+            if assistant.bundle_label
+            else ""
+        )
+        a_time = _short_time(assistant.turn_at or assistant.received_at)
+        model = assistant.model or "assistant"
+        a_head = (
+            f"{_AI_BADGE} [bold #7de3ff]{model}[/] "
+            f"[sf.muted]· replying to[/] [bold #3ddab4]{a_author}[/] "
+            f"[sf.muted]· in[/] {a_src} "
+            f"[sf.muted]· {a_branch} · {a_time}[/]"
+            f"{a_bundle}"
+        )
+        a_preview = (assistant.text or assistant.summary or "").strip()
+        if a_preview and self._strip_code_blocks and not self._show_tool_runs:
+            a_preview = _strip_code_blocks(a_preview)
+        lim_a, lim_ac = _PREVIEW_ASSISTANT
+        a_preview = _truncate(a_preview, lim_ac if self._compact else lim_a)
+        a_ctx = _ctx_line(assistant)
+        pending_line = (u_author, u_preview) if u_preview else None
+
+        a_critiques: list[Critique] = []
+        if self._critic_enabled:
+            a_critiques = critique_event(assistant)
+
+        with self._lock:
+            console.print()
+            console.print(
+                f"  [sf.muted]· paired reply ·[/] "
+                f"[sf.label]#{user.id}[/] [sf.muted]→[/] "
+                f"[sf.label]#{assistant.id}[/]"
+            )
+            if self._compact:
+                u_tail = ""
+                if u_preview:
+                    u_tail = f"  {escape(' '.join(u_preview.splitlines()))}"
+                u_ctx_c = f"  {u_ctx}" if u_ctx else ""
+                console.print(f"{u_head}{u_tail}{u_ctx_c}")
+                a_tail = ""
+                if a_preview:
+                    a_tail = f"  {escape(' '.join(a_preview.splitlines()))}"
+                if pending_line:
+                    _, prev_txt = pending_line
+                    a_tail = f"  [sf.muted]⤷ {prev_txt}[/]{a_tail}"
+                a_ctx_c = f"  {a_ctx}" if a_ctx else ""
+                console.print(f"{a_head}{a_tail}{a_ctx_c}")
+                if self._show_tool_runs and assistant.tool_calls:
+                    self._render_tool_calls(assistant.tool_calls)
+                self._render_critiques(assistant, a_critiques)
+                return
+
+            console.print()
+            console.print(u_head)
+            if u_ctx:
+                console.print(f"  {u_ctx}")
+            if user.title:
+                console.print(
+                    f"  [sf.muted]title:[/] {_truncate(user.title, 200)}"
+                )
+            if u_preview:
+                for line in u_preview.splitlines():
+                    console.print(
+                        f"  {line}", markup=False, highlight=False
+                    )
+
+            console.print()
+            console.print(a_head)
+            if a_ctx:
+                console.print(f"  {a_ctx}")
+            if pending_line:
+                _, prev_txt = pending_line
+                console.print(
+                    f"  [sf.muted]⤷ prompt ·[/] [sf.label]{prev_txt}[/]"
+                )
+            if a_preview:
+                for line in a_preview.splitlines():
+                    console.print(
+                        f"    {line}", markup=False, highlight=False
+                    )
+            elif assistant.role == "assistant":
+                console.print(
+                    "    [sf.muted](assistant body not shared — broadcaster is "
+                    "in summary-only mode)[/]"
+                )
+            if self._show_tool_runs and assistant.tool_calls:
+                self._render_tool_calls(assistant.tool_calls)
+            self._render_critiques(assistant, a_critiques)
+
     def _render_tool_calls(self, calls: list[ToolCallPayload]) -> None:
         """Print one line per tool invocation under the assistant body.
 
@@ -634,8 +794,8 @@ class Notifier:
             f"    [sf.muted]» {n} tool run{'s' if n != 1 else ''}:[/]"
         )
         # Cap the list at a generous bound — reviewers who need every
-        # call can re-run with --no-verbose / inspect the captured
-        # .prompts file. 50 covers virtually every realistic agent
+        # call can inspect the captured ``.prompts`` file. 50 covers
+        # virtually every realistic agent
         # session without flooding the pane.
         shown = calls[:50]
         for call in shown:

@@ -22,6 +22,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import click
@@ -337,6 +338,116 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # in the warm-up batch.
 _TEAM_WATCH_BOOTSTRAP_LIMIT = 250
 
+# Seconds with no new assistant chunk on the wire before we treat the
+# reply as finished and print the paired Q/A block. 18s survives model
+# pauses between list items better than the broadcaster's 5s tail
+# heuristic; ``spec team watch`` is review-first, not token streaming.
+_TEAM_WATCH_ASSISTANT_QUIET_SECS = 18.0
+
+
+class _TeamWatchQAState:
+    """Coalesce streaming assistant rows into one readable Q/A block.
+
+    The user always sees their ``USER`` row immediately; once assistant
+    chunks go quiet (or a new user message arrives), we print the prompt
+    again bundled with the merged assistant body — see
+    :meth:`Notifier.show_completed_pair`.
+    """
+
+    def __init__(self) -> None:
+        self.pending_user: IncomingEvent | None = None
+        self.assistant_chunks: list[IncomingEvent] = []
+        self.last_assistant_mono: float | None = None
+
+    @staticmethod
+    def _merge_assistant_chunks(chunks: list[IncomingEvent]) -> IncomingEvent:
+        if not chunks:
+            raise ValueError("merge requires non-empty chunks")
+        by_id = max(chunks, key=lambda e: e.id)
+        by_text = max(chunks, key=lambda e: len((e.text or "").strip()))
+        text_src = by_text if (by_text.text or "").strip() else by_id
+        text = (text_src.text or "").strip() or None
+        summary = (by_id.summary or "").strip() or None
+        if not summary:
+            summary = (by_text.summary or "").strip() or None
+        tool_calls = list(by_id.tool_calls or [])
+        if not tool_calls and by_text.tool_calls:
+            tool_calls = list(by_text.tool_calls)
+        return replace(
+            by_id,
+            text=text,
+            summary=summary,
+            tool_calls=tool_calls,
+        )
+
+    def flush_pair(self, notifier: Notifier) -> bool:
+        if self.pending_user is None or not self.assistant_chunks:
+            return False
+        merged = self._merge_assistant_chunks(self.assistant_chunks)
+        notifier.show_completed_pair(self.pending_user, merged)
+        self.assistant_chunks.clear()
+        self.pending_user = None
+        self.last_assistant_mono = None
+        return True
+
+    def on_user(
+        self,
+        ev: IncomingEvent,
+        notifier: Notifier,
+        last_output_at: list[float],
+    ) -> None:
+        if self.pending_user is not None and self.assistant_chunks:
+            self.flush_pair(notifier)
+        self.assistant_chunks.clear()
+        self.last_assistant_mono = None
+        self.pending_user = ev
+        notifier.show(ev)
+        last_output_at[0] = time.monotonic()
+
+    def buffer_assistant(self, ev: IncomingEvent) -> bool:
+        if self.pending_user is None:
+            return False
+        self.assistant_chunks.append(ev)
+        self.last_assistant_mono = time.monotonic()
+        return True
+
+    def tick_quiet_flush(
+        self,
+        notifier: Notifier,
+        last_output_at: list[float],
+        quiet_secs: float,
+    ) -> None:
+        if (
+            self.pending_user is None
+            or not self.assistant_chunks
+            or self.last_assistant_mono is None
+        ):
+            return
+        if time.monotonic() - self.last_assistant_mono < quiet_secs:
+            return
+        if self.flush_pair(notifier):
+            last_output_at[0] = time.monotonic()
+
+    def flush_on_error(self, notifier: Notifier, last_output_at: list[float]) -> None:
+        if self.pending_user is not None and self.assistant_chunks:
+            self.flush_pair(notifier)
+            last_output_at[0] = time.monotonic()
+        self.pending_user = None
+        self.assistant_chunks.clear()
+        self.last_assistant_mono = None
+
+    def flush_shutdown(self, notifier: Notifier) -> None:
+        if self.pending_user is None or not self.assistant_chunks:
+            self.pending_user = None
+            self.assistant_chunks.clear()
+            self.last_assistant_mono = None
+            return
+        merged = self._merge_assistant_chunks(self.assistant_chunks)
+        notifier.show_completed_pair(self.pending_user, merged)
+        self.pending_user = None
+        self.assistant_chunks.clear()
+        self.last_assistant_mono = None
+
 
 def _stdin_is_interactive() -> bool:
     """Whether ``sys.stdin`` looks like an interactive TTY.
@@ -488,6 +599,13 @@ def team_watch_cmd(
     transient drops; ``Ctrl+C`` once asks for a graceful exit, a
     second press forces.
 
+    **Q/A coalescing (live SSE only):** each user prompt is printed as
+    soon as it arrives. Assistant rows for that prompt are buffered
+    until the stream is quiet for about 18 seconds (or until a new user
+    message / error), then the prompt is shown again together with the
+    merged assistant body in one ``paired reply`` block. REST warm-up
+    uses the old per-event layout.
+
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
 
@@ -542,6 +660,7 @@ def team_watch_cmd(
     # Tracks the timestamp of the last *visible* output so the idle
     # heartbeat printer doesn't fire on top of fresh content.
     last_output_at = [time.monotonic()]
+    qa = _TeamWatchQAState()
 
     watch_state = WatchState(critic_enabled=critic_enabled)
 
@@ -619,6 +738,7 @@ def team_watch_cmd(
             ev.role == "assistant"
             and ((ev.text or "").strip() or not is_tool_only_summary(ev.summary))
         )
+        force_show_assistant = False
         if (
             ev.role == "assistant"
             and not show_tool_runs
@@ -630,6 +750,31 @@ def team_watch_cmd(
             )
             if not critiques:
                 return
+            force_show_assistant = True
+
+        use_qa_coalesce = tick_clock
+
+        if use_qa_coalesce and ev.role == "user":
+            qa.on_user(ev, notifier, last_output_at)
+            return
+
+        if use_qa_coalesce and ev.role == "error":
+            qa.flush_on_error(notifier, last_output_at)
+            notifier.show(ev)
+            if tick_clock:
+                last_output_at[0] = time.monotonic()
+            return
+
+        if (
+            use_qa_coalesce
+            and ev.role == "assistant"
+            and not force_show_assistant
+            and qa.buffer_assistant(ev)
+        ):
+            if tick_clock:
+                last_output_at[0] = time.monotonic()
+            return
+
         notifier.show(ev)
         if tick_clock:
             last_output_at[0] = time.monotonic()
@@ -722,6 +867,11 @@ def team_watch_cmd(
     # below any reasonable interval.
     try:
         while consumer_thread.is_alive() and not stop_event.is_set():
+            qa.tick_quiet_flush(
+                notifier,
+                last_output_at,
+                _TEAM_WATCH_ASSISTANT_QUIET_SECS,
+            )
             # Surface "AI has not replied" hints on every loop tick.
             # Cheap (O(open_sessions)) and only prints on the first
             # transition past the no-reply threshold per session.
@@ -737,6 +887,7 @@ def team_watch_cmd(
     finally:
         consumer.stop()
         consumer_thread.join(timeout=2.0)
+        qa.flush_shutdown(notifier)
 
 
 @team_group.command("flag")

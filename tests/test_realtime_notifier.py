@@ -250,6 +250,45 @@ def test_second_assistant_does_not_repeat_stale_prompt(monkeypatch):
     assert cap.export_text().count("⤷ prompt") == 1
 
 
+def test_assistant_prefers_full_text_over_one_line_summary(monkeypatch):
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    sid = "sess-detail"
+    pid = 99
+    long_tail = "X" * 800
+    assistant = IncomingEvent(
+        id=501,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Short headline only.",
+        text=f"Short headline only.\n\nExpanded reasoning and code.\n{long_tail}",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=3,
+        author_handle="pat",
+        author_name="Pat",
+        author_avatar_url=None,
+    )
+    n = Notifier(critic_enabled=False)
+    n.show(assistant)
+    out = cap.export_text()
+    assert "Expanded reasoning and code." in out
+    # ``export_text`` inserts hard wraps — count chars instead of a
+    # contiguous 800-``X`` substring.
+    assert out.count("X") >= 800
+
+
 # ── _alert (notify) ───────────────────────────────────────────────
 
 

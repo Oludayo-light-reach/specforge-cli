@@ -202,12 +202,33 @@ def _run_team_snapshot(
             f"{bundle}"
         )
         console.print(head)
-        text = (event.summary or event.text or "").strip()
-        if text:
-            short = text.splitlines()[0]
-            if len(short) > 200:
-                short = short[:200].rstrip() + "…"
-            console.print(f"      [sf.muted]{short}[/]")
+        raw = (event.text or event.summary or "").strip()
+        if raw:
+            if event.role == "assistant":
+                # Same preference as :class:`Notifier` — ``summary`` is a
+                # headline; ``text`` carries the reply reviewers skim for.
+                budget, max_lines = 4000, 24
+            else:
+                budget, max_lines = 200, 1
+            lines: list[str] = []
+            used = 0
+            for line in raw.splitlines():
+                if not line.strip() and not lines:
+                    continue
+                if len(lines) >= max_lines:
+                    lines.append("…")
+                    break
+                if used + len(line) > budget:
+                    remain = max(0, budget - used - 1)
+                    if remain > 8:
+                        lines.append(line[:remain].rstrip() + "…")
+                    else:
+                        lines.append("…")
+                    break
+                lines.append(line)
+                used += len(line) + 1
+            for ln in lines:
+                console.print(f"      [sf.muted]{ln}[/]")
         # Apply the same auto-critic in the snapshot view so a `spec
         # team` glance flags the same risky prompts the live watcher
         # would. Cheap (pure regex) and only fires on user turns.

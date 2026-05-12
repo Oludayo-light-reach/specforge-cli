@@ -148,6 +148,14 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit].rstrip() + "…"
 
 
+# Terminal preview limits. User prompts stay relatively short; assistant
+# bodies can be large when the broadcaster + SSE ``verbose`` pipeline
+# ships full ``text`` — we must not collapse that back to the one-line
+# ``summary`` or a 200-char cap or reviewers never see the actual reply.
+_PREVIEW_USER = (400, 120)  # (non-compact, compact)
+_PREVIEW_ASSISTANT = (48_000, 500)  # (non-compact, compact)
+_PREVIEW_ERROR = (12_000, 120)
+
 # How long we wait for an assistant follow-up to a user prompt before
 # we surface a "no AI reply seen yet" hint. 90 seconds is a sweet
 # spot in practice: short enough that a hung agent is noticed
@@ -262,7 +270,8 @@ class Notifier:
         pending_prompt: tuple[str, str] | None = None
         if event.role == "user":
             preview = (event.text or event.summary or "").strip()
-            preview = _truncate(preview, 280 if not self._compact else 120)
+            lim_u, lim_uc = _PREVIEW_USER
+            preview = _truncate(preview, lim_uc if self._compact else lim_u)
             # USER badge (mint background) + author handle in the
             # source's accent color. A reviewer scanning a fast pane
             # sees the green block and knows immediately a human just
@@ -285,8 +294,9 @@ class Notifier:
             # Agent error: timeout / tool failure / refused request.
             # Red badge + short message in the header keeps the eye
             # snapping to it even on a busy pane.
-            preview = (event.summary or event.text or "").strip()
-            preview = _truncate(preview, 220 if not self._compact else 100)
+            preview = (event.text or event.summary or "").strip()
+            lim_e, lim_ec = _PREVIEW_ERROR
+            preview = _truncate(preview, lim_ec if self._compact else lim_e)
             model = event.model or "agent"
             head = (
                 f"{_ERROR_BADGE} [bold #ff8a98]{model}[/] "
@@ -306,8 +316,11 @@ class Notifier:
                 critiques = critique_event(event)
             pending_prompt = self._pending_user_prompt.pop(pair_key, None)
         else:
-            preview = (event.summary or event.text or "").strip()
-            preview = _truncate(preview, 220 if not self._compact else 100)
+            # Prefer full ``text`` over ``summary`` — both are usually set
+            # for assistant turns, and the summary is only a headline.
+            preview = (event.text or event.summary or "").strip()
+            lim_a, lim_ac = _PREVIEW_ASSISTANT
+            preview = _truncate(preview, lim_ac if self._compact else lim_a)
             model = event.model or "assistant"
             # AI badge (cyan background). The model name carries the
             # source's accent color so "claude_code/claude-sonnet-4"

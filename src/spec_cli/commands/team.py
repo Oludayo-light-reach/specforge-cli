@@ -691,7 +691,7 @@ def team_watch_cmd(
     except (AttributeError, ValueError):
         pass
 
-    notifier.announce_reconnecting("connecting…")
+    notifier.announce_connecting("live prompt stream…")
 
     # Main thread surfaces the idle heartbeat so the consumer thread
     # stays a clean network reader. Tick rate is 1Hz which is well

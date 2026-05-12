@@ -660,9 +660,13 @@ class Notifier:
                 f"streaming team prompts[/]"
             )
 
-    def announce_reconnecting(self, reason: str) -> None:
+    def announce_connecting(self, detail: str) -> None:
+        """Printed once before the SSE thread delivers live rows.
+
+        Runs *after* the REST bootstrap replay so reviewers are not
+        misled into thinking this was a mid-stream disconnect."""
         with self._lock:
-            console.print(f"[sf.warn]…[/] reconnecting [sf.muted]({reason})[/]")
+            console.print(f"[sf.warn]…[/] connecting [sf.muted]({detail})[/]")
 
     def announce_broadcast_disabled(self) -> None:
         with self._lock:

@@ -229,7 +229,7 @@ def _cmd_help(_cmd: ParsedCommand, ctx: CommandContext) -> None:
             "  /replay <n>{h,m}               re-emit last window through the notifier",
             "  /search <term>                 grep the in-memory buffer (handle / file / body)",
             "  /critic on | /critic off       toggle the auto-critic at runtime",
-            "  /status                        print who is currently active",
+            "  /status                        visibility (/focus, /mutes) + who was active",
             "  /help                          this list",
         ]
     )
@@ -407,10 +407,25 @@ def _cmd_critic(cmd: ParsedCommand, ctx: CommandContext) -> None:
 def _cmd_status(_cmd: ParsedCommand, ctx: CommandContext) -> None:
     """Per-teammate "last seen" digest, derived from the in-memory
     buffer. No API call — what's in the pane is what we report."""
-    if not ctx.buffer:
-        ctx.notifier.show_command_result(
-            "no activity yet in this session.", kind="info"
+    st = ctx.state
+    vis: list[str] = []
+    if st.focus:
+        vis.append(
+            f"visibility: /focus @{st.focus.lstrip('@')} "
+            "(only this teammate's events are printed)"
         )
+    elif st.mutes:
+        joined = ", ".join(sorted(f"@{m.lstrip('@')}" for m in st.mutes))
+        vis.append(f"visibility: muted {joined} (everyone else still shows)")
+    else:
+        vis.append(
+            "visibility: all teammates (workspace prompt stream; "
+            "no /focus, no /mutes)"
+        )
+
+    if not ctx.buffer:
+        vis.append("no activity yet in this session.")
+        ctx.notifier.show_command_result("\n".join(vis), kind="info")
         return
     # Map (handle, source) → (last_event_time, bundle_label)
     seen: dict[tuple[str, str], tuple[datetime, str | None]] = {}
@@ -427,11 +442,10 @@ def _cmd_status(_cmd: ParsedCommand, ctx: CommandContext) -> None:
         if prev is None or ts > prev[0]:
             seen[key] = (ts, ev.bundle_label)
     if not seen:
-        ctx.notifier.show_command_result(
-            "no non-presence events seen yet.", kind="info"
-        )
+        vis.append("no non-presence events seen yet.")
+        ctx.notifier.show_command_result("\n".join(vis), kind="info")
         return
-    rows: list[str] = ["active teammates (last seen, source, bundle):"]
+    rows: list[str] = [*vis, "active teammates (last seen, source, bundle):"]
     now = datetime.now(timezone.utc)
     for (author, source), (ts, bundle) in sorted(
         seen.items(), key=lambda kv: kv[1][0], reverse=True

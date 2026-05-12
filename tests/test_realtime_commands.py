@@ -273,6 +273,8 @@ def test_status_with_empty_buffer_says_no_activity():
     ctx, notifier, _, _ = _ctx()
     dispatch(parse_command("/status"), ctx)  # type: ignore[arg-type]
     body = notifier.show_command_result.call_args[0][0]
+    assert "visibility" in body
+    assert "all teammates" in body
     assert "no activity" in body
 
 
@@ -285,10 +287,22 @@ def test_status_lists_last_seen_per_author_source():
     ctx, notifier, _, _ = _ctx(buffer_events=events)
     dispatch(parse_command("/status"), ctx)  # type: ignore[arg-type]
     body = notifier.show_command_result.call_args[0][0]
+    assert "visibility" in body
+    assert "all teammates" in body
     assert "@alice" in body
     assert "@bob" in body
     assert "claude_code" in body
     assert "codex" in body
+
+
+def test_status_shows_focus_in_visibility_line():
+    events = [_event(1, handle="alice", source="cursor")]
+    ctx, notifier, _, state = _ctx(buffer_events=events)
+    state.focus = "alice"
+    dispatch(parse_command("/status"), ctx)  # type: ignore[arg-type]
+    body = notifier.show_command_result.call_args[0][0]
+    assert "/focus @alice" in body
+    assert "only this teammate" in body
 
 
 # ── /replay ────────────────────────────────────────────────────────

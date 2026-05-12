@@ -340,7 +340,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
 ):
     """Cursor streams one assistant bubble: text grows on disk while
     ``broadcast_turns`` must stay pinned so we POST again; only after
-    the fingerprint is quiet for ``TAIL_ASSISTANT_STABILITY_SECS`` do
+    the fingerprint is quiet for ``max(5s, 3×poll_interval)`` do
     we advance the cursor."""
     from spec_cli.prompts.schema import Session, Turn
     from spec_cli.realtime.tracker import LiveCursor
@@ -412,7 +412,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
     assert len(poster.events) == 3
     assert cursor.turns_broadcast_for("s1") == 1
 
-    clock[0] = 1.0
+    clock[0] = 10.0
     _producer_tick(
         bundle_root=tmp_path,
         cursor=cursor,

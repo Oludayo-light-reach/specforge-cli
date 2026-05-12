@@ -96,9 +96,11 @@ MIN_TURN_TEXT_CHARS = 1
 # Final assistant turns (Cursor streams into one bubble) may grow on
 # disk between producer polls. We POST updates while ``text``
 # changes, then delay advancing ``broadcast_turns`` until the body
-# stays unchanged for this quiet window so the last POST carries the
-# full reply.
-TAIL_ASSISTANT_STABILITY_SECS = 0.85
+# stays unchanged long enough that token streams are unlikely to
+# resume in the same bubble (sub-second quiet was too aggressive —
+# models often pause longer between chunks).
+TAIL_ASSISTANT_STABILITY_FLOOR_SECS = 5.0
+TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER = 3.0
 
 
 @dataclass
@@ -598,7 +600,10 @@ def _producer_tick(
                     and hold.turn_idx == turn_idx
                     and fp == hold.fp
                 ):
-                    if now_m - hold.last_fp_change >= TAIL_ASSISTANT_STABILITY_SECS:
+                    if now_m - hold.last_fp_change >= max(
+                        TAIL_ASSISTANT_STABILITY_FLOOR_SECS,
+                        opts.poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
+                    ):
                         holds.pop(session.id, None)
                         cursor.record_broadcast(session.id, turn_idx + 1)
                     continue

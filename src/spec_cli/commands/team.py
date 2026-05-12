@@ -307,6 +307,12 @@ def team_group(
 # in `spec team watch`. Chosen so a quiet workspace still feels alive
 # without ever competing with real events for screen real estate.
 _TEAM_WATCH_HEARTBEAT_SECS = 60.0
+# Workspace SSE only replays when ``Last-Event-ID`` is set. On a fresh
+# connect that cursor is empty — so we prime the pane from REST once
+# (same bundles as the stream) and then resume the socket from the
+# newest id so reviewers still see the user prompt that kicked off a
+# thread they joined mid-flight.
+_TEAM_WATCH_BOOTSTRAP_LIMIT = 40
 
 
 def _stdin_is_interactive() -> bool:
@@ -547,27 +553,15 @@ def team_watch_cmd(
         on_connect=_on_connect,
     )
 
-    def on_fatal(err: SSEStreamError) -> None:
-        notifier.announce_fatal(str(err))
-        stop_event.set()
-
-    def on_event(ev: IncomingEvent) -> None:
-        # Always append to the buffer first — /replay and /summarize
-        # rely on seeing the unfiltered event history.
+    def _deliver(ev: IncomingEvent, *, tick_clock: bool = True) -> None:
+        """Shared path for live SSE frames and the one-shot REST warm."""
         event_buffer.append(ev)
         event_to_project[ev.id] = ev.project_id
         if not include_presence and ev.role == "presence":
             return
-        # Apply runtime focus / mute filters before any rendering.
         if not watch_state.is_visible(ev):
             return
-        # Pull the critic enable bit off the runtime state so /critic
-        # on|off takes effect without restarting the watcher.
         notifier.set_critic_enabled(watch_state.critic_enabled)
-        # Tool-only assistant turns are far too noisy to render by
-        # default. They still pass through the critic so destructive
-        # ``Bash "rm -rf …"`` runs surface — but only when the critic
-        # has something to say about them.
         if (
             ev.role == "assistant"
             and not show_tool_runs
@@ -577,9 +571,41 @@ def team_watch_cmd(
                 critique_event(ev) if watch_state.critic_enabled else []
             )
             if not critiques:
-                return  # silently swallow — bench noise, not signal
+                return
         notifier.show(ev)
-        last_output_at[0] = time.monotonic()
+        if tick_clock:
+            last_output_at[0] = time.monotonic()
+
+    try:
+        hist_client = CloudClient(creds)
+        boot_rows = hist_client.list_my_prompt_events(
+            limit=_TEAM_WATCH_BOOTSTRAP_LIMIT,
+            include_presence=include_presence,
+        )
+        boot_events = sorted(
+            (
+                IncomingEvent.from_json(r)
+                for r in boot_rows
+                if isinstance(r, dict)
+            ),
+            key=lambda e: e.id,
+        )
+        max_boot_id: int | None = None
+        for ev in boot_events:
+            if max_boot_id is None or ev.id > max_boot_id:
+                max_boot_id = ev.id
+            _deliver(ev, tick_clock=False)
+        if max_boot_id is not None:
+            consumer.set_resume_cursor(max_boot_id)
+    except ApiError:
+        pass
+
+    def on_fatal(err: SSEStreamError) -> None:
+        notifier.announce_fatal(str(err))
+        stop_event.set()
+
+    def on_event(ev: IncomingEvent) -> None:
+        _deliver(ev, tick_clock=True)
 
     def on_flag(flag: IncomingFlag) -> None:
         notifier.show_flag(flag)

@@ -206,12 +206,28 @@ class Notifier:
         self._open_sessions: dict[
             tuple[int, str], tuple[int, datetime, str, bool]
         ] = {}
+        # (project_id, session_id) → (author_display, truncated prompt) so
+        # the first assistant/error line after a user turn can echo what
+        # question was being answered — even when the viewer only tuned
+        # in after the USER badge scrolled away.
+        self._pending_user_prompt: dict[
+            tuple[int, str], tuple[str, str]
+        ] = {}
 
     def set_critic_enabled(self, enabled: bool) -> None:
         """Toggle the auto-critic at runtime. Used by the ``/critic``
         slash command so a reviewer can silence the suggestion stream
         without restarting the watcher."""
         self._critic_enabled = bool(enabled)
+
+    @staticmethod
+    def _session_pair_key(event: IncomingEvent) -> tuple[int, str]:
+        sid = (event.session_id or "").strip()
+        if not sid:
+            # Extremely rare — keep keys stable per row so we never leak
+            # one session's prompt into another on the same project.
+            sid = f"_ev:{event.id}"
+        return (event.project_id, sid)
 
     def show(self, event: IncomingEvent) -> None:
         time_label = _short_time(event.turn_at or event.received_at)
@@ -242,6 +258,8 @@ class Notifier:
         ctx_line = "  ".join(ctx_parts) if ctx_parts else ""
 
         critiques: list[Critique] = []
+        pair_key = self._session_pair_key(event)
+        pending_prompt: tuple[str, str] | None = None
         if event.role == "user":
             preview = (event.text or event.summary or "").strip()
             preview = _truncate(preview, 280 if not self._compact else 120)
@@ -257,6 +275,8 @@ class Notifier:
             )
             if self._critic_enabled:
                 critiques = critique_event(event)
+            if preview:
+                self._pending_user_prompt[pair_key] = (author, preview)
             # Remember this prompt as "awaiting AI reply". Sessions
             # are pinned by (project_id, session_id) — the same
             # identity the server uses for dedupe.
@@ -284,6 +304,7 @@ class Notifier:
             # still gets flagged.
             if self._critic_enabled:
                 critiques = critique_event(event)
+            pending_prompt = self._pending_user_prompt.pop(pair_key, None)
         else:
             preview = (event.summary or event.text or "").strip()
             preview = _truncate(preview, 220 if not self._compact else 100)
@@ -305,6 +326,7 @@ class Notifier:
             # summaries surfaces in the live stream.
             if self._critic_enabled:
                 critiques = critique_event(event)
+            pending_prompt = self._pending_user_prompt.pop(pair_key, None)
 
         with self._lock:
             if self._compact:
@@ -312,6 +334,9 @@ class Notifier:
                 # at the end so the row still parses even when piped
                 # into ``grep`` for a handle / file / session id.
                 tail = f"  {preview}" if preview else ""
+                if pending_prompt:
+                    _, prev_txt = pending_prompt
+                    tail = f"  [sf.muted]⤷ {prev_txt}[/]{tail}"
                 ctx_compact = f"  {ctx_line}" if ctx_line else ""
                 console.print(f"{head}{tail}{ctx_compact}")
                 self._render_critiques(event, critiques)
@@ -326,6 +351,11 @@ class Notifier:
                 console.print(f"  {ctx_line}")
             if event.title and event.role == "user":
                 console.print(f"  [sf.muted]title:[/] {_truncate(event.title, 200)}")
+            if pending_prompt:
+                _, prev_txt = pending_prompt
+                console.print(
+                    f"  [sf.muted]⤷ prompt ·[/] [sf.label]{prev_txt}[/]"
+                )
             if preview:
                 # Indent assistant / error bodies a bit further so
                 # they read as a clear "reply" block underneath the

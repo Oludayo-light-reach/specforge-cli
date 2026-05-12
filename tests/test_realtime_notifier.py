@@ -15,6 +15,8 @@ from io import StringIO
 from unittest.mock import MagicMock
 
 import pytest
+from rich.console import Console
+from rich.theme import Theme
 
 from spec_cli.realtime.critic import SEV_HIGH, SEV_WARN, Critique
 from spec_cli.realtime.events import IncomingEvent
@@ -88,6 +90,164 @@ def test_paths_chip_drops_empty_input():
     assert _paths_chip(None) is None
     assert _paths_chip([]) is None
     assert _paths_chip(["", None, ""]) is None  # type: ignore[list-item]
+
+
+# ── pending user prompt (assistant context) ───────────────────────
+
+
+def _recording_console() -> Console:
+    """Console compatible with :mod:`spec_cli.ui` theme tokens."""
+    return Console(
+        record=True,
+        width=120,
+        theme=Theme(
+            {
+                "sf.mint": "bold #3ddab4",
+                "sf.reject": "bold #ff5a6a",
+                "sf.warn": "bold #f0b86e",
+                "sf.muted": "dim #9aa3b2",
+                "sf.point": "bold #7de3ff",
+                "sf.label": "bold #c7c9d1",
+            }
+        ),
+        highlight=False,
+    )
+
+
+def test_assistant_shows_pending_user_prompt_line(monkeypatch):
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    sid = "composer-shared"
+    pid = 42
+    user = IncomingEvent(
+        id=101,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="Where is the hero section and the install curl snippet?",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    assistant = IncomingEvent(
+        id=102,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Searching the codebase for the landing page hero.",
+        text="Searching the codebase for the landing page hero.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    n = Notifier(critic_enabled=False)
+    n.show(user)
+    n.show(assistant)
+    out = cap.export_text()
+    assert "Where is the hero section" in out
+    assert "⤷ prompt" in out
+
+
+def test_second_assistant_does_not_repeat_stale_prompt(monkeypatch):
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    sid = "composer-shared-2"
+    pid = 43
+    user = IncomingEvent(
+        id=201,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="First question only",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    a1 = IncomingEvent(
+        id=202,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="m",
+        summary="reply one",
+        text="reply one",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    a2 = IncomingEvent(
+        id=203,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="m",
+        summary="reply two",
+        text="reply two",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    n = Notifier(critic_enabled=False)
+    n.show(user)
+    n.show(a1)
+    n.show(a2)
+    assert cap.export_text().count("⤷ prompt") == 1
 
 
 # ── _alert (notify) ───────────────────────────────────────────────

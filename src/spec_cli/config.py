@@ -121,9 +121,14 @@ class Manifest:
         cloud = self.data.get("cloud") or {}
         raw = cloud.get("prompt_stream") if isinstance(cloud, dict) else None
 
-        # Default: ON, summary-only. The next branches override.
+        # Default policy as of Spec Live v0.4: when broadcasting is on,
+        # ship the full assistant ``text`` body as well as the summary.
+        # ``spec team watch`` is a real-time review tool and a reviewer
+        # cannot debug what they cannot read. Teams that want the old
+        # privacy posture can set ``verbose: false`` explicitly — the
+        # property still honours that opt-out.
         enabled = True
-        verbose = False
+        verbose = True
         if raw is None:
             return {"enabled": enabled, "verbose": verbose}
         if isinstance(raw, bool):
@@ -137,7 +142,10 @@ class Manifest:
             # Anything else falls through to the default ON.
         elif isinstance(raw, dict):
             enabled = bool(raw.get("enabled", True))
-            verbose = bool(raw.get("verbose", False))
+            # Explicit ``verbose`` key wins. Absent key inherits the
+            # verbose-by-default policy above so existing manifests
+            # that pre-date the flip still benefit from the change.
+            verbose = bool(raw.get("verbose", True))
         return {"enabled": enabled, "verbose": verbose}
 
     def set_cloud_prompt_stream(self, *, enabled: bool, verbose: bool | None = None) -> None:

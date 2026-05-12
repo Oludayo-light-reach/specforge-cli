@@ -94,8 +94,32 @@ def test_synthesize_handles_multi_tool_with_overflow_marker():
     # First three appear with names; the rest are summarised.
     assert "Read main.py" in out
     assert "Edit auth.py" in out
-    assert "Bash" in out
+    # Bash command snippet is now included so the auto-critic on the
+    # receiver side can spot destructive verbs before the tool lands.
+    assert 'Bash "pytest"' in out
     assert "(+2 more)" in out
+
+
+def test_synthesize_includes_bash_command_for_critic_to_inspect():
+    """The synthesized summary must include enough of the Bash
+    command for the receiver's auto-critic to recognise destructive
+    verbs like ``rm -rf``. Without this, a teammate's agent could
+    nuke a directory and the team feed would only see ``Bash``."""
+    calls = [ToolCall(name="Bash", args={"command": "rm -rf node_modules && rebuild"})]
+    out = _synthesize_tool_summary(calls)
+    assert out is not None
+    assert "rm -rf" in out
+
+
+def test_synthesize_quotes_grep_and_glob_patterns():
+    calls = [
+        ToolCall(name="Grep", args={"pattern": "TODO"}),
+        ToolCall(name="Glob", args={"pattern": "**/*.py"}),
+    ]
+    out = _synthesize_tool_summary(calls)
+    assert out is not None
+    assert 'Grep "TODO"' in out
+    assert 'Glob "**/*.py"' in out
 
 
 def test_synthesize_strips_directory_components():

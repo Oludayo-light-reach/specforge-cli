@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import signal
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -34,7 +35,18 @@ from ..config import (
     load_manifest,
     parse_cloud_project,
 )
-from ..realtime.critic import critique_event, suggested_flag_command
+from ..realtime.commands import (
+    CommandContext,
+    WatchState,
+    dispatch,
+    make_buffer,
+    parse_command,
+)
+from ..realtime.critic import (
+    critique_event,
+    is_tool_only_summary,
+    suggested_flag_command,
+)
 from ..realtime.events import IncomingEvent, IncomingFlag
 from ..realtime.notifier import Notifier
 from ..realtime.transport import SSEConsumer, SSEStreamError, run_consumer_in_thread
@@ -297,6 +309,46 @@ def team_group(
 _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 
 
+def _stdin_is_interactive() -> bool:
+    """Whether ``sys.stdin`` looks like an interactive TTY.
+
+    We refuse to start the slash-command reader otherwise — piping a
+    log file into ``spec team watch`` should not silently start
+    interpreting log lines as commands. Anything that fails the
+    isatty() check (CI runners, ``< /dev/null``, ``screen -L``
+    rotated buffers) falls back to read-only mode.
+    """
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _stdin_reader(ctx: "CommandContext", stop_event: threading.Event) -> None:
+    """Read slash-commands from stdin until ``stop_event`` fires.
+
+    Lives in a daemon thread so a hung ``readline()`` does not block
+    process exit after Ctrl+C — the kernel reaps stdin when the main
+    thread tears down. Non-command lines are silently ignored, which
+    means a reviewer who fat-fingers their editor open in the same
+    pane doesn't accidentally trigger anything destructive.
+    """
+    while not stop_event.is_set():
+        try:
+            line = sys.stdin.readline()
+        except (KeyboardInterrupt, ValueError):
+            return
+        if not line:
+            # EOF on stdin (Ctrl+D, or piped input exhausted) — let
+            # the watcher continue running purely as a stream
+            # consumer; we just stop accepting commands.
+            return
+        cmd = parse_command(line)
+        if cmd is None:
+            continue
+        dispatch(cmd, ctx)
+
+
 @team_group.command("watch")
 @click.option(
     "--compact",
@@ -336,12 +388,65 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
         "`spec team flag` command to escalate it into a team-visible flag."
     ),
 )
+@click.option(
+    "--verbose/--no-verbose",
+    "verbose",
+    default=True,
+    show_default=True,
+    help=(
+        "Receive full assistant ``text`` bodies (default). Use "
+        "``--no-verbose`` for a summary-only feed: assistant turns "
+        "show only the short summary line, user prompts are still "
+        "shipped in full so reviewers can see what triggered each "
+        "response."
+    ),
+)
+@click.option(
+    "--show-tool-runs/--no-tool-runs",
+    "show_tool_runs",
+    default=False,
+    show_default=True,
+    help=(
+        "Show synthetic assistant turns whose only content is "
+        "``ran N tools: …``. Off by default because tool-only turns "
+        "are noisy; the auto-critic still inspects them and surfaces "
+        "any that match a destructive / test-bypass rule."
+    ),
+)
+@click.option(
+    "--commands/--no-commands",
+    "commands_enabled",
+    default=True,
+    show_default=True,
+    help=(
+        "Enable the in-pane slash-command layer (default). Disable for "
+        "fully passive read-only mode. Commands include /summarize, "
+        "/flag, /focus, /mute, /replay, /search, /critic, /status, /help."
+    ),
+)
+@click.option(
+    "--notify/--no-notify",
+    "notify",
+    default=False,
+    show_default=True,
+    help=(
+        "Ring the terminal bell and (on macOS) fire a system "
+        "notification banner when the auto-critic catches a "
+        "block-severity hit on a teammate's turn — destructive "
+        "command, leaked secret, test bypass. Off by default; turn "
+        "on when you can't keep eyes on the pane."
+    ),
+)
 def team_watch_cmd(
     compact: bool,
     include_presence: bool,
     heartbeat: bool,
     heartbeat_interval: int,
     critic_enabled: bool,
+    verbose: bool,
+    show_tool_runs: bool,
+    commands_enabled: bool,
+    notify: bool,
 ) -> None:
     """Live SSE tail across every bundle you can see (workspace-wide).
 
@@ -379,17 +484,57 @@ def team_watch_cmd(
         fatal("Not signed in. Run `spec login` first.")
         return
 
-    notifier = Notifier(compact=compact, critic_enabled=critic_enabled)
+    notifier = Notifier(
+        compact=compact,
+        critic_enabled=critic_enabled,
+        notify=notify,
+    )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle
     # heartbeat printer doesn't fire on top of fresh content.
     last_output_at = [time.monotonic()]
+
+    # Bounded in-memory event memory shared with the command layer:
+    # /summarize, /replay, /status all read from this. Updated in
+    # the consumer callback, so command handlers see exactly what
+    # has been received in this session.
+    event_buffer = make_buffer()
+    watch_state = WatchState(critic_enabled=critic_enabled)
+
+    # Map event_id → project_id so /flag can post against the right
+    # project when the workspace stream covers multiple bundles. We
+    # populate this from the in-memory buffer; older events that
+    # have aged out of the buffer are not flaggable via /flag (a
+    # reviewer can always fall back to `spec team flag` outside the
+    # pane).
+    event_to_project: dict[int, int] = {}
+
+    flag_client: CloudClient | None = None
+    if commands_enabled:
+        try:
+            flag_client = CloudClient(creds)
+        except Exception:  # noqa: BLE001
+            flag_client = None
+
+    cmd_ctx = CommandContext(
+        notifier=notifier,
+        state=watch_state,
+        buffer=event_buffer,
+        flag_client=flag_client,
+        project_for_event=event_to_project.get,
+    )
 
     def _on_connect() -> None:
         # First successful handshake — print the "connected" banner
         # only now, so auth failures stay silent on stdout and the
         # user sees the real error from the SSE consumer instead.
         notifier.announce_connected("workspace (all bundles)")
+        if commands_enabled:
+            notifier.show_command_result(
+                "interactive commands enabled — type /help for the list. "
+                "Two-stage Ctrl+C still exits.",
+                kind="info",
+            )
         last_output_at[0] = time.monotonic()
 
     consumer = SSEConsumer(
@@ -398,6 +543,7 @@ def team_watch_cmd(
         None,
         workspace=True,
         include_presence=include_presence,
+        verbose=verbose,
         on_connect=_on_connect,
     )
 
@@ -406,8 +552,32 @@ def team_watch_cmd(
         stop_event.set()
 
     def on_event(ev: IncomingEvent) -> None:
+        # Always append to the buffer first — /replay and /summarize
+        # rely on seeing the unfiltered event history.
+        event_buffer.append(ev)
+        event_to_project[ev.id] = ev.project_id
         if not include_presence and ev.role == "presence":
             return
+        # Apply runtime focus / mute filters before any rendering.
+        if not watch_state.is_visible(ev):
+            return
+        # Pull the critic enable bit off the runtime state so /critic
+        # on|off takes effect without restarting the watcher.
+        notifier.set_critic_enabled(watch_state.critic_enabled)
+        # Tool-only assistant turns are far too noisy to render by
+        # default. They still pass through the critic so destructive
+        # ``Bash "rm -rf …"`` runs surface — but only when the critic
+        # has something to say about them.
+        if (
+            ev.role == "assistant"
+            and not show_tool_runs
+            and is_tool_only_summary(ev.summary)
+        ):
+            critiques = (
+                critique_event(ev) if watch_state.critic_enabled else []
+            )
+            if not critiques:
+                return  # silently swallow — bench noise, not signal
         notifier.show(ev)
         last_output_at[0] = time.monotonic()
 
@@ -418,6 +588,23 @@ def team_watch_cmd(
     consumer_thread = run_consumer_in_thread(
         consumer, on_event, on_fatal, on_flag=on_flag
     )
+
+    # Background stdin reader: read one line at a time, parse, and
+    # dispatch. Daemonised so a hung readline() does not prevent the
+    # process from exiting after the two-stage Ctrl+C completes. We
+    # deliberately do not draw a pinned input prompt or use
+    # ``rich.live`` — keeping the watcher in a normal scrolling pane
+    # preserves terminal scrollback, multiplexer integration, and
+    # mouse-copy of past events.
+    stdin_thread: threading.Thread | None = None
+    if commands_enabled and _stdin_is_interactive():
+        stdin_thread = threading.Thread(
+            target=_stdin_reader,
+            args=(cmd_ctx, stop_event),
+            name="spec-team-watch-stdin",
+            daemon=True,
+        )
+        stdin_thread.start()
 
     # Two-stage Ctrl+C: first press asks the consumer to stop; second
     # raises KeyboardInterrupt (default handler) and bails out of any

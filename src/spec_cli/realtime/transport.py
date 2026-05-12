@@ -155,18 +155,31 @@ class SSEConsumer:
         *,
         workspace: bool = False,
         include_presence: bool = False,
+        verbose: bool = True,
         user_agent: str = "spec-cli/live",
         on_connect: "Callable[[], None] | None" = None,
     ) -> None:
         base = api_base.rstrip("/")
         if workspace:
             self._url = f"{base}/api/me/prompt-stream"
-            if include_presence:
-                self._url += "?include_presence=true"
         else:
             if project_id is None:
                 raise ValueError("project_id is required unless workspace=True")
             self._url = f"{base}/api/projects/{project_id}/prompt-stream"
+        # Build the query string once at construction time so it
+        # survives every reconnect — ``Last-Event-ID`` rides on the
+        # header, not the URL, so we never need to rebuild this.
+        # ``verbose=true`` is the default so reviewers see the AI's
+        # full reply body in real time; ``verbose=false`` is an
+        # explicit opt-out via ``--no-verbose`` on the CLI.
+        params: list[str] = []
+        if workspace and include_presence:
+            params.append("include_presence=true")
+        # Send verbose explicitly regardless of value so the server
+        # never has to guess — older servers without the param will
+        # ignore the unknown key and behave as before.
+        params.append(f"verbose={'true' if verbose else 'false'}")
+        self._url += "?" + "&".join(params)
         self._headers = {
             "Authorization": f"Bearer {access_token}",
             "User-Agent": user_agent,

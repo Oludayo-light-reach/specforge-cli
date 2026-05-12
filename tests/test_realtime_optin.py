@@ -36,8 +36,27 @@ def _manifest_at(tmp_path: Path, body: dict) -> Manifest:
 def test_prompt_stream_default_is_on_when_unset(tmp_path):
     """Bedrock invariant: a bundle that has never heard of Spec Live
     still broadcasts. Removing this default is the kind of regression
-    that silently kills the team-feed product."""
+    that silently kills the team-feed product.
+
+    As of v0.4 the verbose default *also* flipped to True so
+    ``spec team watch`` viewers see full assistant bodies without
+    every teammate having to edit their ``spec.yaml``. Teams that
+    want the old summary-only posture can set ``verbose: false``
+    explicitly — see ``test_prompt_stream_explicit_verbose_false``.
+    """
     m = _manifest_at(tmp_path, {"name": "demo"})
+    assert m.prompt_stream_enabled is True
+    assert m.prompt_stream_verbose is True
+
+
+def test_prompt_stream_explicit_verbose_false(tmp_path):
+    """Explicit opt-out wins over the new default. A team that
+    flipped this off intentionally must keep their preference even
+    after the default flip."""
+    m = _manifest_at(
+        tmp_path,
+        {"cloud": {"prompt_stream": {"enabled": True, "verbose": False}}},
+    )
     assert m.prompt_stream_enabled is True
     assert m.prompt_stream_verbose is False
 

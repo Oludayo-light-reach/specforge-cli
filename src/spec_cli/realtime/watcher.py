@@ -111,7 +111,12 @@ class WatcherOptions:
     receive: bool = True
     mirror: bool = False
     presence_enabled: bool = True
-    verbose_assistant: bool = False
+    # Broadcaster verbosity: when True (default since v0.4) we POST
+    # the full assistant ``text`` body alongside the summary so
+    # ``spec team watch`` viewers can debug the AI's actual output.
+    # Teams wanting the old "summary-only" posture can flip this off
+    # via ``cloud.prompt_stream.verbose: false`` in ``spec.yaml``.
+    verbose_assistant: bool = True
     compact_output: bool = False
     project_branch_filter: str | None = None
     user_agent: str = field(
@@ -633,6 +638,14 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit].rstrip() + "\n\n[…truncated…]"
 
 
+# Sentinel prefix on synthesized tool-only assistant summaries. The
+# receiver uses this to identify tool-only assistant turns and route
+# them through the critic before deciding whether to render them in
+# the stream (they are otherwise too noisy to show unconditionally).
+# Keep this stable — any change is a wire compatibility break.
+TOOL_SUMMARY_PREFIX = "ran "
+
+
 def _synthesize_tool_summary(calls: list) -> str | None:
     """Build a one-line summary of which tools an assistant turn invoked.
 
@@ -643,12 +656,14 @@ def _synthesize_tool_summary(calls: list) -> str | None:
     show only user prompts, making the AI look silent.
 
     Output shape:
-        ``ran 3 tools: Edit auth.py, Bash, Read main.py (+1 more)``
+        ``ran 3 tools: Edit auth.py, Bash "pytest -q", Read main.py (+1 more)``
 
-    Tool names use the upstream casing from the adapter
-    (``ALLOWED_TOOL_NAMES``) so reviewers recognize them at a glance.
-    A primary ``path`` arg is appended when present to make the line
-    actually useful for spotting blast radius.
+    For Bash specifically we include the first 80 chars of the
+    command so the auto-critic can spot destructive verbs
+    (``rm -rf``, ``git reset --hard``) in the live stream and a
+    reviewer can intervene *before* the blast radius lands. The
+    command text passes through ``redact_text`` so any pasted
+    secrets are scrubbed before they reach the wire.
     """
     if not calls:
         return None
@@ -657,22 +672,51 @@ def _synthesize_tool_summary(calls: list) -> str | None:
         name = getattr(call, "name", None)
         if not isinstance(name, str) or not name:
             continue
-        path = ""
         args = getattr(call, "args", None)
-        if isinstance(args, dict):
-            p = args.get("path") or args.get("file_path") or args.get("file")
-            if isinstance(p, str) and p:
-                # Keep the basename so the line stays short — full
-                # path is already in ``paths_touched`` on the event.
-                path = " " + p.rsplit("/", 1)[-1][:60]
-        parts.append(f"{name}{path}")
+        detail = _tool_call_detail(name, args)
+        parts.append(f"{name}{detail}")
     if not parts:
         return None
     extra = max(0, len(calls) - 3)
     body = ", ".join(parts)
     if extra:
         body += f" (+{extra} more)"
-    return f"ran {len(calls)} tool{'s' if len(calls) != 1 else ''}: {body}"
+    return f"{TOOL_SUMMARY_PREFIX}{len(calls)} tool{'s' if len(calls) != 1 else ''}: {body}"
+
+
+def _tool_call_detail(name: str, args: object) -> str:
+    """Pick the most informative single-line detail for a tool call.
+
+    Priority by tool:
+
+    * ``Bash`` — first ~80 chars of the ``command`` arg (redacted),
+      quoted so the destructive-verb critic can pattern-match.
+    * file-edit tools (``Edit``, ``Write``, ``Read``, ``MultiEdit``) —
+      the basename of the target file from ``path`` / ``file_path``.
+    * ``Grep`` / ``Glob`` — the ``pattern`` arg, quoted.
+    * everything else — falls back to ``path`` if present, else
+      nothing (the bare tool name is the detail).
+
+    Returned with a leading space (or empty string) so it can be
+    concatenated straight onto the tool name.
+    """
+    if not isinstance(args, dict):
+        return ""
+    if name == "Bash":
+        cmd = args.get("command")
+        if isinstance(cmd, str) and cmd.strip():
+            snippet = redact_text(cmd.strip())[:80]
+            return f' "{snippet}"'
+        return ""
+    if name in {"Grep", "Glob"}:
+        pat = args.get("pattern")
+        if isinstance(pat, str) and pat.strip():
+            return f' "{pat.strip()[:60]}"'
+        return ""
+    p = args.get("path") or args.get("file_path") or args.get("file")
+    if isinstance(p, str) and p:
+        return " " + p.rsplit("/", 1)[-1][:60]
+    return ""
 
 
 def _now_utc() -> datetime:

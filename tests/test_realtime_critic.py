@@ -203,10 +203,51 @@ def test_multi_task_does_not_fire_on_short_prompts():
 # ── role / empty filters ──────────────────────────────────────────
 
 
-def test_assistant_turns_are_not_critiqued():
-    ev = _user_event("rm -rf /")
+def test_assistant_turns_are_critiqued_for_blast_radius():
+    """Assistant turns now run through a narrower rule set focused on
+    *what the AI is about to do*, since the synthesized tool summary
+    (``ran 1 tool: Bash "rm -rf …"``) carries the dangerous command
+    onto the wire. This is the receiver's last chance to stop a
+    teammate's agent before the file system change lands."""
+    ev = _user_event(text=None, eid=1)
     ev.role = "assistant"
+    ev.summary = 'ran 1 tool: Bash "rm -rf node_modules"'
+    rules = {c.rule for c in critique_event(ev)}
+    assert "destructive-verb" in rules
+
+
+def test_assistant_prose_with_no_dangerous_content_yields_no_critique():
+    ev = _user_event(text="Sure, I'll start by reading auth.py", eid=2)
+    ev.role = "assistant"
+    ev.summary = "Sure, I'll start by reading auth.py"
     assert critique_event(ev) == []
+
+
+def test_assistant_critique_inspects_both_summary_and_text():
+    """The assistant rule body is the union of summary + text — a
+    broadcaster in summary-only mode is the more common case but
+    verbose-mode broadcasters carry the full text and we should
+    inspect that too."""
+    from spec_cli.realtime.critic import critique_event as ce
+    ev = _user_event(text="...full output... git reset --hard origin/main ...", eid=3)
+    ev.role = "assistant"
+    ev.summary = "applied the patch"  # innocent summary
+    rules = {c.rule for c in ce(ev)}
+    assert "destructive-verb" in rules
+
+
+def test_is_tool_only_summary_detects_synthesized_prefix():
+    from spec_cli.realtime.critic import is_tool_only_summary
+
+    assert is_tool_only_summary("ran 1 tool: Edit auth.py")
+    assert is_tool_only_summary("ran 12 tools: Read x, Bash, Edit y")
+    assert is_tool_only_summary("Ran 3 Tools: foo")  # case-insensitive
+    # False positives: a real prose reply that happens to start with
+    # the word "ran" should not be misclassified.
+    assert not is_tool_only_summary("ran into a bug in payments.py")
+    assert not is_tool_only_summary("here is the plan: 1) read 2) patch")
+    assert not is_tool_only_summary(None)
+    assert not is_tool_only_summary("")
 
 
 def test_empty_prompt_yields_no_critique():

@@ -20,12 +20,74 @@ whole point of having a stream open.
 """
 from __future__ import annotations
 
+import os
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from ..ui import console
-from .critic import Critique, critique_event, suggested_flag_command
+from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
 from .events import IncomingEvent, IncomingFlag
+
+
+def _short_cwd(cwd: str | None) -> str | None:
+    """Render a teammate's working directory compactly for the header.
+
+    Strips the user's own ``$HOME`` to ``~`` (universal shell ergonomics)
+    and collapses very long paths to ``…/last-two-segments`` so the
+    header line never wraps. Returns ``None`` for missing / empty
+    input so callers can compose the chip conditionally.
+    """
+    if not isinstance(cwd, str):
+        return None
+    path = cwd.strip()
+    if not path:
+        return None
+    home = os.path.expanduser("~")
+    if home and (path == home or path.startswith(home + os.sep)):
+        path = "~" + path[len(home):]
+    # Hard cap on chip width — pick the last two segments when the
+    # path is longer than 40 chars so the eye still recognises the
+    # repo name on the right.
+    if len(path) > 40:
+        try:
+            parts = Path(path).parts
+            if len(parts) > 2:
+                path = "…/" + "/".join(parts[-2:])
+        except Exception:  # noqa: BLE001
+            pass
+    return path
+
+
+def _short_session(session_id: str | None) -> str | None:
+    """Render a short, stable session badge. We use the first 6 chars
+    of the upstream session id — long enough to be unique across the
+    handful of concurrent sessions a reviewer is likely to be
+    watching, short enough not to dominate the header line."""
+    if not isinstance(session_id, str):
+        return None
+    sid = session_id.strip()
+    if not sid:
+        return None
+    return sid[:6]
+
+
+def _paths_chip(paths: list[str] | None) -> str | None:
+    """Render a compact chip listing the first couple of files an
+    event touched, with an overflow marker. Cheap proxy for "what
+    did this turn change" without shipping a full diff over the
+    wire. Returns ``None`` when there is nothing to show."""
+    if not paths:
+        return None
+    seen = [p for p in paths if isinstance(p, str) and p][:2]
+    if not seen:
+        return None
+    extra = max(0, len(paths) - len(seen))
+    basenames = [p.rsplit("/", 1)[-1] for p in seen]
+    body = ", ".join(basenames)
+    if extra:
+        body += f", +{extra} more"
+    return body
 
 
 # Per-kind glyph + color hint used both in the watcher and `spec team
@@ -51,6 +113,10 @@ _FLAG_GLYPH = {
 # every Rich-capable terminal.
 _USER_BADGE = "[bold black on #3ddab4] USER [/]"
 _AI_BADGE = "[bold black on #7de3ff]  AI  [/]"
+# Red ERROR badge used when an adapter ships ``role = "error"`` —
+# agent timeout, refused request, tool failure. Lights up the pane so
+# a reviewer notices an agent in trouble without having to read text.
+_ERROR_BADGE = "[bold white on #d63a4e] ERROR [/]"
 
 # Source → display color. Each adapter the watcher can stream from
 # gets its own muted-but-distinct hue so a reviewer can tell which
@@ -122,10 +188,17 @@ class Notifier:
         *,
         compact: bool = False,
         critic_enabled: bool = True,
+        notify: bool = False,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
         self._critic_enabled = critic_enabled
+        # Opt-in attention helper: ring the terminal bell + best-effort
+        # OS notification (macOS only for now via ``osascript``) when
+        # the critic fires at ``block`` severity, e.g. a teammate just
+        # typed ``rm -rf`` or pasted a secret. Default off so noisy
+        # team feeds don't beep constantly.
+        self._notify = notify
         # session_key → (event_id, posted_at, author_display, warned)
         # Tracks open user prompts that have not yet seen an assistant
         # follow-up; lets ``check_open_sessions`` surface a hint when
@@ -133,6 +206,12 @@ class Notifier:
         self._open_sessions: dict[
             tuple[int, str], tuple[int, datetime, str, bool]
         ] = {}
+
+    def set_critic_enabled(self, enabled: bool) -> None:
+        """Toggle the auto-critic at runtime. Used by the ``/critic``
+        slash command so a reviewer can silence the suggestion stream
+        without restarting the watcher."""
+        self._critic_enabled = bool(enabled)
 
     def show(self, event: IncomingEvent) -> None:
         time_label = _short_time(event.turn_at or event.received_at)
@@ -144,6 +223,23 @@ class Notifier:
             if event.bundle_label
             else ""
         )
+
+        # Composable context chips — cwd shortened to ``~``, paths the
+        # turn touched, and a short session id for thread tracking.
+        # All three are optional: we only render the divider before a
+        # chip when it actually has content, so a quiet stream stays
+        # clean and a busy stream still fits on one line.
+        cwd_chip = _short_cwd(event.cwd)
+        paths_chip = _paths_chip(event.paths_touched)
+        session_chip = _short_session(event.session_id)
+        ctx_parts: list[str] = []
+        if cwd_chip:
+            ctx_parts.append(f"[sf.muted]cwd[/] [sf.label]{cwd_chip}[/]")
+        if paths_chip:
+            ctx_parts.append(f"[sf.muted]touched[/] [sf.label]{paths_chip}[/]")
+        if session_chip:
+            ctx_parts.append(f"[sf.muted]session[/] [sf.label]{session_chip}[/]")
+        ctx_line = "  ".join(ctx_parts) if ctx_parts else ""
 
         critiques: list[Critique] = []
         if event.role == "user":
@@ -165,6 +261,29 @@ class Notifier:
             # are pinned by (project_id, session_id) — the same
             # identity the server uses for dedupe.
             self._remember_open_session(event)
+        elif event.role == "error":
+            # Agent error: timeout / tool failure / refused request.
+            # Red badge + short message in the header keeps the eye
+            # snapping to it even on a busy pane.
+            preview = (event.summary or event.text or "").strip()
+            preview = _truncate(preview, 220 if not self._compact else 100)
+            model = event.model or "agent"
+            head = (
+                f"{_ERROR_BADGE} [bold #ff8a98]{model}[/] "
+                f"[sf.muted]· failed on[/] [bold #3ddab4]{author}[/] "
+                f"[sf.muted]· in[/] {source_label} "
+                f"[sf.muted]· {branch} · {time_label}[/]"
+                f"{bundle}"
+            )
+            # An error closes the awaiting-reply tracker for this
+            # session — we have a definitive answer, just not a happy
+            # one.
+            self._mark_session_replied(event)
+            # Surface assistant-side critic on the error message too,
+            # so e.g. a tool failure containing destructive text
+            # still gets flagged.
+            if self._critic_enabled:
+                critiques = critique_event(event)
         else:
             preview = (event.summary or event.text or "").strip()
             preview = _truncate(preview, 220 if not self._compact else 100)
@@ -181,24 +300,40 @@ class Notifier:
             )
             # Pair off the awaiting-reply tracker.
             self._mark_session_replied(event)
+            # Assistant turns also run through the critic so
+            # destructive Bash / test-bypass language in tool
+            # summaries surfaces in the live stream.
+            if self._critic_enabled:
+                critiques = critique_event(event)
 
         with self._lock:
             if self._compact:
-                line = f"{head}  {preview}" if preview else head
-                console.print(line)
+                # Compact mode lives on one line — context chips ride
+                # at the end so the row still parses even when piped
+                # into ``grep`` for a handle / file / session id.
+                tail = f"  {preview}" if preview else ""
+                ctx_compact = f"  {ctx_line}" if ctx_line else ""
+                console.print(f"{head}{tail}{ctx_compact}")
                 self._render_critiques(event, critiques)
                 return
             console.print()
             console.print(head)
+            if ctx_line:
+                # One indented line below the badge with the muted
+                # context chips. Always indented to the same column
+                # as the body so a vertical scan groups header →
+                # context → body cleanly.
+                console.print(f"  {ctx_line}")
             if event.title and event.role == "user":
                 console.print(f"  [sf.muted]title:[/] {_truncate(event.title, 200)}")
             if preview:
-                # Indent assistant bodies a bit further so they read
-                # as a clear "reply" block underneath the header.
+                # Indent assistant / error bodies a bit further so
+                # they read as a clear "reply" block underneath the
+                # header.
                 indent = "    " if event.role != "user" else "  "
                 for line in preview.splitlines():
                     console.print(f"{indent}{line}")
-            elif event.role != "user":
+            elif event.role == "assistant":
                 # Empty-body assistant turn (broadcaster did not send
                 # summary or text) — call it out so reviewers know
                 # there *was* a reply, just not its content.
@@ -206,11 +341,6 @@ class Notifier:
                     "    [sf.muted](assistant body not shared — broadcaster is "
                     "in summary-only mode)[/]"
                 )
-            if event.paths_touched:
-                paths = ", ".join(event.paths_touched[:5])
-                if len(event.paths_touched) > 5:
-                    paths += f", +{len(event.paths_touched) - 5} more"
-                console.print(f"  [sf.muted]paths:[/] {paths}")
             self._render_critiques(event, critiques)
 
     # ── critic + session-pair plumbing ────────────────────────────
@@ -221,9 +351,17 @@ class Notifier:
         """Print one indented suggestion per fired rule, plus the
         exact ``spec team flag`` command a reviewer would run if they
         agree with the critic. Single-quoted ``rule`` makes searching
-        chat logs for a specific rule easy."""
+        chat logs for a specific rule easy.
+
+        When ``--notify`` was set on the watcher and *any* of the
+        rules is ``block`` severity, we also ring the terminal bell
+        and fire a best-effort macOS notification — for the case
+        where the reviewer is not staring at the pane and a teammate
+        just typed ``rm -rf`` or pasted a secret.
+        """
         if not critiques:
             return
+        block_hits: list[Critique] = []
         for c in critiques:
             console.print(
                 f"  [{c.color}]{c.glyph} AUTO {c.rule:<16}[/] "
@@ -232,6 +370,57 @@ class Notifier:
             console.print(
                 f"     [sf.muted]→ {suggested_flag_command(event.id, c)}[/]"
             )
+            if c.severity == SEV_HIGH:
+                block_hits.append(c)
+        if self._notify and block_hits:
+            self._alert(event, block_hits)
+
+    def _alert(
+        self, event: IncomingEvent, hits: list[Critique]
+    ) -> None:
+        """Best-effort "look at the pane" alert for block-severity
+        critic hits. Always rings the terminal bell (works in any
+        terminal); on macOS we additionally fire ``osascript`` so the
+        OS shows a banner.
+
+        Failures are swallowed silently — alerting is a courtesy, not
+        the contract of the watcher.
+        """
+        try:
+            import sys
+
+            # ``\a`` to stderr so it doesn't get caught by stdout
+            # redirects piping the stream into a file.
+            sys.stderr.write("\a")
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import shutil
+            import subprocess
+
+            osa = shutil.which("osascript")
+            if not osa:
+                return
+            top = hits[0]
+            title = f"Spec: block on {event.author_display}"
+            # AppleScript quoting: escape double quotes and backslashes
+            # inside the message so a stray quote in the critic text
+            # doesn't break the call.
+            msg = top.msg.replace("\\", "\\\\").replace('"', '\\"')
+            sub_title = f"#{event.id} · {top.rule}"
+            script = (
+                f'display notification "{msg}" '
+                f'with title "{title}" '
+                f'subtitle "{sub_title}"'
+            )
+            subprocess.Popen(
+                [osa, "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _remember_open_session(self, event: IncomingEvent) -> None:
         key = (event.project_id, event.session_id or f"ev:{event.id}")
@@ -308,6 +497,38 @@ class Notifier:
             console.print(
                 f"[sf.muted]· still watching · {ts}[/]"
             )
+
+    def show_command_result(self, body: str, *, kind: str = "info") -> None:
+        """Render the output of a slash-command (``/flag``, ``/summarize``,
+        etc.) so it visually separates from streamed events. ``kind`` is
+        one of ``info`` / ``ok`` / ``error`` / ``summarize``; each gets a
+        distinct accent glyph so the eye can tell at a glance whether
+        the watcher is acknowledging an action, raising an error, or
+        emitting a large structured block for the agent.
+
+        ``/summarize`` output, in particular, is meant to be read
+        verbatim by the agent running in the terminal — we therefore
+        render it with ``markup=False`` so any literal ``[…]`` text
+        in a teammate's prompt does not get interpreted as a Rich
+        tag and disappear from the agent's context.
+        """
+        glyph, color = {
+            "ok": ("✓", "sf.mint"),
+            "error": ("✗", "sf.reject"),
+            "summarize": ("≡", "sf.point"),
+            "info": ("·", "sf.point"),
+        }.get(kind, ("·", "sf.point"))
+        lines = body.splitlines() or [body]
+        with self._lock:
+            console.print()
+            console.print(
+                f"[{color}]{glyph}[/] [bold {color}]spec>[/] "
+                f"{lines[0]}",
+                markup=True,
+                highlight=False,
+            )
+            for extra in lines[1:]:
+                console.print(f"   {extra}", markup=False, highlight=False)
 
     def announce_connected(self, project_label: str) -> None:
         with self._lock:

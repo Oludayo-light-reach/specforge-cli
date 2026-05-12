@@ -206,14 +206,27 @@ _SECRET_PATTERNS = re.compile(
 def critique_event(event: IncomingEvent) -> list[Critique]:
     """Run every rule against ``event`` and return the firing critiques.
 
-    Only ``role = "user"`` events are inspected today — assistant turns
-    have their own failure modes (hallucinated APIs, etc.) but those
-    are harder to detect with regex alone and live behind a future
-    LLM-backed pass. ``presence`` rows are skipped.
-    """
-    if event.role != "user":
-        return []
+    Two role-specific rule sets:
 
+    * **user turns** — full prompt-quality catalogue: vague intent,
+      destructive verbs, test bypass, leaked secrets, trust handoff,
+      multi-task.
+    * **assistant turns** — narrower: we look for *blast radius* in
+      the synthesized tool summary or in any prose the assistant did
+      emit. Destructive verbs in a Bash command (``ran 1 tool: Bash
+      "rm -rf node_modules"``) fire ``destructive-verb`` so the
+      reviewer sees it *before* the tool actually lands.
+
+    Presence rows are always skipped — they carry no inspectable text.
+    """
+    if event.role == "user":
+        return _critique_user(event)
+    if event.role == "assistant":
+        return _critique_assistant(event)
+    return []
+
+
+def _critique_user(event: IncomingEvent) -> list[Critique]:
     body = (event.text or event.summary or "").strip()
     if not body:
         return []
@@ -270,6 +283,65 @@ def critique_event(event: IncomingEvent) -> list[Critique]:
     return out
 
 
+def _critique_assistant(event: IncomingEvent) -> list[Critique]:
+    """Inspect an assistant turn's summary + text for blast-radius
+    warnings. The body we examine is the union of ``text`` (prose) and
+    ``summary`` (which for tool-only turns carries the synthesized
+    ``ran N tools: Bash "rm -rf …"`` line). Joining them lets a single
+    regex pass catch the dangerous Bash command whether the
+    broadcaster shared full text or only the summary."""
+    parts: list[str] = []
+    if isinstance(event.summary, str) and event.summary.strip():
+        parts.append(event.summary.strip())
+    if isinstance(event.text, str) and event.text.strip():
+        parts.append(event.text.strip())
+    if not parts:
+        return []
+    body = "\n".join(parts)[:4096]
+
+    out: list[Critique] = []
+    if _DESTRUCTIVE.search(body):
+        out.append(_critique(
+            "destructive-verb",
+            SEV_HIGH,
+            "AI is about to run a destructive operation — review the "
+            "tool call before it lands",
+        ))
+    if _matches_test_bypass(body):
+        out.append(_critique(
+            "test-bypass",
+            SEV_HIGH,
+            "AI is about to disable / skip / remove tests — stop "
+            "and review the underlying failure",
+        ))
+    if _SECRET_PATTERNS.search(body):
+        out.append(_critique(
+            "secret-in-output",
+            SEV_HIGH,
+            "AI output looks like it contains a credential — rotate "
+            "and check for leakage",
+        ))
+    return out
+
+
+def is_tool_only_summary(text: str | None) -> bool:
+    """Cheap check: did the broadcaster mark this assistant turn as
+    tool-only? ``True`` iff the summary starts with the sentinel
+    prefix that ``watcher._synthesize_tool_summary`` writes. The
+    receiver uses this to filter tool-only turns out of the live
+    stream unless the critic has something to say about them.
+
+    Keeping this function in ``critic.py`` (rather than depending on
+    a constant from the broadcaster module) means the receiver does
+    not need to import anything from ``realtime.watcher``."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.lstrip()
+    # Accept "ran 1 tool:" / "ran 12 tools:" but reject "ran out of
+    # ideas" — must have a digit between ``ran`` and ``tool``.
+    return bool(re.match(r"^ran\s+\d+\s+tools?:", stripped, re.IGNORECASE))
+
+
 def _critique(rule: str, severity: str, msg: str) -> Critique:
     return Critique(
         rule=rule,
@@ -299,6 +371,7 @@ __all__ = [
     "SEV_WARN",
     "SEV_HIGH",
     "critique_event",
+    "is_tool_only_summary",
     "suggested_flag_command",
 ]
 

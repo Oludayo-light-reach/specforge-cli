@@ -18,7 +18,18 @@ import threading
 from datetime import datetime, timezone
 
 from ..ui import console
-from .events import IncomingEvent
+from .events import IncomingEvent, IncomingFlag
+
+
+# Per-kind glyph + color hint used both in the watcher and `spec team
+# watch`. Kept small and stable so muscle memory transfers between
+# screens.
+_FLAG_GLYPH = {
+    "warning": ("⚠", "sf.warn"),
+    "question": ("?", "sf.point"),
+    "block": ("⛔", "sf.reject"),
+    "ack": ("✓", "sf.mint"),
+}
 
 
 def _short_time(value: datetime | None) -> str:
@@ -95,6 +106,37 @@ class Notifier:
                     paths += f", +{len(event.paths_touched) - 5} more"
                 console.print(f"  [sf.muted]paths:[/] {paths}")
 
+    def show_flag(self, flag: IncomingFlag) -> None:
+        """Render an incoming flag frame inline with the prompt stream.
+
+        Single line on purpose — flags are decorative annotations, not
+        the main event. The glyph + role color encodes severity at a
+        glance; the optional note is shown verbatim (truncated to a
+        sensible width)."""
+        glyph, color = _FLAG_GLYPH.get(flag.kind, ("⚑", "sf.warn"))
+        author = flag.author_display
+        note = (flag.note or "").strip()
+        note_part = ""
+        if note:
+            note_short = _truncate(note, 220 if not self._compact else 100)
+            note_part = f" [sf.muted]· {note_short}[/]"
+        with self._lock:
+            console.print(
+                f"  [{color}]{glyph} {flag.kind:<8}[/] "
+                f"[sf.label]{author}[/] [sf.muted]· flagged #{flag.prompt_event_id}[/]"
+                f"{note_part}"
+            )
+
+    def announce_heartbeat(self) -> None:
+        """Visible "I am still listening" tick. Surfaced periodically
+        from idle workspace watchers so engineers can tell at a glance
+        that the stream is alive even when the team is quiet."""
+        ts = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+        with self._lock:
+            console.print(
+                f"[sf.muted]· still watching · {ts}[/]"
+            )
+
     def announce_connected(self, project_label: str) -> None:
         with self._lock:
             console.print(
@@ -120,3 +162,4 @@ class Notifier:
 
 
 __all__ = ["Notifier"]
+

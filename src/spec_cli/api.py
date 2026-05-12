@@ -308,6 +308,49 @@ class CloudClient:
         data = self._request("GET", "/api/me/prompt-events", params=params)
         return data or []
 
+    def list_prompt_event_flags(
+        self, project_id: int, event_id: int
+    ) -> list[dict[str, Any]]:
+        """Return the flags (reactions / warnings / acks) on one event."""
+        data = self._request(
+            "GET",
+            f"/api/projects/{project_id}/prompt-events/{event_id}/flags",
+        )
+        return data or []
+
+    def create_prompt_event_flag(
+        self,
+        *,
+        project_id: int,
+        event_id: int,
+        kind: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach a flag to a prompt event.
+
+        Mirrors ``POST /api/projects/{pid}/prompt-events/{eid}/flags``.
+        The server fans the new flag out over SSE so every connected
+        watcher (per-project ``spec watch`` and workspace-wide
+        ``spec team watch``) sees it immediately.
+        """
+        body: dict[str, Any] = {"kind": kind}
+        if note is not None:
+            body["note"] = note
+        return self._request(
+            "POST",
+            f"/api/projects/{project_id}/prompt-events/{event_id}/flags",
+            json=body,
+        )
+
+    def delete_prompt_event_flag(
+        self, project_id: int, flag_id: int
+    ) -> None:
+        """Delete one of your own flags by id."""
+        self._request(
+            "DELETE",
+            f"/api/projects/{project_id}/prompt-events/flags/{flag_id}",
+        )
+
     # -- branch reviews ------------------------------------------------
 
     def open_branch_review(

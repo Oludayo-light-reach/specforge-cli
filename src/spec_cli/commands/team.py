@@ -1,12 +1,26 @@
 """
-``spec team`` — snapshot of recent team prompt activity, plus
-``spec team watch`` for a workspace-wide live SSE tail.
+``spec team`` — recent prompt activity (snapshot) plus subcommands for
+the live workspace-wide stream and flagging teammates' prompts.
+
+Subcommands:
+
+* ``spec team`` — print recent prompt events (snapshot from the REST
+  list endpoints). Bundle-scoped by default; ``--org`` falls back to
+  ``GET /api/me/prompt-events`` for a workspace-wide listing.
+* ``spec team watch`` — long-lived SSE tail across every bundle the
+  caller can see (``GET /api/me/prompt-stream``). Receive-only;
+  designed to live in a dedicated terminal so engineers can watch
+  every running agent on every project from one screen.
+* ``spec team flag <event_id> --kind …`` — post a flag (reaction /
+  warning / question / ack) on a prompt event. The flag fans out
+  over the same SSE channel so peers see it within an RTT.
 """
 from __future__ import annotations
 
 import re
 import signal
 import threading
+import time
 from datetime import datetime, timezone
 
 import click
@@ -20,10 +34,10 @@ from ..config import (
     load_manifest,
     parse_cloud_project,
 )
-from ..realtime.events import IncomingEvent
+from ..realtime.events import IncomingEvent, IncomingFlag
 from ..realtime.notifier import Notifier
 from ..realtime.transport import SSEConsumer, SSEStreamError, run_consumer_in_thread
-from ..ui import console, dim, fatal
+from ..ui import console, dim, fatal, ok
 
 
 def _ago(value: datetime | None) -> str:
@@ -43,6 +57,9 @@ def _ago(value: datetime | None) -> str:
 
 # GitHub-style handle — server ``author_handle`` filter is exact match.
 _HANDLE_STYLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,37}$")
+
+# Closed enum (mirrors the server's ``PromptEventFlagCreate``).
+_FLAG_KINDS = ("warning", "question", "block", "ack")
 
 
 def _event_matches_user_filter(ev: IncomingEvent, needle: str) -> bool:
@@ -148,6 +165,9 @@ def _run_team_snapshot(
             bundle = f" [sf.muted]· {event.bundle_label}[/]"
         head = (
             f"  [{role_color}]{event.role:<9}[/] "
+            # Event id is displayed so users can copy it straight into
+            # `spec team flag <id>` without a second lookup.
+            f"[sf.muted]#{event.id}[/] "
             f"[sf.label]{author}[/] [sf.muted]· {branch} · {when} · {event.source}[/]"
             f"{bundle}"
         )
@@ -220,9 +240,7 @@ def team_group(
 ) -> None:
     """Print recent Spec Live prompt activity, or stream the whole workspace.
 
-    Default (no subcommand): same as before — snapshot from
-    ``/api/projects/{id}/prompt-events`` or ``/api/me/prompt-events`` with
-    ``--org``.
+    Default (no subcommand): snapshot from the REST list endpoints.
 
     \b
     Examples:
@@ -230,6 +248,7 @@ def team_group(
       spec team --org --limit 50
       spec team --user alice
       spec team watch
+      spec team flag 4711 --kind warning --note "race condition risk"
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -243,6 +262,12 @@ def team_group(
     )
 
 
+# Idle interval (seconds) between visible "still watching" heartbeats
+# in `spec team watch`. Chosen so a quiet workspace still feels alive
+# without ever competing with real events for screen real estate.
+_TEAM_WATCH_HEARTBEAT_SECS = 60.0
+
+
 @team_group.command("watch")
 @click.option(
     "--compact",
@@ -254,16 +279,41 @@ def team_group(
     is_flag=True,
     help="Include presence pings in the stream (very noisy).",
 )
-def team_watch_cmd(compact: bool, include_presence: bool) -> None:
+@click.option(
+    "--heartbeat/--no-heartbeat",
+    "heartbeat",
+    default=True,
+    show_default=True,
+    help=(
+        "Print a single `· still watching ·` line on idle so the terminal "
+        "never looks frozen. Disable in dashboards / CI to keep the log clean."
+    ),
+)
+@click.option(
+    "--heartbeat-interval",
+    type=click.IntRange(15, 3600),
+    default=int(_TEAM_WATCH_HEARTBEAT_SECS),
+    show_default=True,
+    help="Seconds between heartbeat lines when --heartbeat is on.",
+)
+def team_watch_cmd(
+    compact: bool,
+    include_presence: bool,
+    heartbeat: bool,
+    heartbeat_interval: int,
+) -> None:
     """Live SSE tail across every bundle you can see (workspace-wide).
 
     Connects to ``GET /api/me/prompt-stream``. Receive-only — does not
-    require a bundle directory. Ctrl+C to stop.
+    require a bundle directory. Reconnects with exponential backoff on
+    transient drops; ``Ctrl+C`` once asks for a graceful exit, a
+    second press forces.
 
     \b
     Examples:
       spec team watch
       spec team watch --compact
+      spec team watch --no-heartbeat
     """
     creds = load_credentials()
     if not creds or not creds.access_token:
@@ -271,28 +321,63 @@ def team_watch_cmd(compact: bool, include_presence: bool) -> None:
         return
 
     notifier = Notifier(compact=compact)
+    stop_event = threading.Event()
+    # Tracks the timestamp of the last *visible* output so the idle
+    # heartbeat printer doesn't fire on top of fresh content.
+    last_output_at = [time.monotonic()]
+
+    def _on_connect() -> None:
+        # First successful handshake — print the "connected" banner
+        # only now, so auth failures stay silent on stdout and the
+        # user sees the real error from the SSE consumer instead.
+        notifier.announce_connected("workspace (all bundles)")
+        last_output_at[0] = time.monotonic()
+
     consumer = SSEConsumer(
         creds.api_base,
         creds.access_token,
         None,
         workspace=True,
         include_presence=include_presence,
+        on_connect=_on_connect,
     )
 
     def on_fatal(err: SSEStreamError) -> None:
         notifier.announce_fatal(str(err))
+        stop_event.set()
 
     def on_event(ev: IncomingEvent) -> None:
         if not include_presence and ev.role == "presence":
             return
         notifier.show(ev)
+        last_output_at[0] = time.monotonic()
 
-    notifier.announce_connected("workspace (all bundles)")
+    def on_flag(flag: IncomingFlag) -> None:
+        notifier.show_flag(flag)
+        last_output_at[0] = time.monotonic()
 
-    t = run_consumer_in_thread(consumer, on_event, on_fatal)
+    consumer_thread = run_consumer_in_thread(
+        consumer, on_event, on_fatal, on_flag=on_flag
+    )
+
+    # Two-stage Ctrl+C: first press asks the consumer to stop; second
+    # raises KeyboardInterrupt (default handler) and bails out of any
+    # blocking cleanup. Matches the convention in `spec watch`.
+    pressed_once = threading.Event()
 
     def _stop(_signum: int, _frame: object | None) -> None:
-        consumer.stop()
+        if not pressed_once.is_set():
+            pressed_once.set()
+            try:
+                dim("spec team watch: shutting down… (press Ctrl+C again to force)")
+            except Exception:  # noqa: BLE001
+                pass
+            consumer.stop()
+            stop_event.set()
+            try:
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+            except (AttributeError, ValueError):
+                pass
 
     signal.signal(signal.SIGINT, _stop)
     try:
@@ -300,7 +385,119 @@ def team_watch_cmd(compact: bool, include_presence: bool) -> None:
     except (AttributeError, ValueError):
         pass
 
-    t.join()
+    notifier.announce_reconnecting("connecting…")
+
+    # Main thread surfaces the idle heartbeat so the consumer thread
+    # stays a clean network reader. Tick rate is 1Hz which is well
+    # below any reasonable interval.
+    try:
+        while consumer_thread.is_alive() and not stop_event.is_set():
+            if heartbeat:
+                idle_for = time.monotonic() - last_output_at[0]
+                if idle_for >= heartbeat_interval:
+                    notifier.announce_heartbeat()
+                    last_output_at[0] = time.monotonic()
+            # Sleep in small slices so Ctrl+C is responsive even when
+            # we are otherwise quiet.
+            stop_event.wait(timeout=1.0)
+    finally:
+        consumer.stop()
+        consumer_thread.join(timeout=2.0)
+
+
+@team_group.command("flag")
+@click.argument("event_id", type=int)
+@click.option(
+    "--kind",
+    "-k",
+    type=click.Choice(list(_FLAG_KINDS)),
+    default="warning",
+    show_default=True,
+    help="Flag kind (warning · question · block · ack).",
+)
+@click.option(
+    "--note",
+    "-m",
+    default=None,
+    help="Optional short note (max 500 chars).",
+)
+@click.option(
+    "--project",
+    "-p",
+    default=None,
+    help=(
+        "Project `handle/slug`. Defaults to `cloud.project` from "
+        "spec.yaml when run inside a bundle. Required outside a bundle."
+    ),
+)
+def team_flag_cmd(
+    event_id: int, kind: str, note: str | None, project: str | None
+) -> None:
+    """Flag a teammate's prompt event in near-real-time.
+
+    The flag is delivered to every connected ``spec watch`` /
+    ``spec team watch`` over SSE on the ``flag`` channel, so peers
+    see it next to the prompt within an RTT. Idempotent: posting the
+    same kind for the same event twice yields 409.
+
+    \b
+    Examples:
+      spec team flag 4711 --kind warning --note "race condition risk"
+      spec team flag 4712 --kind ack
+      spec team flag 4713 --kind block --note "do not run this"
+    """
+    creds = load_credentials()
+    if not creds or not creds.access_token:
+        fatal("Not signed in. Run `spec login` first.")
+        return
+
+    raw = project
+    if not raw:
+        try:
+            root = find_bundle_root()
+        except BundleNotFoundError:
+            fatal(
+                "No project specified. Pass `--project <handle>/<slug>` or "
+                "run `spec team flag` from inside a Spec bundle."
+            )
+            return
+        manifest = load_manifest(root)
+        raw = manifest.cloud_project
+        if not raw:
+            fatal(
+                "No `cloud.project` in spec.yaml. Pass --project <handle>/<slug>."
+            )
+            return
+
+    try:
+        handle, slug = parse_cloud_project(raw, default_handle=creds.user_handle)
+    except RemoteUrlError as e:
+        fatal(str(e))
+        return
+
+    client = CloudClient(creds)
+    try:
+        project_info = client.resolve_project(handle, slug)
+    except ApiError as e:
+        fatal(str(e))
+        return
+    project_id = int(project_info["id"])
+    try:
+        out = client.create_prompt_event_flag(
+            project_id=project_id,
+            event_id=event_id,
+            kind=kind,
+            note=note,
+        )
+    except ApiError as e:
+        fatal(str(e))
+        return
+
+    flag_id = out.get("id") if isinstance(out, dict) else None
+    ok(
+        f"flagged #{event_id} as {kind}"
+        + (f" (flag id {flag_id})" if flag_id is not None else "")
+    )
 
 
 # Backwards-compatible export name for cli.py

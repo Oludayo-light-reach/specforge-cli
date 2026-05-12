@@ -158,6 +158,52 @@ class OutgoingEvent:
 
 
 @dataclass
+class IncomingFlag:
+    """A teammate's flag (reaction / warning) on a prompt event.
+
+    Carried over the SSE wire as ``event: flag`` frames and surfaced
+    by the watcher's notifier next to the prompt the flag references.
+    Mirrors the server's ``PromptEventFlagOut`` schema.
+    """
+
+    id: int
+    prompt_event_id: int
+    project_id: int
+    kind: str
+    note: str | None
+    created_at: datetime
+    author_user_id: int
+    author_handle: str | None
+    author_name: str
+    author_avatar_url: str | None
+
+    @classmethod
+    def from_json(cls, payload: dict[str, Any]) -> "IncomingFlag":
+        author = payload.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        return cls(
+            id=int(payload["id"]),
+            prompt_event_id=int(payload["prompt_event_id"]),
+            project_id=int(payload["project_id"]),
+            kind=str(payload.get("kind") or "warning"),
+            note=_str_or_none(payload.get("note")),
+            created_at=_parse_dt(payload.get("created_at"))
+            or datetime.now(timezone.utc),
+            author_user_id=int(author.get("user_id") or 0),
+            author_handle=_str_or_none(author.get("handle")),
+            author_name=str(author.get("name") or "(unknown)"),
+            author_avatar_url=_str_or_none(author.get("avatar_url")),
+        )
+
+    @property
+    def author_display(self) -> str:
+        if self.author_handle:
+            return f"@{self.author_handle}"
+        return self.author_name
+
+
+@dataclass
 class IncomingEvent:
     """One event delivered by the server, via SSE or REST.
 

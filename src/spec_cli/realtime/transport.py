@@ -29,7 +29,7 @@ from typing import Callable, Iterator
 
 import requests
 
-from .events import IncomingEvent, OutgoingEvent
+from .events import IncomingEvent, IncomingFlag, OutgoingEvent
 
 log = logging.getLogger(__name__)
 
@@ -132,11 +132,19 @@ class HTTPPoster:
 class SSEConsumer:
     """Long-lived SSE listener with automatic reconnect.
 
-    Run :meth:`stream` from a background thread; it yields
-    :class:`IncomingEvent` instances forever (until ``stop`` is set).
+    Run :meth:`stream` from a background thread; it yields a mix of
+    :class:`IncomingEvent` (turn frames) and :class:`IncomingFlag`
+    (teammate reaction frames) instances forever (until ``stop`` is
+    set). Callers must therefore handle both types; the watcher and
+    ``spec team watch`` do this via a ``Notifier`` that knows about
+    both.
+
     Reconnect logic is encapsulated — callers don't need to handle
     transient drops, only fatal errors raised as
-    :class:`SSEStreamError`.
+    :class:`SSEStreamError`. ``on_connect`` (if supplied) is invoked
+    each time we successfully open a new connection so callers can
+    surface a visible "● connected" line *after* auth has cleared,
+    not before.
     """
 
     def __init__(
@@ -148,6 +156,7 @@ class SSEConsumer:
         workspace: bool = False,
         include_presence: bool = False,
         user_agent: str = "spec-cli/live",
+        on_connect: "Callable[[], None] | None" = None,
     ) -> None:
         base = api_base.rstrip("/")
         if workspace:
@@ -176,6 +185,7 @@ class SSEConsumer:
         # idle would feel hung.
         self._resp_lock = threading.Lock()
         self._active_response: requests.Response | None = None
+        self._on_connect = on_connect
 
     def set_resume_cursor(self, last_event_id: int | None) -> None:
         """Set the ``Last-Event-ID`` value to send on the next connect.
@@ -205,7 +215,7 @@ class SSEConsumer:
             except Exception:  # noqa: BLE001
                 pass
 
-    def stream(self) -> Iterator[IncomingEvent]:
+    def stream(self) -> Iterator["IncomingEvent | IncomingFlag"]:
         """Yield events forever (until :meth:`stop` is called).
 
         Reconnect-on-error is built in; the only way to exit is by
@@ -245,7 +255,7 @@ class SSEConsumer:
 
     # -- internals -----------------------------------------------------
 
-    def _connect_once(self) -> Iterator[IncomingEvent]:
+    def _connect_once(self) -> Iterator["IncomingEvent | IncomingFlag"]:
         headers = dict(self._headers)
         if self._last_event_id is not None:
             headers["Last-Event-ID"] = str(self._last_event_id)
@@ -283,6 +293,15 @@ class SSEConsumer:
                     f"{resp.text[:200]}"
                 )
 
+            # First successful HTTP exchange — let the caller flip its
+            # UI to "● connected". We swallow any callback exceptions
+            # so a printer bug never takes the stream down.
+            if self._on_connect is not None:
+                try:
+                    self._on_connect()
+                except Exception as e:  # noqa: BLE001
+                    log.debug("spec-live: on_connect callback raised: %s", e)
+
             for parsed in _iter_sse_frames(resp.iter_lines(decode_unicode=True)):
                 if self._stop.is_set():
                     return
@@ -300,6 +319,18 @@ class SSEConsumer:
                         log.debug("spec-live: dropping unparseable event: %s", e)
                         continue
                     yield event
+                elif parsed.event == "flag" and parsed.data:
+                    try:
+                        payload = json.loads(parsed.data)
+                    except (TypeError, ValueError) as e:
+                        log.debug("spec-live: dropping malformed flag frame: %s", e)
+                        continue
+                    try:
+                        flag = IncomingFlag.from_json(payload)
+                    except (KeyError, TypeError, ValueError) as e:
+                        log.debug("spec-live: dropping unparseable flag: %s", e)
+                        continue
+                    yield flag
         finally:
             with self._resp_lock:
                 # Clear the published reference whether we exited
@@ -400,23 +431,35 @@ def run_consumer_in_thread(
     consumer: SSEConsumer,
     on_event: Callable[[IncomingEvent], None],
     on_fatal: Callable[[SSEStreamError], None],
+    *,
+    on_flag: Callable[[IncomingFlag], None] | None = None,
 ) -> threading.Thread:
     """Convenience: spin up the SSE consumer on a daemon thread.
 
     The thread terminates cleanly when :meth:`SSEConsumer.stop` is
-    called or when ``on_fatal`` is invoked. ``on_event`` is called from
-    the consumer thread — callers that update terminal output must
-    serialise themselves (the ``Notifier`` does, via Rich's console
-    lock).
+    called or when ``on_fatal`` is invoked. ``on_event`` is called for
+    every prompt-turn frame; ``on_flag`` (optional) for every flag
+    frame. Both run on the consumer thread — callers that update
+    terminal output must serialise themselves (the ``Notifier`` does,
+    via Rich's console lock). When ``on_flag`` is not provided, flag
+    frames are silently dropped — convenient for callers that only
+    care about turns.
     """
 
     def _run() -> None:
         try:
-            for event in consumer.stream():
+            for item in consumer.stream():
                 try:
-                    on_event(event)
+                    if isinstance(item, IncomingFlag):
+                        if on_flag is not None:
+                            on_flag(item)
+                    else:
+                        on_event(item)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("spec-live: handler raised on event %s: %s", event.id, e)
+                    item_id = getattr(item, "id", "?")
+                    log.warning(
+                        "spec-live: handler raised on item %s: %s", item_id, e
+                    )
         except SSEStreamError as e:
             on_fatal(e)
 

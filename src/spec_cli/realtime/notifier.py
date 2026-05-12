@@ -371,6 +371,17 @@ class Notifier:
         without restarting the watcher."""
         self._critic_enabled = bool(enabled)
 
+    def _assistant_body_limit_chars(self) -> int:
+        """Assistant prose cap before ``…`` truncation in the pane.
+
+        ``--show-tool-runs`` implies the reviewer wants the full merged
+        body even in ``--compact`` mode, so we use the same generous cap
+        as non-compact output instead of the 12k compact ceiling.
+        """
+        if self._show_tool_runs:
+            return MAX_TURN_TEXT_CHARS
+        return _PREVIEW_ASSISTANT[1] if self._compact else _PREVIEW_ASSISTANT[0]
+
     def record_pairing(self, event: IncomingEvent) -> None:
         """Update the user→AI pairing tracker without rendering.
 
@@ -537,8 +548,7 @@ class Notifier:
             # the pane stays scannable on default settings.
             if preview and self._strip_code_blocks and not self._show_tool_runs:
                 preview = _strip_code_blocks(preview)
-            lim_a, lim_ac = _PREVIEW_ASSISTANT
-            preview = _truncate(preview, lim_ac if self._compact else lim_a)
+            preview = _truncate(preview, self._assistant_body_limit_chars())
             model = event.model or "assistant"
             # AI badge (cyan background). The model name carries the
             # source's accent color so "claude_code/claude-sonnet-4"
@@ -614,13 +624,18 @@ class Notifier:
                         f"{indent}{line}", markup=False, highlight=False
                     )
             elif event.role == "assistant":
-                # Empty-body assistant turn (broadcaster did not send
-                # summary or text) — call it out so reviewers know
-                # there *was* a reply, just not its content.
-                console.print(
-                    "    [sf.muted](assistant body not shared — broadcaster is "
-                    "in summary-only mode)[/]"
-                )
+                if self._show_tool_runs and event.tool_calls:
+                    console.print(
+                        "    [sf.muted](no prose on this row — structured tool "
+                        "runs below)[/]"
+                    )
+                else:
+                    console.print(
+                        "    [sf.muted](assistant body not on wire — enable "
+                        "``cloud.prompt_stream.verbose`` on the broadcaster's "
+                        "bundle and default ``spec team watch`` verbosity, or "
+                        "only a summary was posted)[/]"
+                    )
             if (
                 event.role == "assistant"
                 and self._show_tool_runs
@@ -705,8 +720,7 @@ class Notifier:
         a_preview = (assistant.text or assistant.summary or "").strip()
         if a_preview and self._strip_code_blocks and not self._show_tool_runs:
             a_preview = _strip_code_blocks(a_preview)
-        lim_a, lim_ac = _PREVIEW_ASSISTANT
-        a_preview = _truncate(a_preview, lim_ac if self._compact else lim_a)
+        a_preview = _truncate(a_preview, self._assistant_body_limit_chars())
         a_ctx = _ctx_line(assistant)
         pending_line = (u_author, u_preview) if u_preview else None
 
@@ -769,10 +783,18 @@ class Notifier:
                         f"    {line}", markup=False, highlight=False
                     )
             elif assistant.role == "assistant":
-                console.print(
-                    "    [sf.muted](assistant body not shared — broadcaster is "
-                    "in summary-only mode)[/]"
-                )
+                if self._show_tool_runs and assistant.tool_calls:
+                    console.print(
+                        "    [sf.muted](no prose on this row — structured tool "
+                        "runs below)[/]"
+                    )
+                else:
+                    console.print(
+                        "    [sf.muted](assistant body not on wire — enable "
+                        "``cloud.prompt_stream.verbose`` on the broadcaster's "
+                        "bundle and default ``spec team watch`` verbosity, or "
+                        "only a summary was posted)[/]"
+                    )
             if self._show_tool_runs and assistant.tool_calls:
                 self._render_tool_calls(assistant.tool_calls)
             self._render_critiques(assistant, a_critiques)

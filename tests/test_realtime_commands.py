@@ -292,6 +292,21 @@ def test_critic_with_bad_arg_reports_current_state():
 # ── /status ───────────────────────────────────────────────────────
 
 
+def test_status_includes_team_watch_receiver_brief():
+    notifier = MagicMock()
+    state = WatchState()
+    buf = make_buffer()
+    ctx = CommandContext(
+        notifier=notifier,
+        state=state,
+        buffer=buf,
+        team_watch_receiver_brief="receiver: SSE assistant prose on",
+    )
+    dispatch(parse_command("/status"), ctx)  # type: ignore[arg-type]
+    text = notifier.show_command_result.call_args[0][0]
+    assert "receiver: SSE assistant prose on" in text
+
+
 def test_status_with_empty_buffer_says_no_activity():
     ctx, notifier, _, _ = _ctx()
     dispatch(parse_command("/status"), ctx)  # type: ignore[arg-type]

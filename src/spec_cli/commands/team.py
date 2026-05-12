@@ -17,6 +17,7 @@ Subcommands:
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -411,12 +412,22 @@ class _TeamWatchQAState:
                 key=lambda e: len((e.summary or "").strip()),
             )
             summary = (by_sum.summary or "").strip() or None
-        tool_calls = list(by_id.tool_calls or [])
-        if not tool_calls:
-            for c in sorted(chunks, key=lambda e: e.id):
-                if c.tool_calls:
-                    tool_calls = list(c.tool_calls)
-                    break
+        merged_tools: list = []
+        seen_sig: set[tuple[str, str]] = set()
+        for c in sorted(chunks, key=lambda e: e.id):
+            for tc in c.tool_calls or []:
+                try:
+                    sig = (
+                        tc.name,
+                        json.dumps(tc.args, sort_keys=True, default=str),
+                    )
+                except TypeError:
+                    sig = (tc.name, str(tc.args))
+                if sig in seen_sig:
+                    continue
+                seen_sig.add(sig)
+                merged_tools.append(tc)
+        tool_calls = merged_tools
         return replace(
             by_id,
             text=text,
@@ -815,6 +826,12 @@ def team_watch_cmd(
                 kind="ok",
             )
 
+    recv_brief = (
+        f"receiver: SSE assistant prose "
+        f"{'on (full bodies when stored)' if verbose else 'OFF — use default verbose; bodies stripped on wire'} · "
+        f"layout {'compact' if compact else 'default'} · "
+        f"tools+fenced code {'on' if show_tool_runs else 'off'}"
+    )
     cmd_ctx = CommandContext(
         notifier=notifier,
         state=watch_state,
@@ -822,6 +839,7 @@ def team_watch_cmd(
         flag_client=flag_client,
         project_for_event=event_to_project.get,
         qa_pair_now=_qa_pair_now,
+        team_watch_receiver_brief=recv_brief,
     )
 
     def _on_connect() -> None:

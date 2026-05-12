@@ -122,6 +122,32 @@ def test_flush_pair_drops_cross_session_chunks_before_merge() -> None:
     assert "ok" in (a.text or "")
 
 
+def test_merge_unions_tool_calls_across_chunks() -> None:
+    from dataclasses import replace
+
+    from spec_cli.realtime.events import ToolCallPayload
+
+    r = ToolCallPayload(name="Read", args={"path": "a.py"}, status=None)
+    e = ToolCallPayload(name="Edit", args={"path": "b.py"}, status=None)
+    c1 = replace(_ev(id=10, role="assistant", text="a"), tool_calls=[r])
+    c2 = replace(_ev(id=11, role="assistant", text="ab"), tool_calls=[e])
+    merged = _TeamWatchQAState._merge_assistant_chunks([c1, c2])
+    names = [t.name for t in merged.tool_calls]
+    assert names == ["Read", "Edit"]
+
+
+def test_merge_tool_calls_dedupes_identical_entries() -> None:
+    from dataclasses import replace
+
+    from spec_cli.realtime.events import ToolCallPayload
+
+    r = ToolCallPayload(name="Read", args={"path": "a.py"}, status=None)
+    c1 = replace(_ev(id=10, role="assistant", text="a"), tool_calls=[r])
+    c2 = replace(_ev(id=11, role="assistant", text="ab"), tool_calls=[r])
+    merged = _TeamWatchQAState._merge_assistant_chunks([c1, c2])
+    assert len(merged.tool_calls) == 1
+
+
 def test_flush_on_assistant_closed_matches_session() -> None:
     qa = _TeamWatchQAState()
     n = MagicMock()

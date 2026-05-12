@@ -129,6 +129,9 @@ class CommandContext:
     project_for_event: Callable[[int], int | None] | None = None
     # ``spec team watch`` only: flush Q/A coalescing buffer on ``/pair``.
     qa_pair_now: Callable[[], None] | None = None
+    # ``spec team watch`` only: one-line digest of verbose / compact /
+    # ``--show-tool-runs`` for ``/status`` and debugging.
+    team_watch_receiver_brief: str | None = None
 
 
 @dataclass(frozen=True)
@@ -426,6 +429,9 @@ def _cmd_status(_cmd: ParsedCommand, ctx: CommandContext) -> None:
     buffer. No API call — what's in the pane is what we report."""
     st = ctx.state
     vis: list[str] = []
+    if ctx.team_watch_receiver_brief:
+        vis.append(ctx.team_watch_receiver_brief)
+
     if st.focus:
         vis.append(
             f"visibility: /focus @{st.focus.lstrip('@')} "

@@ -115,6 +115,67 @@ def _recording_console() -> Console:
     )
 
 
+def test_viewer_handle_skips_no_reply_tracking_for_own_user_prompt(
+    monkeypatch,
+):
+    """``spec team watch`` passes viewer_handle so ⏳ never targets self."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    sid = "sess-self"
+    pid = 42
+    own = IncomingEvent(
+        id=101,
+        project_id=pid,
+        session_id=sid,
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="My question",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    n = Notifier(critic_enabled=False, viewer_handle="jon")
+    n.show(own)
+    assert (pid, sid) not in n._open_sessions
+
+    peer = IncomingEvent(
+        id=102,
+        project_id=pid,
+        session_id="sess-peer",
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="Peer question",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=8,
+        author_handle="alice",
+        author_name="Alice",
+        author_avatar_url=None,
+    )
+    n.show(peer)
+    assert (pid, "sess-peer") in n._open_sessions
+
+
 def test_assistant_shows_pending_user_prompt_line(monkeypatch):
     import spec_cli.realtime.notifier as notifier_mod
 

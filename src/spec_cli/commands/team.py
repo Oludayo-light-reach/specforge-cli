@@ -525,6 +525,7 @@ def team_watch_cmd(
         critic_enabled=critic_enabled,
         notify=notify,
         pairing_buffer=event_buffer,
+        viewer_handle=creds.user_handle,
     )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle

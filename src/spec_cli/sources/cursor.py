@@ -368,13 +368,63 @@ def _bubble_text(bubble: dict[str, Any]) -> str:
     """Extract the prose body from a Cursor bubble.
 
     Bubbles store both a Lexical-formatted ``richText`` blob and a flat
-    ``text`` field. We use ``text`` exclusively — it's already
-    plaintext and matches what the user actually typed / saw.
+    ``text`` field. We prefer ``text`` when it is non-empty; some Cursor
+    builds only populate ``richText`` for user bubbles, and skipping those
+    dropped prompts from Spec Live entirely.
     """
     text = bubble.get("text")
-    if not isinstance(text, str):
+    if isinstance(text, str):
+        out = sanitize_for_toml_text(text)
+        if out.strip():
+            return out
+    rich = bubble.get("richText")
+    if rich is not None:
+        lexical = _lexical_plain_text(rich)
+        if lexical.strip():
+            return sanitize_for_toml_text(lexical)
+    return ""
+
+
+def _lexical_plain_text(raw: Any) -> str:
+    """Best-effort plain text from Cursor's Lexical ``richText`` field.
+
+    Accepts JSON string or already-parsed dict/list. Walks Lexical's
+    ``children`` tree and concatenates ``type: \"text\"`` node bodies.
+    """
+    if raw is None:
         return ""
-    return sanitize_for_toml_text(text)
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return ""
+        try:
+            parsed: Any = json.loads(s)
+        except json.JSONDecodeError:
+            return s
+    else:
+        parsed = raw
+
+    parts: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                t = node.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t)
+            ch = node.get("children")
+            if isinstance(ch, list):
+                for c in ch:
+                    walk(c)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("root"), dict):
+        walk(parsed["root"])
+    else:
+        walk(parsed)
+    return "\n".join(parts) if parts else ""
 
 
 def _cursor_composer_default_model(composer_data: dict[str, Any]) -> str | None:

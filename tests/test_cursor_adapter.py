@@ -136,6 +136,8 @@ def _add_composer(
         }
         if "modelInfo" in bubble:
             body["modelInfo"] = bubble["modelInfo"]
+        if "richText" in bubble:
+            body["richText"] = bubble["richText"]
         conn.execute(
             "INSERT OR REPLACE INTO cursorDiskKV VALUES (?, ?)",
             (f"bubbleId:{composer_id}:{bubble['id']}", json.dumps(body)),
@@ -203,6 +205,48 @@ def test_read_cursor_sessions_extracts_user_and_assistant_turns(tmp_path, monkey
     assert s.turns[1].text is None  # non-verbose
     assert s.turns[1].summary is not None
     assert "scanning" in s.turns[1].summary.lower()
+
+
+def test_cursor_user_turn_from_richtext_when_text_empty(tmp_path, monkeypatch):
+    """Some Cursor builds omit ``text`` on user bubbles but ship Lexical."""
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    composer_id = "22222222-2222-4222-a222-222222222222"
+    _make_workspace(tmp_path, "ws-rt", bundle, [composer_id])
+    lexical = json.dumps(
+        {
+            "root": {
+                "type": "root",
+                "children": [
+                    {
+                        "type": "paragraph",
+                        "children": [
+                            {"type": "text", "text": "Hello from richText only."},
+                        ],
+                    }
+                ],
+            }
+        }
+    )
+    _add_composer(
+        tmp_path,
+        composer_id,
+        name="Lexical user",
+        bubbles=[
+            {
+                "id": "b-u1",
+                "type": 1,
+                "text": "",
+                "richText": lexical,
+                "createdAt": "2026-03-10T12:00:00Z",
+            },
+        ],
+    )
+    sessions = list(read_cursor_sessions(bundle))
+    assert len(sessions) == 1
+    assert sessions[0].turns[0].role == "user"
+    assert "richText only" in (sessions[0].turns[0].text or "")
 
 
 def test_read_cursor_sessions_falls_back_to_composer_model_config(tmp_path, monkeypatch):

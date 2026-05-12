@@ -199,6 +199,7 @@ class Notifier:
         critic_enabled: bool = True,
         notify: bool = False,
         pairing_buffer: Any = None,
+        viewer_handle: str | None = None,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
@@ -227,6 +228,9 @@ class Notifier:
         # When the warm-up window skipped the triggering USER row, we
         # still recover the prompt for ``⤷ prompt`` by scanning back.
         self._pairing_buffer = pairing_buffer
+        # Signed-in viewer (``spec team watch`` only). Skip no-reply
+        # tracking for your own user prompts — the hint is for teammates.
+        self._viewer_handle = (viewer_handle or "").strip().lower() or None
 
     def set_critic_enabled(self, enabled: bool) -> None:
         """Toggle the auto-critic at runtime. Used by the ``/critic``
@@ -506,6 +510,12 @@ class Notifier:
             pass
 
     def _remember_open_session(self, event: IncomingEvent) -> None:
+        # Workspace stream includes your own USER rows; the no-reply hint
+        # is written for teammates ("their watcher") and is noise on self.
+        if self._viewer_handle and event.role == "user":
+            ah = (event.author_handle or "").strip().lower()
+            if ah and ah == self._viewer_handle:
+                return
         key = (event.project_id, event.session_id or f"ev:{event.id}")
         # Evict oldest if the table gets too big — bounds memory at
         # the cost of losing one pairing on a freakishly busy host.

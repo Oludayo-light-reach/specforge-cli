@@ -373,13 +373,19 @@ class _TeamWatchQAState:
     broadcaster's ``spec watch`` (tail stability), the next user
     message, ``error``, ``/pair``, process exit, or (unless
     ``--assistant-quiet-secs 0``) idle quiet after the last assistant
-    chunk — see :meth:`Notifier.show_completed_pair`.
+    chunk. Assistant rows must match the pending user's ``project_id``
+    and ``session_id`` so a workspace-wide stream cannot attach another
+    thread's reply — see :meth:`Notifier.show_completed_pair`.
     """
 
     def __init__(self) -> None:
         self.pending_user: IncomingEvent | None = None
         self.assistant_chunks: list[IncomingEvent] = []
         self.last_assistant_mono: float | None = None
+
+    @staticmethod
+    def _session_key(ev: IncomingEvent) -> tuple[int, str]:
+        return (ev.project_id, (ev.session_id or "").strip())
 
     @staticmethod
     def _merge_assistant_chunks(chunks: list[IncomingEvent]) -> IncomingEvent:
@@ -419,7 +425,15 @@ class _TeamWatchQAState:
         )
 
     def flush_pair(self, notifier: Notifier) -> bool:
-        if self.pending_user is None or not self.assistant_chunks:
+        if self.pending_user is None:
+            return False
+        key = self._session_key(self.pending_user)
+        self.assistant_chunks = [
+            c
+            for c in self.assistant_chunks
+            if c.role == "assistant" and self._session_key(c) == key
+        ]
+        if not self.assistant_chunks:
             return False
         merged = self._merge_assistant_chunks(self.assistant_chunks)
         notifier.show_completed_pair(self.pending_user, merged)
@@ -445,6 +459,8 @@ class _TeamWatchQAState:
     def buffer_assistant(self, ev: IncomingEvent) -> bool:
         if self.pending_user is None:
             return False
+        if self._session_key(ev) != self._session_key(self.pending_user):
+            return False
         self.assistant_chunks.append(ev)
         self.last_assistant_mono = time.monotonic()
         return True
@@ -465,13 +481,22 @@ class _TeamWatchQAState:
             ev.session_id,
         ):
             return False
+        key = self._session_key(self.pending_user)
+        scoped = [
+            c
+            for c in self.assistant_chunks
+            if c.role == "assistant" and self._session_key(c) == key
+        ]
+        if not scoped:
+            return False
         cid = ev.closes_event_id
         if cid is not None:
-            a_ids = [c.id for c in self.assistant_chunks]
+            a_ids = [c.id for c in scoped]
             lo, hi = min(a_ids), max(a_ids)
             if cid < lo or cid > hi:
                 return False
-        self.flush_pair(notifier)
+        if not self.flush_pair(notifier):
+            return False
         last_output_at[0] = time.monotonic()
         return True
 
@@ -679,16 +704,17 @@ def team_watch_cmd(
     transient drops; ``Ctrl+C`` once asks for a graceful exit, a
     second press forces.
 
-    **Q/A coalescing (live SSE only):** each user prompt is printed as
-    soon as it arrives. Assistant chunks merge until a flush boundary:
-    an ``assistant_closed`` row from the teammate's ``spec watch`` (when
-    their tail assistant bubble stabilizes), the next user message, an
-    ``error`` row, ``/pair``, process exit, or (unless
-    ``--assistant-quiet-secs 0``) that many idle seconds after the last
-    assistant chunk. The idle window remains a fallback when the
+    **Q/A coalescing (REST warm-up + live SSE):** each user prompt is
+    printed as soon as it arrives. Assistant chunks merge until a flush
+    boundary: an ``assistant_closed`` row from the teammate's
+    ``spec watch`` (when their tail assistant bubble stabilizes), the
+    next user message, an ``error`` row, ``/pair``, process exit, or
+    (unless ``--assistant-quiet-secs 0``) that many idle seconds after
+    the last assistant chunk. The idle window remains a fallback when the
     broadcaster runs an older CLI that does not emit ``assistant_closed``.
     The paired block always uses the **full merged** assistant body
-    received so far. REST warm-up keeps the old per-event layout.
+    received so far. The initial REST replay uses the same rules so
+    ``/pair`` matches what you see on screen.
 
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
@@ -805,9 +831,9 @@ def team_watch_cmd(
         if commands_enabled:
             notifier.show_command_result(
                 "interactive commands enabled — type /help for the list. "
-                "Use /pair when the assistant reply looks done but the paired "
-                "block has not printed yet (older broadcasters without "
-                "assistant_closed). Two-stage Ctrl+C still exits.",
+                "Use /pair if the merged Q/A block has not printed yet "
+                "(e.g. older broadcaster without a close signal). "
+                "Two-stage Ctrl+C still exits.",
                 kind="info",
             )
         last_output_at[0] = time.monotonic()
@@ -866,8 +892,10 @@ def team_watch_cmd(
 
         use_qa_coalesce = tick_clock
 
-        if use_qa_coalesce and ev.role == "assistant_closed":
-            qa.flush_on_assistant_closed(ev, notifier, last_output_at)
+        # Never render this wire sentinel; flush only on the live SSE path.
+        if ev.role == "assistant_closed":
+            if use_qa_coalesce:
+                qa.flush_on_assistant_closed(ev, notifier, last_output_at)
             return
 
         if use_qa_coalesce and ev.role == "user":
@@ -913,7 +941,7 @@ def team_watch_cmd(
         for ev in boot_events:
             if max_boot_id is None or ev.id > max_boot_id:
                 max_boot_id = ev.id
-            _deliver(ev, tick_clock=False)
+            _deliver(ev, tick_clock=True)
         if max_boot_id is not None:
             consumer.set_resume_cursor(max_boot_id)
     except ApiError:

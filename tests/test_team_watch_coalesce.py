@@ -21,12 +21,14 @@ def _ev(
     text: str | None,
     summary: str | None = None,
     closes_event_id: int | None = None,
+    project_id: int = 1,
+    session_id: str = "sess",
 ) -> IncomingEvent:
     ts = datetime.now(timezone.utc)
     return IncomingEvent(
         id=id,
-        project_id=1,
-        session_id="sess",
+        project_id=project_id,
+        session_id=session_id,
         source="cursor",
         role=role,
         branch="main",
@@ -93,6 +95,31 @@ def test_resolve_assistant_quiet_secs_zero_means_timer_off(monkeypatch) -> None:
 def test_resolve_assistant_quiet_secs_default_from_constant(monkeypatch) -> None:
     monkeypatch.delenv("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS", raising=False)
     assert _resolve_assistant_quiet_secs(None) == 120.0
+
+
+def test_buffer_assistant_requires_same_project_and_session() -> None:
+    qa = _TeamWatchQAState()
+    qa.pending_user = _ev(id=1, role="user", text="hi", session_id="aaa")
+    assert not qa.buffer_assistant(
+        _ev(id=2, role="assistant", text="wrong", session_id="bbb")
+    )
+    assert qa.assistant_chunks == []
+
+
+def test_flush_pair_drops_cross_session_chunks_before_merge() -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    qa.pending_user = _ev(id=1, role="user", text="hey", session_id="aaa")
+    qa.assistant_chunks = [
+        _ev(id=2, role="assistant", text="stray", session_id="bbb"),
+        _ev(id=3, role="assistant", text="ok", session_id="aaa"),
+    ]
+    assert qa.flush_pair(n)
+    n.show_completed_pair.assert_called_once()
+    u, a = n.show_completed_pair.call_args[0]
+    assert u.session_id == "aaa"
+    assert a.session_id == "aaa"
+    assert "ok" in (a.text or "")
 
 
 def test_flush_on_assistant_closed_matches_session() -> None:

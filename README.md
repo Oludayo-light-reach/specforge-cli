@@ -414,6 +414,26 @@ for regenerated responses, the sandbox output of `spec prompts
 simulate`). Tool calls are sanitized through a shared allowlist — names and
 args only, no file contents or command output.
 
+## Development
+
+Tests and linters expect this repo’s dependencies (including `rich` and
+`pytest`). Running `python -m pytest` with the bare system interpreter
+(Apple Command Line Tools Python, etc.) will fail at import time with
+`ModuleNotFoundError` — use a project environment first.
+
+From the `spec-cli` directory:
+
+```bash
+# Recommended (uses pyproject.toml; pulls dev extras including pytest)
+uv run pytest
+
+# Or: editable install into a venv, then pytest on PATH
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+pytest
+```
+
 ## Environment
 
 | Variable | Purpose |

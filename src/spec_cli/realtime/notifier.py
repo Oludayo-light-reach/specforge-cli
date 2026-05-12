@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
+
 from ..ui import console
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
 from .events import IncomingEvent, IncomingFlag
@@ -420,7 +422,10 @@ class Notifier:
                 # Compact mode lives on one line — context chips ride
                 # at the end so the row still parses even when piped
                 # into ``grep`` for a handle / file / session id.
-                tail = f"  {preview}" if preview else ""
+                tail = ""
+                if preview:
+                    flat = " ".join(preview.splitlines())
+                    tail = f"  {escape(flat)}"
                 if pending_prompt:
                     _, prev_txt = pending_prompt
                     tail = f"  [sf.muted]⤷ {prev_txt}[/]{tail}"
@@ -449,7 +454,12 @@ class Notifier:
                 # header.
                 indent = "    " if event.role != "user" else "  "
                 for line in preview.splitlines():
-                    console.print(f"{indent}{line}")
+                    # Literal ``[...]`` in pasted logs / code must not be
+                    # parsed as Rich markup (team watch often carries
+                    # terminal scrollback with brackets and backticks).
+                    console.print(
+                        f"{indent}{line}", markup=False, highlight=False
+                    )
             elif event.role == "assistant":
                 # Empty-body assistant turn (broadcaster did not send
                 # summary or text) — call it out so reviewers know

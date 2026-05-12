@@ -272,7 +272,14 @@ def test_cursor_user_turn_from_richtext_when_text_empty(tmp_path, monkeypatch):
 
 
 def test_read_cursor_sessions_falls_back_to_composer_model_config(tmp_path, monkeypatch):
-    """Assistant bubbles often omit modelInfo; composerData.modelConfig does not."""
+    """Assistant bubbles often omit modelInfo; composerData.modelConfig does not.
+
+    Consecutive assistant bubbles between two user prompts are now
+    coalesced into a single logical :class:`Turn` (mirrors how Cursor
+    splits one reply across many bubbles internally). The composer's
+    default model fills the per-turn ``model`` whenever no bubble
+    inside the run carries an explicit ``modelInfo``.
+    """
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -310,11 +317,21 @@ def test_read_cursor_sessions_falls_back_to_composer_model_config(tmp_path, monk
     assert len(sessions) == 1
     s = sessions[0]
     assert s.model == "claude-4.5-opus-high-thinking"
+    # Two consecutive assistant bubbles coalesce into one turn.
+    assert len(s.turns) == 2
+    assert s.turns[1].role == "assistant"
     assert s.turns[1].model == "claude-4.5-opus-high-thinking"
-    assert s.turns[2].model == "claude-4.5-opus-high-thinking"
 
 
 def test_read_cursor_sessions_bubble_model_info_overrides_model_config(tmp_path, monkeypatch):
+    """The first per-bubble ``modelInfo`` inside an assistant run wins.
+
+    Cursor sometimes stamps ``modelInfo`` on only the first bubble of
+    a reply (the model that handled the turn) and leaves later
+    bubbles blank. After coalescing, that first non-default model is
+    what reaches receivers — falling back to ``composerData.modelConfig``
+    only when no bubble inside the run carried one.
+    """
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -345,8 +362,9 @@ def test_read_cursor_sessions_bubble_model_info_overrides_model_config(tmp_path,
 
     s = list(read_cursor_sessions(bundle))[0]
     assert s.model == "from-bubble"
+    # Coalesced run carries the first non-default model seen.
+    assert len(s.turns) == 2
     assert s.turns[1].model == "from-bubble"
-    assert s.turns[2].model == "default-from-config"
 
 
 def test_read_cursor_sessions_returns_empty_when_store_missing(tmp_path, monkeypatch):
@@ -473,16 +491,18 @@ def test_read_cursor_sessions_drops_empty_user_bubbles(tmp_path, monkeypatch):
     assert sessions[0].turns[0].text == "actually a question"
 
 
-def test_assistant_bubble_with_tool_data_but_no_text_emits_placeholder(
+def test_assistant_bubble_with_tool_data_extracts_structured_tool_call(
     tmp_path, monkeypatch
 ):
-    """Cursor sometimes ships agent runs as bubbles with no prose, just
-    ``toolFormerData``. Previously these were silently dropped — making
-    `spec team watch` show the user prompt and then ghost-silence
-    until the no-reply hint fired. The fix: emit a synthetic
-    ``ran tools: …`` summary so the turn lands as a real assistant
-    frame, the watcher's pairing tracker clears, and reviewers can see
-    the agent actually replied."""
+    """A type-2 bubble whose body is just ``toolFormerData`` is one
+    of Cursor's tool-invocation bubbles. The adapter now decodes
+    Cursor's internal tool id (``edit_file`` →) into the canonical
+    spec tool name (``Edit``), routes the args through
+    ``summarize_tool_call``, and attaches the result to the assistant
+    :class:`Turn` as a structured ``tool_calls`` entry — so receivers
+    can render ``Edit auth.py`` (and the auto-critic can scan
+    destructive verbs) without having to parse Cursor blobs.
+    """
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -497,8 +517,12 @@ def test_assistant_bubble_with_tool_data_but_no_text_emits_placeholder(
                 "id": "a-tool-only",
                 "type": 2,
                 "text": "",
-                # Structured activity blob with no readable prose.
-                "toolFormerData": {"name": "Edit", "args": {"path": "auth.py"}},
+                # Cursor's internal id for the file-edit tool — adapter
+                # maps it to the canonical ``Edit``.
+                "toolFormerData": {
+                    "name": "edit_file",
+                    "rawArgs": json.dumps({"path": "auth.py"}),
+                },
             },
         ],
     )
@@ -510,9 +534,15 @@ def test_assistant_bubble_with_tool_data_but_no_text_emits_placeholder(
         "tool-only assistant bubble must not be silently dropped"
     )
     ai_turn = sessions[0].turns[1]
-    assert ai_turn.summary is not None and ai_turn.summary.startswith("ran "), (
-        "tool-only assistant turn should carry the ``ran …`` sentinel summary"
+    # No prose → no summary text on this turn; the structured tool
+    # list is what carries the signal forward. The watcher
+    # synthesises the ``ran N tools: …`` headline downstream from
+    # this list.
+    assert ai_turn.tool_calls, (
+        "tool-only assistant turn must surface the structured tool call"
     )
+    assert ai_turn.tool_calls[0].name == "Edit"
+    assert ai_turn.tool_calls[0].args.get("path") == "auth.py"
 
 
 def test_user_bubble_with_attachments_but_no_text_emits_placeholder(
@@ -598,6 +628,130 @@ def test_read_cursor_sessions_finds_sessions_under_alias(tmp_path, monkeypatch):
     # under one of the recorded roots, so the session reappears.
     sessions = list(read_cursor_sessions([new_path, old_path]))
     assert [s.id for s in sessions] == [cid]
+
+
+def test_read_cursor_sessions_coalesces_assistant_run_with_tool_calls(
+    tmp_path, monkeypatch
+):
+    """A single Cursor agent reply is stored across many bubbles — prose
+    chunks interleaved with ``toolFormerData`` bubbles (one per tool
+    invocation). The adapter coalesces this run into a single
+    assistant :class:`Turn` so ``spec team watch`` shows one event
+    per logical reply, with the prose joined and the structured
+    tool list attached.
+
+    Without this, every Cursor agent run flooded the team feed with
+    30-70 noisy "ran tools" placeholder rows and any prose tail
+    landed as its own disconnected event.
+    """
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    composer_id = "deadbeef-feed-4eed-aaaa-0123456789ab"
+    _make_workspace(tmp_path, "ws-coalesce", bundle, [composer_id])
+    _add_composer(
+        tmp_path,
+        composer_id,
+        bubbles=[
+            {"id": "u", "type": 1, "text": "refactor auth.py"},
+            {
+                "id": "intro",
+                "type": 2,
+                "text": "Reading the file first.",
+            },
+            {
+                "id": "t1",
+                "type": 2,
+                "text": "",
+                "toolFormerData": {
+                    "name": "read_file_v2",
+                    "rawArgs": json.dumps({"path": "auth.py"}),
+                },
+            },
+            {
+                "id": "t2",
+                "type": 2,
+                "text": "",
+                "toolFormerData": {
+                    "name": "edit_file",
+                    "rawArgs": json.dumps({"path": "auth.py"}),
+                },
+            },
+            {
+                "id": "outro",
+                "type": 2,
+                "text": "Done — extracted the helper.",
+            },
+        ],
+    )
+
+    sessions = list(read_cursor_sessions(bundle, verbose=True))
+    assert len(sessions) == 1
+    roles = [t.role for t in sessions[0].turns]
+    assert roles == ["user", "assistant"], (
+        "intro + tools + outro must coalesce into ONE assistant turn, not five"
+    )
+    ai = sessions[0].turns[1]
+    assert ai.text is not None
+    # Both prose halves of the run are present.
+    assert "Reading the file first" in ai.text
+    assert "Done — extracted the helper" in ai.text
+    # Ordered structured tool list — Read before Edit.
+    assert [c.name for c in ai.tool_calls] == ["Read", "Edit"]
+    # Coalesced turn populates session-level paths_touched so receivers
+    # render the "touched auth.py" chip without walking tool_calls.
+    assert "auth.py" in sessions[0].paths_touched
+
+
+def test_read_cursor_sessions_normalizes_cursor_tool_names(
+    tmp_path, monkeypatch
+):
+    """Cursor's internal tool ids (``ripgrep_raw_search``,
+    ``run_terminal_command_v2``) get mapped to the canonical spec
+    names (``Grep``, ``Bash``) so receivers can render every adapter
+    uniformly and the auto-critic's destructive-verb patterns trigger
+    regardless of which agent ran the command."""
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    composer_id = "11112222-3333-4444-aaaa-555566667777"
+    _make_workspace(tmp_path, "ws-tools-map", bundle, [composer_id])
+    _add_composer(
+        tmp_path,
+        composer_id,
+        bubbles=[
+            {"id": "u", "type": 1, "text": "find todos"},
+            {
+                "id": "search",
+                "type": 2,
+                "text": "",
+                "toolFormerData": {
+                    "name": "ripgrep_raw_search",
+                    "rawArgs": json.dumps({"pattern": "TODO", "path": "."}),
+                },
+            },
+            {
+                "id": "shell",
+                "type": 2,
+                "text": "",
+                "toolFormerData": {
+                    "name": "run_terminal_command_v2",
+                    # Cursor stashes the command under ``params`` for terminal
+                    # invocations; the adapter must reach into that.
+                    "params": json.dumps({"command": "rm -rf node_modules"}),
+                },
+            },
+        ],
+    )
+    sessions = list(read_cursor_sessions(bundle))
+    assert len(sessions) == 1
+    ai = sessions[0].turns[1]
+    names = [c.name for c in ai.tool_calls]
+    assert names == ["Grep", "Bash"]
+    # The Bash command body must reach the wire so the receiver's
+    # destructive-verb critic can flag it before the agent runs.
+    bash = ai.tool_calls[1]
+    assert "rm -rf" in (bash.args.get("command") or "")
 
 
 def test_read_cursor_sessions_skips_non_file_workspaces(tmp_path, monkeypatch):

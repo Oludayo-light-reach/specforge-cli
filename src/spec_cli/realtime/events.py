@@ -117,6 +117,40 @@ class PresencePayload:
 
 
 @dataclass
+class ToolCallPayload:
+    """One agent-emitted tool invocation as shipped on the wire.
+
+    Mirrors :class:`spec_cli.prompts.schema.ToolCall` but lives in
+    ``realtime.events`` so the wire layer doesn't have to import the
+    capture schema. ``name`` is the canonical spec tool name
+    (``Read``, ``Edit``, ``Bash``, …) — adapter-specific identifiers
+    are mapped before this dataclass is constructed so receivers can
+    render every source uniformly.
+    """
+
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+    status: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"name": self.name, "args": dict(self.args or {})}
+        if self.status is not None:
+            out["status"] = self.status
+        return out
+
+    @classmethod
+    def from_json(cls, payload: Any) -> "ToolCallPayload | None":
+        if not isinstance(payload, dict):
+            return None
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        status = payload.get("status") if isinstance(payload.get("status"), str) else None
+        return cls(name=name, args=dict(args), status=status)
+
+
+@dataclass
 class OutgoingEvent:
     """One observed turn we are about to broadcast.
 
@@ -138,6 +172,12 @@ class OutgoingEvent:
     paths_touched: list[str] = field(default_factory=list)
     presence: PresencePayload | None = None
     turn_at: datetime | None = None
+    # Structured per-tool detail. Set on assistant turns for adapters
+    # that surface tool invocations (Cursor agent runs, Claude Code,
+    # Codex). Receivers expand these inline under the assistant body
+    # when ``--show-tool-runs`` is on; the wire always carries them
+    # so the toggle can be flipped without re-fetching history.
+    tool_calls: list[ToolCallPayload] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -154,6 +194,7 @@ class OutgoingEvent:
             "paths_touched": list(self.paths_touched or []),
             "presence": self.presence.to_json() if self.presence else None,
             "turn_at": _isoformat(self.turn_at),
+            "tool_calls": [c.to_json() for c in (self.tool_calls or [])],
         }
 
 
@@ -233,12 +274,20 @@ class IncomingEvent:
     author_avatar_url: str | None
     presence: PresencePayload | None = None
     bundle_label: str | None = None
+    tool_calls: list[ToolCallPayload] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "IncomingEvent":
         author = payload.get("author") or {}
         if not isinstance(author, dict):
             author = {}
+        raw_tools = payload.get("tool_calls")
+        tool_calls: list[ToolCallPayload] = []
+        if isinstance(raw_tools, list):
+            for entry in raw_tools:
+                tc = ToolCallPayload.from_json(entry)
+                if tc is not None:
+                    tool_calls.append(tc)
         return cls(
             id=int(payload["id"]),
             project_id=int(payload["project_id"]),
@@ -262,6 +311,7 @@ class IncomingEvent:
             author_avatar_url=_str_or_none(author.get("avatar_url")),
             presence=PresencePayload.from_json(payload.get("presence")),
             bundle_label=_str_or_none(payload.get("bundle_label")),
+            tool_calls=tool_calls,
         )
 
     @property

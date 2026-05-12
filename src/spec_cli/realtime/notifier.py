@@ -20,7 +20,9 @@ whole point of having a stream open.
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,7 +33,7 @@ from rich.markup import escape
 from ..prompts.schema import MAX_TURN_TEXT_CHARS
 from ..ui import console
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
-from .events import IncomingEvent, IncomingFlag
+from .events import IncomingEvent, IncomingFlag, ToolCallPayload
 
 
 def _short_cwd(cwd: str | None) -> str | None:
@@ -92,6 +94,110 @@ def _paths_chip(paths: list[str] | None) -> str | None:
     if extra:
         body += f", +{extra} more"
     return body
+
+
+# Palette for stable session colorization. Each session id hashes to
+# one of these hues so all events from the same thread share a chip
+# color in the pane — essential when two or three teammates are
+# prompting concurrently and the events interleave. The palette stays
+# within the "muted but distinct" zone so the colored chip never
+# competes with the USER / AI badges for attention.
+_SESSION_PALETTE = (
+    "#7de3ff",  # cyan
+    "#9ee37d",  # lime
+    "#c79bff",  # purple
+    "#ffb86b",  # amber
+    "#ff8aa3",  # pink
+    "#7da3ff",  # blue
+    "#f6d57e",  # gold
+    "#7de3c2",  # mint
+)
+
+
+def _session_color(session_id: str | None) -> str:
+    """Stable color for a session chip. Hash → palette index. Same id
+    always picks the same color across runs and machines."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return "#9aa3b2"
+    digest = hashlib.sha256(session_id.strip().encode("utf-8")).digest()
+    return _SESSION_PALETTE[digest[0] % len(_SESSION_PALETTE)]
+
+
+# Markdown / pasted-log code blocks the user explicitly does *not*
+# want in the default ``spec team watch`` view. Matches fenced
+# ```lang …``` blocks (greedy across newlines), plus 4-space-indented
+# log dumps that often come back as quoted error output.
+_CODE_FENCE_RE = re.compile(
+    r"```([a-zA-Z0-9_+\-]*)\n?(.*?)```",
+    re.DOTALL,
+)
+
+
+def _strip_code_blocks(text: str) -> str:
+    """Replace fenced code blocks with a compact ``[code: lang ~N lines]``
+    placeholder so the default ``spec team watch`` view shows the
+    prose narration without pages of pasted code or tool output.
+
+    The user toggle for "show me the code edits too" is the
+    ``--show-tool-runs`` flag — distinct from prose code blocks
+    because those are explanatory examples inside the AI's reply, not
+    tool invocations against the repo. We collapse both so the
+    pane stays scannable; reviewers who want the raw body fetch the
+    event by id, or run ``spec team watch --show-tool-runs`` for the
+    structured tool list.
+    """
+    def _replace(match: re.Match[str]) -> str:
+        lang = (match.group(1) or "").strip().lower()
+        body = match.group(2) or ""
+        lines = body.count("\n") + (1 if body.strip() else 0)
+        if lang:
+            return f"[code: {lang} ~{lines} line{'s' if lines != 1 else ''}]"
+        return f"[code ~{lines} line{'s' if lines != 1 else ''}]"
+
+    return _CODE_FENCE_RE.sub(_replace, text)
+
+
+def _format_tool_call_line(call: ToolCallPayload) -> str:
+    """One-line summary of a tool invocation for the team watch pane.
+
+    Echoes the same shape the broadcaster's synthesized ``ran N
+    tools:`` summary uses (``Edit auth.py``, ``Bash "pytest -q"``,
+    ``Grep "TODO"``) so a reviewer's eye recognises both as the same
+    kind of artefact. Long arg values are clipped at 80 chars so the
+    line stays terminal-friendly.
+    """
+    name = call.name
+    args = call.args or {}
+    detail = ""
+    if name == "Bash":
+        cmd = args.get("command")
+        if isinstance(cmd, str) and cmd.strip():
+            detail = f' "{cmd.strip()[:80]}"'
+    elif name in {"Grep", "Glob"}:
+        pat = args.get("pattern")
+        if isinstance(pat, str) and pat.strip():
+            detail = f' "{pat.strip()[:60]}"'
+    elif name == "WebSearch":
+        term = args.get("search_term") or args.get("query")
+        if isinstance(term, str) and term.strip():
+            detail = f' "{term.strip()[:60]}"'
+    elif name == "WebFetch":
+        url = args.get("url")
+        if isinstance(url, str) and url.strip():
+            detail = f' {url.strip()[:80]}'
+    elif name == "Edit":
+        path = args.get("path") or args.get("file_path") or args.get("file")
+        new_head = args.get("new_head")
+        if isinstance(path, str) and path:
+            base = path.rsplit("/", 1)[-1][:60]
+            detail = f" {base}"
+            if isinstance(new_head, str) and new_head.strip():
+                detail += f" → {new_head.strip()[:40]}"
+    else:
+        path = args.get("path") or args.get("file_path") or args.get("file")
+        if isinstance(path, str) and path:
+            detail = " " + path.rsplit("/", 1)[-1][:60]
+    return f"{name}{detail}"
 
 
 # Per-kind glyph + color hint used both in the watcher and `spec team
@@ -205,10 +311,25 @@ class Notifier:
         notify: bool = False,
         pairing_buffer: Any = None,
         viewer_handle: str | None = None,
+        show_tool_runs: bool = False,
+        strip_code_blocks: bool = True,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
         self._critic_enabled = critic_enabled
+        # ``--show-tool-runs`` (off by default): when True, the
+        # notifier appends a bullet list of the assistant turn's
+        # structured ``tool_calls`` (Edit foo.py, Bash "pytest -q",
+        # Read main.py …) under the prose body. Off keeps the pane
+        # scannable — most reviewers want prose, not the full edit
+        # trail.
+        self._show_tool_runs = show_tool_runs
+        # ``strip_code_blocks`` (on by default): when True, fenced
+        # code blocks in assistant prose are replaced with a compact
+        # ``[code: lang ~N lines]`` placeholder. The user's request
+        # is "full ai output (without code) by default"; this is
+        # how we honour it. Flip off to see the raw prose verbatim.
+        self._strip_code_blocks = strip_code_blocks
         # Opt-in attention helper: ring the terminal bell + best-effort
         # OS notification (macOS only for now via ``osascript``) when
         # the critic fires at ``block`` severity, e.g. a teammate just
@@ -331,13 +452,19 @@ class Notifier:
         cwd_chip = _short_cwd(event.cwd)
         paths_chip = _paths_chip(event.paths_touched)
         session_chip = _short_session(event.session_id)
+        session_color = _session_color(event.session_id)
         ctx_parts: list[str] = []
         if cwd_chip:
             ctx_parts.append(f"[sf.muted]cwd[/] [sf.label]{cwd_chip}[/]")
         if paths_chip:
             ctx_parts.append(f"[sf.muted]touched[/] [sf.label]{paths_chip}[/]")
         if session_chip:
-            ctx_parts.append(f"[sf.muted]session[/] [sf.label]{session_chip}[/]")
+            # Per-session stable color so concurrent threads from two
+            # teammates stay visually disambiguated as their events
+            # interleave in the pane.
+            ctx_parts.append(
+                f"[sf.muted]session[/] [bold {session_color}]{session_chip}[/]"
+            )
         ctx_line = "  ".join(ctx_parts) if ctx_parts else ""
 
         critiques: list[Critique] = []
@@ -396,6 +523,13 @@ class Notifier:
             # Prefer full ``text`` over ``summary`` — both are usually set
             # for assistant turns, and the summary is only a headline.
             preview = (event.text or event.summary or "").strip()
+            # By default, fenced code blocks collapse to a compact
+            # ``[code: lang ~N lines]`` placeholder. The user pulls the
+            # raw body back via ``--show-tool-runs`` or by setting
+            # ``strip_code_blocks=False`` on the notifier; either way
+            # the pane stays scannable on default settings.
+            if preview and self._strip_code_blocks and not self._show_tool_runs:
+                preview = _strip_code_blocks(preview)
             lim_a, lim_ac = _PREVIEW_ASSISTANT
             preview = _truncate(preview, lim_ac if self._compact else lim_a)
             model = event.model or "assistant"
@@ -471,7 +605,48 @@ class Notifier:
                     "    [sf.muted](assistant body not shared — broadcaster is "
                     "in summary-only mode)[/]"
                 )
+            if (
+                event.role == "assistant"
+                and self._show_tool_runs
+                and event.tool_calls
+            ):
+                # ``--show-tool-runs`` mode: append the full ordered
+                # tool invocation list below the prose. Indented two
+                # spaces deeper than the body so the eye groups
+                # "narration" / "what the AI did" visually.
+                self._render_tool_calls(event.tool_calls)
             self._render_critiques(event, critiques)
+
+    def _render_tool_calls(self, calls: list[ToolCallPayload]) -> None:
+        """Print one line per tool invocation under the assistant body.
+
+        The header carries a count so a reviewer can see at a glance
+        whether they're about to scroll past two edits or thirty;
+        each subsequent line is the same shape the auto-critic
+        scans for destructive verbs (``Bash "rm -rf"``,
+        ``Edit auth.py``), so a reviewer's pattern-recognition
+        transfers across both surfaces.
+        """
+        if not calls:
+            return
+        n = len(calls)
+        console.print(
+            f"    [sf.muted]» {n} tool run{'s' if n != 1 else ''}:[/]"
+        )
+        # Cap the list at a generous bound — reviewers who need every
+        # call can re-run with --no-verbose / inspect the captured
+        # .prompts file. 50 covers virtually every realistic agent
+        # session without flooding the pane.
+        shown = calls[:50]
+        for call in shown:
+            line = _format_tool_call_line(call)
+            console.print(
+                f"    [sf.muted]·[/] {escape(line)}",
+                highlight=False,
+            )
+        extra = n - len(shown)
+        if extra > 0:
+            console.print(f"    [sf.muted]· …+{extra} more tools[/]")
 
     # ── critic + session-pair plumbing ────────────────────────────
 

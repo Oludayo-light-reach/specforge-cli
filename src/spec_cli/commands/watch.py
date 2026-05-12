@@ -76,6 +76,21 @@ from ..ui import dim, fatal, info, ok, warn
     help="One line per event instead of the multi-line default.",
 )
 @click.option(
+    "--show-tool-runs/--no-tool-runs",
+    "show_tool_runs",
+    default=False,
+    show_default=True,
+    help=(
+        "Expand each incoming assistant turn's structured ``tool_calls`` "
+        "list under the prose body (``Edit auth.py``, ``Bash \"pytest -q\"``, "
+        "``Read main.py``…), and keep fenced code blocks in the prose "
+        "intact instead of collapsing them to ``[code: lang ~N lines]``. "
+        "Off by default — the default pane shows full AI narration "
+        "without code so concurrent threads stay scannable. The auto-critic "
+        "still inspects every tool call regardless of this flag."
+    ),
+)
+@click.option(
     "--poll",
     "poll_interval",
     type=float,
@@ -131,6 +146,7 @@ def watch_cmd(
     mirror: bool,
     verbose_out: bool,
     compact: bool,
+    show_tool_runs: bool,
     poll_interval: float | None,
     branch_only: bool,
     project: str | None,
@@ -329,6 +345,7 @@ def watch_cmd(
             presence_enabled=broadcast_active,
             verbose_assistant=verbose_out or manifest.prompt_stream_verbose,
             compact_output=compact,
+            show_tool_runs=show_tool_runs,
             project_branch_filter=branch_filter,
         )
 

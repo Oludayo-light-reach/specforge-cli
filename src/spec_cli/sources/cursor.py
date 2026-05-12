@@ -69,10 +69,12 @@ from ..prompts.schema import (
     MAX_TURN_MODEL_CHARS,
     MAX_TURN_TEXT_CHARS,
     Session,
+    ToolCall,
     Turn,
     validate_session,
 )
 from ..prompts.text_sanitize import sanitize_for_toml_text
+from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 
 
 # ---------------------------------------------------------------------------
@@ -314,13 +316,36 @@ _BUBBLE_TYPE_ASSISTANT = 2
 # captured `.prompts` files visually consistent across sources.
 _SUMMARY_CHARS: int = 200
 
-# Synthetic summary stamped on Cursor assistant bubbles that have
-# structured activity but no extractable prose (e.g. tool runs Cursor
-# stores in opaque ``toolFormerData`` blobs). The ``ran `` prefix is
-# the watcher-side sentinel for "this is a tool-only assistant turn",
-# matching the synthesized summaries emitted by the watcher itself —
-# the receiver routes both through the same critic-or-suppress filter.
-_CURSOR_TOOL_ONLY_SUMMARY = "ran tools: Cursor agent (details not extracted)"
+
+# Cursor's internal tool names → canonical spec tool name. Cursor adds
+# version suffixes (``_v2``) and uses its own verbs (``ripgrep_raw_search``,
+# ``run_terminal_command``) where Claude Code / Codex would say ``Grep``
+# or ``Bash``. We normalize on the wire so receivers can apply uniform
+# rendering / critic logic regardless of which agent produced the call.
+_CURSOR_TOOL_NAME_MAP: dict[str, str] = {
+    "read_file": "Read",
+    "read_file_v2": "Read",
+    "read_files": "Read",
+    "ripgrep_raw_search": "Grep",
+    "grep_search": "Grep",
+    "codebase_search": "Grep",
+    "glob_file_search": "Glob",
+    "file_search": "Glob",
+    "run_terminal_cmd": "Bash",
+    "run_terminal_command": "Bash",
+    "run_terminal_command_v2": "Bash",
+    "edit_file": "Edit",
+    "search_replace": "Edit",
+    "multi_edit_file": "Edit",
+    "write_file": "Write",
+    "create_file": "Write",
+    "delete_file": "Delete",
+    "web_search": "WebSearch",
+    "web_fetch": "WebFetch",
+    "fetch_url": "WebFetch",
+    "todo_write": "TodoWrite",
+    "list_dir": "Glob",
+}
 
 # Bubble fields that indicate Cursor recorded a real user turn even
 # when ``text`` / ``richText`` are empty. Same idea as the assistant
@@ -352,37 +377,72 @@ def _bubble_has_user_activity(bubble: dict[str, Any]) -> bool:
     return False
 
 
-# Bubble fields that indicate Cursor recorded a real assistant turn
-# even when ``text`` / ``richText`` are empty. Probed in
-# :func:`_bubble_has_assistant_activity`; treated as additive so future
-# Cursor builds adding new fields don't accidentally cause silent drops.
-_CURSOR_ASSISTANT_ACTIVITY_KEYS = (
-    "toolFormerData",
-    "toolCallId",
-    "toolCalls",
-    "toolUse",
-    "capabilities",
-    "responseMetadata",
-    "modelInfo",
-    "completedToolCalls",
-    "intermediateChunks",
-)
+def _extract_cursor_tool_call(bubble: dict[str, Any]) -> ToolCall | None:
+    """Extract a single ``ToolCall`` from a Cursor assistant bubble's
+    ``toolFormerData`` blob, or ``None`` when the bubble doesn't carry one.
 
+    Cursor stores tool invocations as separate type=2 bubbles whose body
+    is a ``toolFormerData`` dict — ``name`` (Cursor's internal tool id),
+    ``rawArgs`` (JSON-encoded arguments, sometimes empty), ``params``
+    (also JSON, more complete for some tools), and ``status``.
 
-def _bubble_has_assistant_activity(bubble: dict[str, Any]) -> bool:
-    """True when an assistant bubble has structured non-text activity.
-
-    Allowlist-based for the same reason as the user-side probe: Cursor
-    stores schema versioning and revision metadata on every bubble,
-    and a denylist would flip "empty bubble" into a placeholder turn
-    on every quiet poll. We bias toward *under-emitting* placeholders
-    over the noise of fake assistant turns.
+    We map Cursor's tool name to the spec canonical name (so ``Edit``,
+    ``Bash``, ``Read``, etc. mean the same thing whether the agent was
+    Cursor, Claude Code, or Codex), pick the most populated arg source,
+    then route the args through ``summarize_tool_call`` so we get the
+    same scrubbed, bounded shape every other adapter ships. Tools that
+    fall outside the allowlist (e.g. random MCP servers) are dropped.
     """
-    for key in _CURSOR_ASSISTANT_ACTIVITY_KEYS:
-        val = bubble.get(key)
-        if val:  # non-empty dict / list / str / int truthy
-            return True
-    return False
+    tf = bubble.get("toolFormerData")
+    if not isinstance(tf, dict):
+        return None
+    raw_name = tf.get("name")
+    if not isinstance(raw_name, str) or not raw_name:
+        return None
+    canonical = _CURSOR_TOOL_NAME_MAP.get(raw_name)
+    if canonical is None or canonical not in ALLOWED_TOOL_NAMES:
+        return None
+
+    # Cursor's ``params`` is often more complete than ``rawArgs``
+    # (e.g. terminal commands populate ``params`` but leave
+    # ``rawArgs`` as an empty string). Try both.
+    args: dict[str, Any] = {}
+    for source_key in ("rawArgs", "params"):
+        raw = tf.get(source_key)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                args = parsed
+                # Bash carries the real command under ``params.command`` even
+                # when ``rawArgs.command`` is set, so the deeper key wins.
+                if args.get("command"):
+                    break
+        elif isinstance(raw, dict):
+            args = raw
+            break
+
+    # Cursor wraps the command for Bash inside ``params.command`` and
+    # nests file edits / writes in different shapes. Normalize the
+    # handful of forms ``summarize_tool_call`` doesn't already handle.
+    if canonical == "Bash" and not args.get("command"):
+        params_str = tf.get("params")
+        if isinstance(params_str, str) and params_str.strip():
+            try:
+                parsed = json.loads(params_str)
+                if isinstance(parsed, dict) and parsed.get("command"):
+                    args = {**args, "command": parsed["command"]}
+            except json.JSONDecodeError:
+                pass
+
+    summarized = summarize_tool_call(canonical, args)
+    if summarized is None:
+        return None
+
+    status = tf.get("status") if isinstance(tf.get("status"), str) else None
+    return ToolCall(name=canonical, args=summarized, status=status)
 
 
 def _first_sentence(text: str) -> str:
@@ -548,6 +608,7 @@ class _SessionBuilder:
     started_at: datetime | None = None
     ended_at: datetime | None = None
     turns: list[Turn] = field(default_factory=list)
+    paths_touched: list[str] = field(default_factory=list)
 
     def to_session(self, *, verbose: bool, name: str | None) -> Session | None:
         if not self.turns:
@@ -569,6 +630,7 @@ class _SessionBuilder:
             model=self.model,
             title=name or None,
             verbose=marker,
+            paths_touched=list(self.paths_touched),
         )
 
 
@@ -580,13 +642,32 @@ def _build_session(
     global_db: Path,
     verbose: bool,
 ) -> Session | None:
-    """Stitch one Cursor composer into a Session.
+    """Stitch one Cursor composer into a Session, coalescing the many
+    bubbles Cursor stores per assistant reply into a single logical
+    :class:`Turn`.
 
-    Reads the composer's bubble-id list out of ``fullConversationHeadersOnly``
-    and pulls each bubble body from the global DB in order. Bubbles
-    that produce no usable turn (empty user text, empty assistant
-    summary with no tool calls) are dropped; if every bubble drops
-    out, the composer yields no Session.
+    Cursor splits one model reply across many type-2 bubbles: prose
+    chunks, thinking-only bubbles (no text), and one ``toolFormerData``
+    bubble per tool invocation. Treating each bubble as its own turn —
+    which earlier versions of this adapter did — exploded a single
+    agent run into 30-70 noisy events in ``spec team watch`` and lost
+    the prose tail entirely whenever it lived in a different bubble
+    from the intro.
+
+    The new shape:
+
+    * ``type == 1``  → one user :class:`Turn` (prose body).
+    * Run of consecutive ``type == 2`` bubbles between two user bubbles
+      → ONE assistant :class:`Turn` whose ``text`` is the joined prose
+      and ``tool_calls`` is the ordered list of normalized tool
+      invocations seen in that run.
+
+    Tool calls are extracted from ``toolFormerData`` via the spec
+    tool allowlist (``Read``, ``Edit``, ``Bash``, etc.). Cursor's
+    internal tool names (``ripgrep_raw_search``, ``run_terminal_command_v2``)
+    are mapped to the canonical names so receivers can apply uniform
+    rendering / critic logic regardless of which agent produced the
+    call.
     """
     headers = composer_data.get("fullConversationHeadersOnly")
     if not isinstance(headers, list):
@@ -603,6 +684,74 @@ def _build_session(
     builder.ended_at = _ms_epoch_to_utc(composer_data.get("lastUpdatedAt"))
     default_model = _cursor_composer_default_model(composer_data)
 
+    # Accumulator for the current run of consecutive assistant bubbles.
+    # Flushed into one :class:`Turn` on the next user bubble or end of
+    # session. ``texts`` holds prose-bubble bodies (later joined with
+    # blank lines so the rendered prose reads as paragraphs);
+    # ``tool_calls`` holds extracted ``ToolCall``s in bubble order so a
+    # reviewer can replay what the agent actually did.
+    pending_texts: list[str] = []
+    pending_tool_calls: list[ToolCall] = []
+    pending_paths: list[str] = []
+    pending_first_at: datetime | None = None
+    pending_last_at: datetime | None = None
+    pending_model: str | None = None
+    pending_has_activity: bool = False
+
+    def _flush_assistant() -> None:
+        nonlocal pending_texts, pending_tool_calls, pending_paths
+        nonlocal pending_first_at, pending_last_at
+        nonlocal pending_model, pending_has_activity
+        if not pending_has_activity:
+            return
+        joined = "\n\n".join(t.strip() for t in pending_texts if t.strip())
+        joined = joined.strip()
+        summary: str | None = None
+        if joined:
+            summary = _first_sentence(joined)
+        if not summary and not joined and not pending_tool_calls:
+            # Truly empty run (thinking bubbles only, no tools, no prose) —
+            # drop. Without a summary we can't honour the schema's
+            # "assistant must carry text or summary" contract.
+            pending_texts = []
+            pending_tool_calls = []
+            pending_paths = []
+            pending_first_at = None
+            pending_last_at = None
+            pending_model = None
+            pending_has_activity = False
+            return
+        preview_text = _preview(joined) if (verbose and joined) else None
+        # When prose is unavailable, leave summary empty here — the
+        # broadcaster synthesizes a ``ran N tools: …`` line from
+        # ``tool_calls`` later in the pipeline, which gives reviewers a
+        # consistent shape across every source adapter.
+        builder.turns.append(
+            Turn(
+                role="assistant",
+                summary=summary or None,
+                text=preview_text,
+                at=pending_last_at or pending_first_at,
+                model=pending_model,
+                tool_calls=list(pending_tool_calls),
+            )
+        )
+        if builder.model is None and pending_model:
+            builder.model = pending_model
+        # Track files the run touched so receivers and ``spec status``
+        # can show "touched X, Y" chips without needing to walk
+        # tool_calls.
+        for p in pending_paths:
+            if p and p not in builder.paths_touched:
+                builder.paths_touched.append(p)
+        pending_texts = []
+        pending_tool_calls = []
+        pending_paths = []
+        pending_first_at = None
+        pending_last_at = None
+        pending_model = None
+        pending_has_activity = False
+
     for header in headers:
         if not isinstance(header, dict):
             continue
@@ -614,69 +763,67 @@ def _build_session(
             continue
         btype = bubble.get("type") if isinstance(bubble.get("type"), int) else None
 
-        # Cursor stamps a per-bubble timestamp under createdAt; fall back
-        # to the header type's ms if absent. Either way we always pick
-        # something so .at is never None for valid bubbles.
         at = _parse_bubble_timestamp(bubble.get("createdAt"))
 
         if btype == _BUBBLE_TYPE_USER:
+            # A user turn always closes any pending assistant run that
+            # belonged to the *previous* user prompt.
+            _flush_assistant()
             text = _bubble_text(bubble)
             if not text.strip():
-                # Pasted content with control characters or Cursor builds
-                # that store the prompt in an unfamiliar field would
-                # otherwise vanish silently. We probe for *any* signal
-                # that a real user turn happened (attachments,
-                # imageData, commands, mention metadata) and emit a
-                # placeholder so the reviewer sees the row.
                 if _bubble_has_user_activity(bubble):
                     text = "(prompt body not extractable — see Cursor)"
                 else:
                     continue
             builder.turns.append(Turn(role="user", text=text, at=at))
-        elif btype == _BUBBLE_TYPE_ASSISTANT:
-            text = _bubble_text(bubble)
-            summary = _first_sentence(text)
-            bubble_model: str | None = None
-            model_info = bubble.get("modelInfo")
-            if isinstance(model_info, dict):
-                m = model_info.get("modelName") or model_info.get("model")
-                if isinstance(m, str) and m.strip():
-                    bubble_model = m.strip()[:MAX_TURN_MODEL_CHARS]
-            if bubble_model is None and default_model:
-                bubble_model = default_model
-            # Previously: assistant bubbles with no extractable text were
-            # silently dropped — which made Cursor agent runs (Edit / Write
-            # / Bash chains with no narration) invisible in ``spec team
-            # watch``. The team saw the user prompt land and then nothing,
-            # and the no-reply hint fired 90 s later as if the AI had
-            # ghosted.
-            #
-            # Fix: when a bubble has zero prose but Cursor *did* record
-            # structured assistant activity (tool calls, attached
-            # capabilities, response metadata, or just a non-cancelled
-            # bubble with a timestamp), emit a synthetic summary so the
-            # turn is broadcast as a real assistant frame. The exact
-            # tool-call extraction is still deferred — we only need
-            # enough signal here to (a) clear the reviewer's no-reply
-            # tracker and (b) tell them an agent run happened.
-            if not summary and not (verbose and text):
-                if _bubble_has_assistant_activity(bubble):
-                    summary = _CURSOR_TOOL_ONLY_SUMMARY
-                else:
-                    continue
-            preview_text = _preview(text) if (verbose and text) else None
-            builder.turns.append(
-                Turn(
-                    role="assistant",
-                    summary=summary or None,
-                    text=preview_text,
-                    at=at,
-                    model=bubble_model,
-                )
-            )
-            if builder.model is None and bubble_model:
-                builder.model = bubble_model
-        # Other bubble types (system / status) are dropped wholesale.
+            continue
+
+        if btype != _BUBBLE_TYPE_ASSISTANT:
+            # System / status bubbles — drop wholesale.
+            continue
+
+        # ── consecutive assistant bubble → accumulate into pending run ──
+        bubble_model: str | None = None
+        model_info = bubble.get("modelInfo")
+        if isinstance(model_info, dict):
+            m = model_info.get("modelName") or model_info.get("model")
+            if isinstance(m, str) and m.strip():
+                bubble_model = m.strip()[:MAX_TURN_MODEL_CHARS]
+        if bubble_model is None and default_model:
+            bubble_model = default_model
+        if pending_model is None and bubble_model is not None:
+            pending_model = bubble_model
+
+        if pending_first_at is None:
+            pending_first_at = at
+        if at is not None:
+            pending_last_at = at
+
+        # Pull tool call (if any) before checking prose so a tool-only
+        # bubble still counts as activity.
+        call = _extract_cursor_tool_call(bubble)
+        if call is not None:
+            pending_tool_calls.append(call)
+            pending_has_activity = True
+            p = call.args.get("path") if isinstance(call.args, dict) else None
+            if isinstance(p, str) and p:
+                # Strip workspace prefix so the chip stays readable —
+                # ``billing.py`` is more useful than the absolute path.
+                short = p
+                try:
+                    rel = Path(p).resolve().relative_to(workspace_folder)
+                    short = str(rel)
+                except (ValueError, OSError):
+                    short = Path(p).name
+                pending_paths.append(short)
+
+        text = _bubble_text(bubble)
+        if text.strip():
+            pending_texts.append(text)
+            pending_has_activity = True
+
+    # Close the trailing assistant run, if any.
+    _flush_assistant()
 
     session = builder.to_session(verbose=verbose, name=name)
     if session is None:

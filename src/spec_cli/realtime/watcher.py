@@ -46,7 +46,7 @@ from ..sources import (
 )
 from ..stage import historical_bundle_paths, record_bundle_path
 from ..ui import dim
-from .events import OutgoingEvent
+from .events import OutgoingEvent, ToolCallPayload
 from .mirror import PeerMirror
 from .notifier import Notifier
 from .presence import (
@@ -141,6 +141,12 @@ class WatcherOptions:
     # via ``cloud.prompt_stream.verbose: false`` in ``spec.yaml``.
     verbose_assistant: bool = True
     compact_output: bool = False
+    # Mirror of the ``spec team watch --show-tool-runs`` toggle for
+    # the regular foreground watcher. When True, the notifier expands
+    # each incoming assistant turn's structured ``tool_calls`` list
+    # under the prose body AND leaves fenced code blocks intact. Off
+    # by default so the pane shows prose narration only.
+    show_tool_runs: bool = False
     project_branch_filter: str | None = None
     user_agent: str = field(
         default_factory=lambda: "spec-cli/live"
@@ -170,7 +176,15 @@ def run_watcher(
     cursor = LiveCursor.load(bundle_root, project_id=opts.project_id)
     cursor.project_id = opts.project_id
 
-    notifier = Notifier(compact=opts.compact_output)
+    notifier = Notifier(
+        compact=opts.compact_output,
+        show_tool_runs=opts.show_tool_runs,
+        # When tool-runs view is on, leave fenced code blocks in
+        # prose intact too — a reviewer asking for tool detail wants
+        # the code itself. When off, strip code blocks so the default
+        # pane shows prose narration without dumps of pasted code.
+        strip_code_blocks=not opts.show_tool_runs,
+    )
     notifier.announce_connected(opts.project_label)
     if not opts.broadcast:
         notifier.announce_broadcast_disabled()
@@ -727,6 +741,24 @@ def _build_outgoing(
         if not summary and not text_out:
             return None
 
+    tool_calls_out: list[ToolCallPayload] = []
+    if role == "assistant":
+        for call in turn.tool_calls or []:
+            name = getattr(call, "name", None)
+            if not isinstance(name, str) or not name:
+                continue
+            args = getattr(call, "args", None) or {}
+            if not isinstance(args, dict):
+                args = {}
+            status = getattr(call, "status", None)
+            tool_calls_out.append(
+                ToolCallPayload(
+                    name=name,
+                    args=dict(args),
+                    status=status if isinstance(status, str) else None,
+                )
+            )
+
     return OutgoingEvent(
         session_id=session.id,
         source=session.source if session.source in (
@@ -742,6 +774,7 @@ def _build_outgoing(
         cwd=session.cwd,
         paths_touched=list(session.paths_touched or []),
         turn_at=turn.at or _now_utc(),
+        tool_calls=tool_calls_out,
     )
 
 

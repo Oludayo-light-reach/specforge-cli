@@ -436,10 +436,14 @@ def _stdin_reader(ctx: "CommandContext", stop_event: threading.Event) -> None:
     default=False,
     show_default=True,
     help=(
-        "Show synthetic assistant turns whose only content is "
-        "``ran N tools: …``. Off by default because tool-only turns "
-        "are noisy; the auto-critic still inspects them and surfaces "
-        "any that match a destructive / test-bypass rule."
+        "Expand each assistant turn's structured ``tool_calls`` list "
+        "under the prose body (``Edit auth.py``, ``Bash \"pytest -q\"``, "
+        "``Read main.py``…), and keep fenced code blocks in the prose "
+        "intact instead of collapsing them to ``[code: lang ~N lines]``. "
+        "Off by default — the default pane shows full AI narration "
+        "without code or tool spam so two teammates' threads stay "
+        "scannable. The auto-critic still inspects every tool call "
+        "even when this flag is off."
     ),
 )
 @click.option(
@@ -526,6 +530,13 @@ def team_watch_cmd(
         notify=notify,
         pairing_buffer=event_buffer,
         viewer_handle=creds.user_handle,
+        show_tool_runs=show_tool_runs,
+        # Default behavior: strip code blocks from assistant prose so
+        # ``spec team watch`` reads as "full AI output without code".
+        # ``--show-tool-runs`` enables the structured tool list AND
+        # keeps the raw code blocks (reviewers asking for the latter
+        # presumably want the former too).
+        strip_code_blocks=not show_tool_runs,
     )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle
@@ -596,9 +607,22 @@ def team_watch_cmd(
         if not watch_state.is_visible(ev):
             return
         notifier.set_critic_enabled(watch_state.critic_enabled)
+        # Tool-only assistant frames are turns the broadcaster could
+        # only synthesize a ``ran N tools: …`` summary for (no prose
+        # captured upstream). The default ``team watch`` view skips
+        # them — most modern adapters now ship the full prose with
+        # ``tool_calls`` as structured sidecar, so a tool-only frame
+        # usually means an older client or a session whose prose is
+        # still streaming. The auto-critic still scans them; if it
+        # fires the row surfaces anyway.
+        is_prose_assistant = (
+            ev.role == "assistant"
+            and ((ev.text or "").strip() or not is_tool_only_summary(ev.summary))
+        )
         if (
             ev.role == "assistant"
             and not show_tool_runs
+            and not is_prose_assistant
             and is_tool_only_summary(ev.summary)
         ):
             critiques = (

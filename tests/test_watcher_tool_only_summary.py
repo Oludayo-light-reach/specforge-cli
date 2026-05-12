@@ -250,3 +250,54 @@ def test_assistant_verbose_mode_still_passes_through_text():
     assert out is not None
     assert out.text is not None
     assert "Here is the plan" in out.text
+
+
+# ── tool_calls wire propagation ───────────────────────────────────
+
+
+def test_build_outgoing_propagates_tool_calls_to_wire():
+    """Structured ``tool_calls`` on a :class:`Turn` must reach the
+    :class:`OutgoingEvent` so receivers running ``spec team watch
+    --show-tool-runs`` can render each call as its own line. Without
+    this, the only thing crossing the wire would be the synthesised
+    ``ran N tools:`` summary headline — which is lossy."""
+    session = _session("cursor")
+    turn = Turn(
+        role="assistant",
+        text="Reading then patching.",
+        summary="Reading then patching.",
+        at=datetime.now(timezone.utc),
+        tool_calls=[
+            ToolCall(name="Read", args={"path": "auth.py"}),
+            ToolCall(name="Edit", args={"path": "auth.py"}),
+            ToolCall(name="Bash", args={"command": "pytest -q"}),
+        ],
+    )
+    out = _build_outgoing(
+        session, turn, branch="main", git=_git_ctx(), opts=_opts(verbose_assistant=True)
+    )
+    assert out is not None
+    assert [c.name for c in out.tool_calls] == ["Read", "Edit", "Bash"]
+    # Args must be carried through verbatim (sanitisation already
+    # happened in the adapter); the receiver needs them to render
+    # ``Bash "pytest -q"`` and friends.
+    assert out.tool_calls[2].args.get("command") == "pytest -q"
+
+
+def test_build_outgoing_emits_empty_tool_calls_for_user_turns():
+    """``tool_calls`` is meaningful only on assistant turns. User /
+    error frames must ship an empty list so the server-side
+    validator doesn't reject the row for carrying a tool list on the
+    wrong role."""
+    session = _session("cursor")
+    turn = Turn(
+        role="user",
+        text="please refactor auth.py",
+        at=datetime.now(timezone.utc),
+    )
+    out = _build_outgoing(
+        session, turn, branch="main", git=_git_ctx(), opts=_opts()
+    )
+    assert out is not None
+    assert out.role == "user"
+    assert out.tool_calls == []

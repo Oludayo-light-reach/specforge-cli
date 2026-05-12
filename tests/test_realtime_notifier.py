@@ -20,12 +20,15 @@ from rich.console import Console
 from rich.theme import Theme
 
 from spec_cli.realtime.critic import SEV_HIGH, SEV_WARN, Critique
-from spec_cli.realtime.events import IncomingEvent
+from spec_cli.realtime.events import IncomingEvent, ToolCallPayload
 from spec_cli.realtime.notifier import (
     Notifier,
+    _format_tool_call_line,
     _paths_chip,
+    _session_color,
     _short_cwd,
     _short_session,
+    _strip_code_blocks,
 )
 
 
@@ -73,6 +76,77 @@ def test_short_session_handles_short_or_missing_input():
     assert _short_session("abc") == "abc"
     assert _short_session(None) is None
     assert _short_session("") is None
+
+
+# ── _session_color ────────────────────────────────────────────────
+
+
+def test_session_color_is_stable_for_same_id():
+    """Two events from the same Cursor / Codex session must paint
+    the chip the same color so a reviewer can follow one thread
+    visually as two teammates' prompts interleave."""
+    a = _session_color("aaaa-1111")
+    b = _session_color("aaaa-1111")
+    assert a == b
+
+
+def test_session_color_falls_back_when_id_is_blank():
+    """No session id → neutral muted color so we don't leak a
+    misleading 'this row belongs to a thread' signal."""
+    assert _session_color(None) == "#9aa3b2"
+    assert _session_color("") == "#9aa3b2"
+    assert _session_color("   ") == "#9aa3b2"
+
+
+# ── _strip_code_blocks ────────────────────────────────────────────
+
+
+def test_strip_code_blocks_collapses_fenced_block_with_lang():
+    """``spec team watch`` default view replaces fenced code with a
+    compact placeholder so the prose stays scannable."""
+    body = (
+        "Here is what I changed:\n\n"
+        "```python\n"
+        "def foo():\n"
+        "    return 1 + 2\n"
+        "```\n\n"
+        "That should do it."
+    )
+    out = _strip_code_blocks(body)
+    assert "def foo" not in out
+    assert "Here is what I changed" in out
+    assert "That should do it" in out
+    assert "[code: python" in out
+
+
+def test_strip_code_blocks_keeps_prose_intact_with_no_code():
+    """Pure-prose assistant replies must be unchanged — we don't want
+    the stripper to mangle bullet lists or backtick-wrapped
+    identifiers."""
+    body = "Use the `auth_helper` function — it's idempotent."
+    assert _strip_code_blocks(body) == body
+
+
+# ── _format_tool_call_line ────────────────────────────────────────
+
+
+def test_format_tool_call_line_emits_canonical_one_liners():
+    """One-line summaries for each tool kind — same shape the
+    auto-critic scans, so a destructive Bash or pasted secret in
+    Grep both surface to the reviewer's eye."""
+    assert (
+        _format_tool_call_line(ToolCallPayload(name="Bash", args={"command": "rm -rf foo"}))
+        == 'Bash "rm -rf foo"'
+    )
+    assert _format_tool_call_line(
+        ToolCallPayload(name="Edit", args={"path": "src/auth.py"})
+    ).endswith("auth.py")
+    assert _format_tool_call_line(
+        ToolCallPayload(name="Read", args={"path": "main.py"})
+    ).endswith("main.py")
+    assert _format_tool_call_line(
+        ToolCallPayload(name="Grep", args={"pattern": "TODO"})
+    ) == 'Grep "TODO"'
 
 
 # ── _paths_chip ────────────────────────────────────────────────────
@@ -174,6 +248,143 @@ def test_viewer_handle_skips_no_reply_tracking_for_own_user_prompt(
     )
     n.show(peer)
     assert (pid, "sess-peer") in n._open_sessions
+
+
+def test_default_team_watch_strips_code_blocks_from_assistant_body(monkeypatch):
+    """``spec team watch`` default render must show the AI's
+    narration with embedded code blocks collapsed to a compact
+    ``[code: lang ~N lines]`` placeholder. The user toggle for raw
+    code is ``--show-tool-runs``; without it, fenced code in the
+    prose body would push every reply off-screen on a busy pane."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    ev = IncomingEvent(
+        id=200,
+        project_id=1,
+        session_id="sess-strip",
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Here is the patch.",
+        text=(
+            "Here is the patch you asked for:\n\n"
+            "```python\n"
+            "def add(a, b):\n"
+            "    return a + b\n"
+            "```\n\n"
+            "Let me know if anything else needs tweaking."
+        ),
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    n = Notifier(critic_enabled=False)
+    n.show(ev)
+    out = cap.export_text()
+    assert "Here is the patch you asked for" in out
+    assert "Let me know if anything else" in out
+    # Raw code body must not survive the stripper.
+    assert "def add" not in out
+    assert "[code: python" in out
+
+
+def test_show_tool_runs_renders_each_tool_call_under_body(monkeypatch):
+    """``spec team watch --show-tool-runs`` expands the assistant
+    turn's ``tool_calls`` list as one indented line per call so a
+    reviewer can see every file the agent touched and every command
+    it ran without leaving the pane. The list is what the user is
+    after when they pass the flag; code blocks in prose stay intact
+    in that mode (a reviewer asking for tool detail wants the code
+    too)."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    ev = IncomingEvent(
+        id=201,
+        project_id=1,
+        session_id="sess-tools",
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Touched a few files.",
+        text="Touched a few files.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+        tool_calls=[
+            ToolCallPayload(name="Read", args={"path": "auth.py"}),
+            ToolCallPayload(name="Edit", args={"path": "auth.py"}),
+            ToolCallPayload(name="Bash", args={"command": "pytest -q"}),
+        ],
+    )
+    n = Notifier(critic_enabled=False, show_tool_runs=True)
+    n.show(ev)
+    out = cap.export_text()
+    # The header carries the count so reviewers know what they're
+    # scrolling past.
+    assert "3 tool runs" in out
+    assert "Read auth.py" in out
+    assert "Edit auth.py" in out
+    assert 'Bash "pytest -q"' in out
+
+
+def test_default_team_watch_does_not_render_tool_calls(monkeypatch):
+    """Without ``--show-tool-runs``, the structured tool list must not
+    leak into the pane — the default view is prose only."""
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    ev = IncomingEvent(
+        id=202,
+        project_id=1,
+        session_id="sess-default",
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="Looked something up.",
+        text="Looked something up.",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+        tool_calls=[ToolCallPayload(name="Bash", args={"command": "rm -rf cache"})],
+    )
+    n = Notifier(critic_enabled=False, show_tool_runs=False)
+    n.show(ev)
+    out = cap.export_text()
+    assert "Looked something up" in out
+    assert "tool run" not in out
+    assert "Bash" not in out
 
 
 def test_assistant_shows_pending_user_prompt_line(monkeypatch):

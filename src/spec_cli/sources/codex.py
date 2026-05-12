@@ -307,6 +307,61 @@ def _session_id_from_rollout_path(path: Path) -> str:
     return f"codex-{digest}"
 
 
+_CODEX_TOOL_NAME_MAP: dict[str, str] = {
+    # Codex Desktop / OpenAI Responses API function names → canonical
+    # spec tool names. Same idea as ``_CURSOR_TOOL_NAME_MAP`` —
+    # normalize on the wire so reviewers see ``Edit auth.py`` whether
+    # the agent was Cursor, Codex, or Claude Code.
+    "read_file": "Read",
+    "shell": "Bash",
+    "container.exec": "Bash",
+    "local_shell": "Bash",
+    "apply_patch": "Edit",
+    "write_file": "Write",
+    "create_file": "Write",
+    "edit_file": "Edit",
+    "grep": "Grep",
+    "search": "Grep",
+    "glob": "Glob",
+    "list_dir": "Glob",
+    "web_search": "WebSearch",
+    "fetch": "WebFetch",
+}
+
+
+def _codex_function_call_to_tool(payload: dict) -> ToolCall | None:
+    """Decode a Codex rollout ``response_item.type == "function_call"``
+    (OpenAI Responses API shape) into a canonical :class:`ToolCall`.
+
+    Codex emits each tool invocation as its own JSONL row, separate
+    from the surrounding ``message`` rows. We coalesce these onto the
+    next assistant turn via :func:`_build_codex_rollout_session` so a
+    reviewer sees a single "the AI replied" line carrying the prose
+    body and the ordered tool list.
+    """
+    raw_name = payload.get("name")
+    if not isinstance(raw_name, str) or not raw_name:
+        return None
+    canonical = _CODEX_TOOL_NAME_MAP.get(raw_name)
+    if canonical is None or canonical not in ALLOWED_TOOL_NAMES:
+        return None
+    args_raw = payload.get("arguments") or payload.get("input") or {}
+    args: dict = {}
+    if isinstance(args_raw, str) and args_raw.strip():
+        try:
+            parsed = json.loads(args_raw)
+            if isinstance(parsed, dict):
+                args = parsed
+        except json.JSONDecodeError:
+            pass
+    elif isinstance(args_raw, dict):
+        args = args_raw
+    summarized = summarize_tool_call(canonical, args)
+    if summarized is None:
+        return None
+    return ToolCall(name=canonical, args=summarized)
+
+
 def _build_codex_rollout_session(
     path: Path,
     *,
@@ -319,6 +374,13 @@ def _build_codex_rollout_session(
     builder.cwd = cwd
     builder.title = title
     builder.model = model
+
+    # Tool calls Codex emitted in JSONL rows *between* the previous
+    # assistant message and the next. Attached to the upcoming
+    # assistant turn so a reviewer sees one event per logical reply
+    # carrying the prose body + the ordered tool list — mirrors what
+    # the Cursor adapter does with type-2 bubbles.
+    pending_tool_calls: list[ToolCall] = []
 
     for row in _iter_jsonl(path):
         ts = _parse_timestamp(row.get("timestamp"))
@@ -353,21 +415,54 @@ def _build_codex_rollout_session(
 
         if rtype != "response_item" or not isinstance(payload, dict):
             continue
-        if payload.get("type") != "message":
+        ptype = payload.get("type")
+        # Function call rows are siblings of message rows in the
+        # Responses API rollout. Accumulate them onto the next
+        # assistant message so the wire carries "prose + structured
+        # tool list" in one event.
+        if ptype in ("function_call", "local_shell_call"):
+            call = _codex_function_call_to_tool(payload)
+            if call is not None:
+                pending_tool_calls.append(call)
+                p = call.args.get("path")
+                if isinstance(p, str) and p and p not in builder.paths_touched:
+                    builder.paths_touched.append(p)
+            continue
+        if ptype != "message":
             continue
         role = payload.get("role")
         if role == "user":
             text = _content_text_from_response_item(payload.get("content"))
             if text.strip():
+                # A new user prompt closes the pending tool list for
+                # the previous assistant turn. If we got here without
+                # ever seeing a closing assistant message, attach the
+                # tools to a synthetic assistant turn — better than
+                # silently dropping the agent's actions.
+                if pending_tool_calls:
+                    builder.turns.append(
+                        Turn(
+                            role="assistant",
+                            summary=None,
+                            text=None,
+                            at=ts,
+                            model=builder.model,
+                            tool_calls=list(pending_tool_calls),
+                        )
+                    )
+                    pending_tool_calls = []
                 builder.turns.append(Turn(role="user", text=text, at=ts))
             continue
         if role != "assistant":
             continue
         text = _content_text_from_response_item(payload.get("content"))
-        if not text.strip():
+        # A truly empty assistant message with no pending tools is
+        # almost always a streaming artefact — drop it. Otherwise we
+        # always emit a turn so the structured tool list lands.
+        if not text.strip() and not pending_tool_calls:
             continue
-        summary = _first_sentence(text)
-        preview_text = _preview(text) if verbose else None
+        summary = _first_sentence(text) if text.strip() else None
+        preview_text = _preview(text) if (verbose and text.strip()) else None
         builder.turns.append(
             Turn(
                 role="assistant",
@@ -375,6 +470,22 @@ def _build_codex_rollout_session(
                 text=preview_text,
                 at=ts,
                 model=builder.model,
+                tool_calls=list(pending_tool_calls),
+            )
+        )
+        pending_tool_calls = []
+
+    # Trailing function calls with no closing assistant message — emit
+    # them so the reviewer still sees what the agent did.
+    if pending_tool_calls:
+        builder.turns.append(
+            Turn(
+                role="assistant",
+                summary=None,
+                text=None,
+                at=None,
+                model=builder.model,
+                tool_calls=list(pending_tool_calls),
             )
         )
 

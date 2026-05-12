@@ -596,6 +596,16 @@ def _build_outgoing(
             text_out = _truncate(redact_text(turn.text.strip()), MAX_TURN_TEXT_CHARS)
         else:
             text_out = None
+        # Tool-only assistant turns (no prose, just tool_use entries
+        # like Edit / Write / Bash / Read) used to be dropped entirely
+        # — which made the team feed look like prompts vanishing into
+        # silence whenever an agent was actually busy editing. We now
+        # synthesize a short, deterministic summary listing the tools
+        # the AI invoked so receivers always see *something* land for
+        # an assistant turn. The exact tool names are far more useful
+        # to reviewers ("Edit auth.py") than "(no prose)".
+        if not summary and turn.tool_calls:
+            summary = _synthesize_tool_summary(turn.tool_calls)
         if not summary and not text_out:
             return None
 
@@ -621,6 +631,48 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "\n\n[…truncated…]"
+
+
+def _synthesize_tool_summary(calls: list) -> str | None:
+    """Build a one-line summary of which tools an assistant turn invoked.
+
+    Used when the assistant emitted no prose (a very common pattern
+    in modern agent loops — Claude Code or Codex will sometimes run a
+    long chain of Edit / Read / Bash with no narration). Without this
+    fallback the watcher would drop the turn and the team feed would
+    show only user prompts, making the AI look silent.
+
+    Output shape:
+        ``ran 3 tools: Edit auth.py, Bash, Read main.py (+1 more)``
+
+    Tool names use the upstream casing from the adapter
+    (``ALLOWED_TOOL_NAMES``) so reviewers recognize them at a glance.
+    A primary ``path`` arg is appended when present to make the line
+    actually useful for spotting blast radius.
+    """
+    if not calls:
+        return None
+    parts: list[str] = []
+    for call in calls[:3]:
+        name = getattr(call, "name", None)
+        if not isinstance(name, str) or not name:
+            continue
+        path = ""
+        args = getattr(call, "args", None)
+        if isinstance(args, dict):
+            p = args.get("path") or args.get("file_path") or args.get("file")
+            if isinstance(p, str) and p:
+                # Keep the basename so the line stays short — full
+                # path is already in ``paths_touched`` on the event.
+                path = " " + p.rsplit("/", 1)[-1][:60]
+        parts.append(f"{name}{path}")
+    if not parts:
+        return None
+    extra = max(0, len(calls) - 3)
+    body = ", ".join(parts)
+    if extra:
+        body += f" (+{extra} more)"
+    return f"ran {len(calls)} tool{'s' if len(calls) != 1 else ''}: {body}"
 
 
 def _now_utc() -> datetime:

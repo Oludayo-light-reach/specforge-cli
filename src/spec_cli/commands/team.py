@@ -34,6 +34,7 @@ from ..config import (
     load_manifest,
     parse_cloud_project,
 )
+from ..realtime.critic import critique_event, suggested_flag_command
 from ..realtime.events import IncomingEvent, IncomingFlag
 from ..realtime.notifier import Notifier
 from ..realtime.transport import SSEConsumer, SSEStreamError, run_consumer_in_thread
@@ -159,16 +160,33 @@ def _run_team_snapshot(
         when = _ago(event.turn_at or event.received_at)
         author = event.author_display
         branch = event.branch or "-"
-        role_color = "sf.point" if event.role == "user" else "sf.label"
         bundle = ""
         if event.bundle_label:
             bundle = f" [sf.muted]· {event.bundle_label}[/]"
+        # Same role-badge convention as the live watcher so muscle
+        # memory transfers between `spec team` and `spec team watch`.
+        # Source color tags help separate concurrent claude_code /
+        # codex / cursor activity in the snapshot too.
+        if event.role == "user":
+            badge = "[bold black on #3ddab4] USER [/]"
+            who = f"[bold #3ddab4]{author}[/]"
+        else:
+            badge = "[bold black on #7de3ff]  AI  [/]"
+            model = event.model or "assistant"
+            who = (
+                f"[bold #7de3ff]{model}[/] [sf.muted]→[/] "
+                f"[bold #3ddab4]{author}[/]"
+            )
+        src_color = {
+            "claude_code": "#c79bff",
+            "codex": "#9ee37d",
+            "cursor": "#7de3ff",
+            "manual": "#c7c9d1",
+        }.get(event.source, "#9aa3b2")
+        src = f"[bold {src_color}]{event.source}[/]"
         head = (
-            f"  [{role_color}]{event.role:<9}[/] "
-            # Event id is displayed so users can copy it straight into
-            # `spec team flag <id>` without a second lookup.
-            f"[sf.muted]#{event.id}[/] "
-            f"[sf.label]{author}[/] [sf.muted]· {branch} · {when} · {event.source}[/]"
+            f"  {badge} [sf.muted]#{event.id}[/] {who} "
+            f"[sf.muted]· {branch} · {when} · in[/] {src}"
             f"{bundle}"
         )
         console.print(head)
@@ -178,6 +196,17 @@ def _run_team_snapshot(
             if len(short) > 200:
                 short = short[:200].rstrip() + "…"
             console.print(f"      [sf.muted]{short}[/]")
+        # Apply the same auto-critic in the snapshot view so a `spec
+        # team` glance flags the same risky prompts the live watcher
+        # would. Cheap (pure regex) and only fires on user turns.
+        for c in critique_event(event):
+            console.print(
+                f"      [{c.color}]{c.glyph} AUTO {c.rule}[/] "
+                f"[sf.muted]{c.msg}[/]"
+            )
+            console.print(
+                f"        [sf.muted]→ {suggested_flag_command(event.id, c)}[/]"
+            )
 
 
 @click.group(name="team", invoke_without_command=True)
@@ -296,11 +325,23 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
     show_default=True,
     help="Seconds between heartbeat lines when --heartbeat is on.",
 )
+@click.option(
+    "--critic/--no-critic",
+    "critic_enabled",
+    default=True,
+    show_default=True,
+    help=(
+        "Run the rule-based auto-critic against every user prompt and "
+        "print suggestions inline. Each suggestion includes the exact "
+        "`spec team flag` command to escalate it into a team-visible flag."
+    ),
+)
 def team_watch_cmd(
     compact: bool,
     include_presence: bool,
     heartbeat: bool,
     heartbeat_interval: int,
+    critic_enabled: bool,
 ) -> None:
     """Live SSE tail across every bundle you can see (workspace-wide).
 
@@ -309,18 +350,36 @@ def team_watch_cmd(
     transient drops; ``Ctrl+C`` once asks for a graceful exit, a
     second press forces.
 
+    Two reviewer aids run automatically and can be disabled if the
+    output ever gets noisy:
+
+    * **Auto-critic** — every user prompt is matched against a small
+      catalogue of "AI is about to do something dangerous" rules
+      (destructive verbs, test-bypass language, vague intent, leaked
+      secrets). Each firing rule prints one suggestion line plus the
+      exact ``spec team flag`` command to escalate it. Turn off with
+      ``--no-critic``.
+
+    * **No-reply hint** — if a user prompt has been visible for 90s+
+      and no assistant turn from the same session has arrived, the
+      watcher surfaces a `⏳ no-reply` line. Catches the common case
+      where a teammate's broadcaster is sharing prompts but not
+      assistant text (the AI looks "silent" when really we just
+      aren't getting the reply).
+
     \b
     Examples:
       spec team watch
       spec team watch --compact
       spec team watch --no-heartbeat
+      spec team watch --no-critic   # silence rule-based suggestions
     """
     creds = load_credentials()
     if not creds or not creds.access_token:
         fatal("Not signed in. Run `spec login` first.")
         return
 
-    notifier = Notifier(compact=compact)
+    notifier = Notifier(compact=compact, critic_enabled=critic_enabled)
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle
     # heartbeat printer doesn't fire on top of fresh content.
@@ -392,6 +451,10 @@ def team_watch_cmd(
     # below any reasonable interval.
     try:
         while consumer_thread.is_alive() and not stop_event.is_set():
+            # Surface "AI has not replied" hints on every loop tick.
+            # Cheap (O(open_sessions)) and only prints on the first
+            # transition past the no-reply threshold per session.
+            notifier.check_open_sessions()
             if heartbeat:
                 idle_for = time.monotonic() - last_output_at[0]
                 if idle_for >= heartbeat_interval:

@@ -204,7 +204,7 @@ spec live on        # re-enable for this bundle (with --verbose for full assista
 |---|---|
 | `spec watch` | Long-running daemon. Broadcasts your prompts + dirty files; renders teammates' in your terminal. `--mirror` also writes incoming events to `prompts/captured/peers/<handle>/`. |
 | `spec team` | Snapshot of recent prompt activity (no SSE). |
-| `spec team watch` | Live workspace-wide SSE tail (`GET /api/me/prompt-stream`). Receive-only; no bundle directory required. Reconnects automatically, prints an idle heartbeat so the terminal never looks frozen, and renders teammate flags inline. |
+| `spec team watch` | Live workspace-wide SSE tail (`GET /api/me/prompt-stream`). Receive-only; no bundle directory required. Reconnects automatically, prints an idle heartbeat so the terminal never looks frozen, renders teammate flags inline, and runs the **auto-critic** against every user prompt so destructive verbs / test-bypass language / pasted secrets / vague intent surface with one-press escalation to `spec team flag`. `--no-critic` to silence. A `⏳ no-reply` line fires if a user prompt has gone 90 s without an assistant follow-up &mdash; usually a sign the broadcaster is in summary-only mode. |
 | `spec team flag <event_id>` | Flag a teammate's prompt event (`warning` / `question` / `block` / `ack`) in near real time. The flag fans out over the same SSE channel so every connected watcher sees it within an RTT. |
 | `spec presence show` | Show every teammate's current dirty-file list with `+/-` line counts. |
 | `spec presence check <path>` | Exit code is the contract: 0 = clear, 2 = a teammate is editing the path. |

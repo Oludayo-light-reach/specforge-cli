@@ -335,21 +335,24 @@ def test_producer_tick_bails_between_turns(tmp_path, monkeypatch):
     assert sent_count[0] == 1
 
 
+@pytest.mark.parametrize("source", ("cursor", "claude_code", "codex"))
 def test_producer_tail_assistant_reposts_then_advances_when_stable(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, source: str
 ):
-    """Cursor streams one assistant bubble: text grows on disk while
-    ``broadcast_turns`` must stay pinned so we POST again; only after
-    the fingerprint is quiet for ``max(5s, 3×poll_interval)`` do
-    we advance the cursor."""
+    """Final assistant turn may grow on disk between polls (all sources).
+
+    ``broadcast_turns`` stays pinned until the body fingerprint is
+    quiet for ``max(5s, 3×poll_interval)``, so we can POST updates while
+    text streams — same rules for cursor, Claude Code, and Codex."""
     from spec_cli.prompts.schema import Session, Turn
     from spec_cli.realtime.tracker import LiveCursor
 
+    sid = f"s1-{source}"
     u = Turn(role="user", text="hello", at=None)
     a = Turn(role="assistant", text="part", at=None)
     session = Session(
-        id="s1",
-        source="cursor",
+        id=sid,
+        source=source,
         title="t",
         turns=[u, a],
         cwd=str(tmp_path),
@@ -397,7 +400,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         assistant_tail_holds=holds,
     )
     assert len(poster.events) == 2
-    assert cursor.turns_broadcast_for("s1") == 1
+    assert cursor.turns_broadcast_for(sid) == 1
 
     clock[0] = 0.1
     a.text = "part — full reply"
@@ -410,7 +413,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         assistant_tail_holds=holds,
     )
     assert len(poster.events) == 3
-    assert cursor.turns_broadcast_for("s1") == 1
+    assert cursor.turns_broadcast_for(sid) == 1
 
     clock[0] = 10.0
     _producer_tick(
@@ -422,21 +425,27 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         assistant_tail_holds=holds,
     )
     assert len(poster.events) == 3
-    assert cursor.turns_broadcast_for("s1") == 2
+    assert cursor.turns_broadcast_for(sid) == 2
 
 
-def test_producer_does_not_skip_empty_tail_assistant_slot(tmp_path, monkeypatch):
-    """Cursor can list a final assistant turn before any body is on disk.
-    Advancing past it would drop the reply entirely (team watch shows
-    only heartbeats after the user row)."""
+@pytest.mark.parametrize("source", ("cursor", "claude_code", "codex"))
+def test_producer_does_not_skip_empty_tail_assistant_slot(
+    tmp_path, monkeypatch, source: str
+):
+    """Do not advance past an unshippable final assistant turn (all sources).
+
+    If ``_build_outgoing`` returns ``None`` for that slot, retry next
+    poll — otherwise ``spec team watch`` can sit on heartbeats with no
+    AI row after the user prompt."""
     from spec_cli.prompts.schema import Session, Turn
     from spec_cli.realtime.tracker import LiveCursor
 
+    sid = f"s2-{source}"
     u = Turn(role="user", text="hello", at=None)
     a = Turn(role="assistant", text="", at=None, summary=None)
     session = Session(
-        id="s2",
-        source="cursor",
+        id=sid,
+        source=source,
         title="t",
         turns=[u, a],
         cwd=str(tmp_path),
@@ -477,7 +486,7 @@ def test_producer_does_not_skip_empty_tail_assistant_slot(tmp_path, monkeypatch)
         assistant_tail_holds=holds,
     )
     assert len(poster.events) == 1
-    assert cursor.turns_broadcast_for("s2") == 1
+    assert cursor.turns_broadcast_for(sid) == 1
 
     a.text = "finally"
     _producer_tick(
@@ -489,7 +498,7 @@ def test_producer_does_not_skip_empty_tail_assistant_slot(tmp_path, monkeypatch)
         assistant_tail_holds=holds,
     )
     assert len(poster.events) == 2
-    assert cursor.turns_broadcast_for("s2") == 1
+    assert cursor.turns_broadcast_for(sid) == 1
 
 
 # ── Issue 3: run_watcher exits promptly on stop_event ──────────────

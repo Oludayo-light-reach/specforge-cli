@@ -543,6 +543,11 @@ def _producer_tick(
 ) -> None:
     """One pass over local transcripts; broadcast new turns.
 
+    Sessions come from Cursor, Claude Code, and Codex adapters in
+    ``_iter_local_sessions`` — tail-assistant streaming and empty-tail
+    retry rules apply to every ``session.source``; there is no
+    source-specific branch in the POST path.
+
     Quiet on the happy path. Errors at the per-source level are
     swallowed so a transient SQLite lock on Cursor's store doesn't
     take down the whole watcher.
@@ -582,11 +587,13 @@ def _producer_tick(
                 # Skip empty / undeliverable turn but still advance the
                 # cursor so we don't rescan it forever.
                 #
-                # Exception: Cursor often materialises the assistant row
-                # before ``text`` / tool summaries exist on disk. If we
-                # advance past that slot, the real reply never POSTs and
-                # ``spec team watch`` shows only heartbeats after the user
-                # prompt. Retry next poll until the turn becomes shippable.
+                # Exception: the final assistant slot can appear in
+                # ``session.turns`` before any body exists on disk (Cursor
+                # is the usual case; other adapters can yield the same
+                # ``_build_outgoing`` → ``None`` pattern). Advancing past
+                # that slot drops the reply for every ``session.source``
+                # (cursor / claude_code / codex). Retry next poll until the
+                # turn becomes shippable.
                 if (
                     turn.role == "assistant"
                     and (prev + offset) == len(session.turns) - 1

@@ -477,6 +477,28 @@ def push_cmd(
 
     if total_accepted:
         ok(f"Pushed {total_accepted} file(s) to [bold]{handle}/{slug}[/]")
+        # Post-push presence broadcast. ``spec watch`` would do this on
+        # its own 15 s tick, but pushing is an explicit "I am done with
+        # this batch, teammates should sync" moment — we propagate the
+        # new ``head_commit`` immediately so peer briefs can flag
+        # "run git pull" within an RTT instead of after a quiet 15 s
+        # window. Best-effort: a failure here is logged but never
+        # blocks the push success path.
+        try:
+            from ..realtime.push_announce import announce_push
+
+            announce_push(
+                creds,
+                project_id,
+                root,
+                branch=git.branch,
+            )
+        except Exception:  # noqa: BLE001
+            # The announce is purely a latency optimisation. If
+            # anything at all goes wrong we fall back to the watcher's
+            # regular tick — the team learns about the push within
+            # 15 s either way.
+            pass
 
     # First-push adoption (PLAN.md §11). When the working tree didn't
     # carry a bundle_id but the server did return one, stamp it now so

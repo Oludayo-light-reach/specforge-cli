@@ -238,6 +238,25 @@ class Notifier:
         without restarting the watcher."""
         self._critic_enabled = bool(enabled)
 
+    def record_pairing(self, event: IncomingEvent) -> None:
+        """Update the user→AI pairing tracker without rendering.
+
+        Called from the watcher's ``_deliver`` *before* the filter that
+        drops noisy tool-only assistant frames. Without this hop, a
+        tool-only assistant reply (synthesized summary, no critic hit)
+        would be filtered out before ``show()`` runs — and the
+        ``_remember_open_session`` entry left by the matching user
+        prompt would never be cleared, causing the no-reply hint to
+        fire 90 s later even though the AI *did* reply.
+
+        Safe to call multiple times for the same event: the
+        underlying maps are idempotent.
+        """
+        if event.role == "user":
+            self._remember_open_session(event)
+        elif event.role in ("assistant", "error"):
+            self._mark_session_replied(event)
+
     @staticmethod
     def _session_pair_key(event: IncomingEvent) -> tuple[int, str]:
         sid = (event.session_id or "").strip()
@@ -253,7 +272,13 @@ class Notifier:
         """Find the most recent user turn for this session with ``id``
         strictly before ``event`` — used when ``_pending_user_prompt``
         missed the USER frame (bootstrap gap, reconnect, or bursty
-        assistant rows)."""
+        assistant rows).
+
+        Stops walking back if we encounter another assistant/error
+        row for the same session first — that one already carried the
+        echo, so this row is a continuation and should *not* repeat
+        the prompt one-liner.
+        """
         buf = self._pairing_buffer
         if buf is None:
             return None
@@ -265,9 +290,14 @@ class Notifier:
         for ev in tail:
             if ev.id >= event.id:
                 continue
-            if ev.role != "user":
-                continue
             if self._session_pair_key(ev) != key:
+                continue
+            # If a prior assistant/error in the same session is closer
+            # to ``event`` than the user prompt, this row is a chain
+            # continuation — the echo already happened, suppress it.
+            if ev.role in ("assistant", "error"):
+                return None
+            if ev.role != "user":
                 continue
             preview = (ev.text or ev.summary or "").strip()
             if not preview:

@@ -486,6 +486,118 @@ def test_notify_on_rings_bell_on_block_severity(monkeypatch):
     assert called["bell"] is True
 
 
+def test_pairing_from_buffer_suppresses_repeat_echo_in_chain():
+    """When an agent emits two assistant turns in a row for the same
+    user prompt ("Time to make the fixes." then "## Fix 1: …" 3 s
+    later), only the FIRST reply should carry the ``⤷ prompt`` echo.
+    The second one is a continuation of the same answer — re-printing
+    the one-liner under every body reads as duplicated noise."""
+    buf: deque[IncomingEvent] = deque(maxlen=500)
+    n = Notifier(pairing_buffer=buf)
+
+    user_ev = _ev(role="user", text="is this fine cd /Users/mvii/...")
+    user_ev.id = 100
+    buf.append(user_ev)
+
+    ai1 = _ev(role="assistant", text="Time to make the fixes.")
+    ai1.id = 101
+    ai1.session_id = user_ev.session_id
+
+    # First assistant reply — the in-memory ``_pending_user_prompt``
+    # popped by ``show()`` is the normal path; the buffer is the
+    # fallback. We exercise the fallback path directly because that's
+    # where the duplicate-echo bug lived (after the pop, every later
+    # call would re-discover the same user row).
+    first_echo = n._pairing_prompt_from_buffer(ai1)
+    assert first_echo is not None
+    assert first_echo[0] == user_ev.author_display
+    buf.append(ai1)  # mirror the real watcher path
+
+    ai2 = _ev(role="assistant", text="## Fix 1: ...")
+    ai2.id = 102
+    ai2.session_id = user_ev.session_id
+    second_echo = n._pairing_prompt_from_buffer(ai2)
+    assert second_echo is None, (
+        "second assistant turn in the same session must NOT re-echo "
+        "the prompt — it's a continuation of the same answer"
+    )
+
+
+def test_pairing_from_buffer_re_echoes_after_new_user_prompt():
+    """After a fresh user prompt the chain resets — the next
+    assistant turn should echo the *new* prompt, not the stale one."""
+    buf: deque[IncomingEvent] = deque(maxlen=500)
+    n = Notifier(pairing_buffer=buf)
+
+    u1 = _ev(role="user", text="first question")
+    u1.id = 200
+    buf.append(u1)
+
+    a1 = _ev(role="assistant", text="first answer")
+    a1.id = 201
+    a1.session_id = u1.session_id
+    buf.append(a1)
+
+    u2 = _ev(role="user", text="follow-up question")
+    u2.id = 202
+    u2.session_id = u1.session_id
+    buf.append(u2)
+
+    a2 = _ev(role="assistant", text="follow-up answer")
+    a2.id = 203
+    a2.session_id = u1.session_id
+    echo = n._pairing_prompt_from_buffer(a2)
+    assert echo is not None
+    assert echo[1].startswith("follow-up"), (
+        "after a new user prompt arrives, the next assistant turn "
+        "must echo the *new* prompt — not the previous one"
+    )
+
+
+def test_record_pairing_clears_open_session_on_assistant_reply():
+    """Tool-only assistant turns are filtered out before ``show()`` in
+    the watcher's ``_deliver`` chain — but the user→AI pairing tracker
+    must still clear or the no-reply hint fires 90 s later as if the
+    AI ghosted. ``record_pairing`` is the hop the watcher calls before
+    the filter to keep the tracker honest."""
+    n = Notifier()
+    user_ev = _ev(role="user", text="please refactor")
+    # Pretend a user turn just landed.
+    n.record_pairing(user_ev)
+    key = (user_ev.project_id, user_ev.session_id)
+    assert key in n._open_sessions, "user prompt must enter the pairing tracker"
+
+    # And now the matching assistant reply lands. Even though the
+    # caller may filter it out before calling show(), the pairing
+    # tracker should already be clear.
+    ai_ev = _ev(role="assistant", text=None)
+    ai_ev.session_id = user_ev.session_id
+    ai_ev.project_id = user_ev.project_id
+    n.record_pairing(ai_ev)
+    assert key not in n._open_sessions, (
+        "assistant reply should clear the pairing tracker so the "
+        "90 s no-reply hint does not fire spuriously"
+    )
+
+
+def test_record_pairing_treats_error_as_a_reply():
+    """An ``error`` role frame closes the awaiting-reply tracker just
+    like an assistant turn — agent timeout / refusal is a definitive
+    answer, just not a happy one. Without this the no-reply hint
+    would fire on top of a failed turn."""
+    n = Notifier()
+    user_ev = _ev(role="user", text="please refactor")
+    n.record_pairing(user_ev)
+    err_ev = _ev(role="error", text="tool failed")
+    err_ev.session_id = user_ev.session_id
+    err_ev.project_id = user_ev.project_id
+    n.record_pairing(err_ev)
+    assert (
+        user_ev.project_id,
+        user_ev.session_id,
+    ) not in n._open_sessions
+
+
 def test_notify_does_not_fire_for_warn_severity(monkeypatch):
     n = Notifier(notify=True)
     called = {"bell": False}

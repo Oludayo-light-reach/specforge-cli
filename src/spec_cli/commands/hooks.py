@@ -43,12 +43,18 @@ from pathlib import Path
 import click
 
 from ..config import BundleNotFoundError, find_bundle_root
+from ..realtime.active_edits import (
+    DEFAULT_LOCK_TTL_SECS,
+    ActiveEditsStore,
+)
 from ..realtime.presence_mirror import read_team_presence
 from ..realtime.team_editing_brief import (
     DEFAULT_LOCKS_MIRROR_STALE_SECS,
     team_presence_mirror_stale,
 )
 from ..ui import dim
+
+CLAUDE_HOOK_AGENT_ID = "claude_code"
 
 
 CLAUDE_HOOK_VERSION = 1
@@ -143,18 +149,68 @@ def claude_pre_tool_use_cmd(block_mode: bool) -> None:
         sys.exit(0)
 
     conflicts: list[tuple[str, list[dict]]] = []
+    rel_paths: list[str] = []
     for abs_path in file_paths:
         rel = _bundle_relative(abs_path, bundle_root)
         if rel is None:
             continue
+        rel_paths.append(rel)
         holders = _holders_for_path(body, rel)
         if holders:
             conflicts.append((rel, holders))
 
-    if not conflicts:
+    # ── single-user multi-agent lock ──────────────────────────────
+    # Take an active-edit lock for this PreToolUse call so other
+    # agents on the same machine (Cursor / Codex) see Claude's edit
+    # in flight. The lock id is emitted on stderr (Claude shows
+    # hook stderr inline) so the matching PostToolUse hook can
+    # release it. Cross-agent overlaps are added to the conflict
+    # list so we surface "your Cursor pane is also editing auth.py"
+    # with the same warning channel as a teammate conflict.
+    active_conflicts: list[dict] = []
+    lock_id: str | None = None
+    session_id = _claude_session_id(payload)
+    if rel_paths:
+        try:
+            store = ActiveEditsStore(bundle_root)
+            lock, ac = store.acquire(
+                rel_paths,
+                agent=CLAUDE_HOOK_AGENT_ID,
+                session_id=session_id,
+                ttl_secs=_hook_lock_ttl_secs(),
+                intent=tool_name or None,
+            )
+            lock_id = lock.id
+            for c in ac:
+                active_conflicts.append(
+                    {
+                        "agent": c.lock.agent,
+                        "session_id": c.lock.session_id,
+                        "intent": c.lock.intent,
+                        "pid": c.lock.pid,
+                        "overlapping_paths": list(c.overlapping_paths),
+                        "expires_at": c.lock.expires_at.isoformat(),
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            # Lock acquisition is best-effort. A broken store should
+            # never block Claude from editing — the team-presence
+            # warning still fires below.
+            pass
+
+    if lock_id:
+        # Print the lock id on stderr in a stable form so the
+        # PostToolUse hook can grep it back out. Claude's hook
+        # protocol passes a session id to *both* hooks, so we
+        # also fall back to "release every lock for this session"
+        # if the post hook can't parse this line.
+        sys.stderr.write(f"spec-lock-id: {lock_id}\n")
+        sys.stderr.flush()
+
+    if not conflicts and not active_conflicts:
         sys.exit(0)
 
-    _emit_conflict_warning(tool_name, conflicts)
+    _emit_conflict_warning(tool_name, conflicts, active_conflicts)
     if block_mode:
         # Non-zero exit blocks the tool call in Claude Code.
         sys.exit(2)
@@ -275,7 +331,9 @@ def _holders_for_path(body: dict, rel_path: str) -> list[dict]:
 
 
 def _emit_conflict_warning(
-    tool_name: str, conflicts: list[tuple[str, list[dict]]]
+    tool_name: str,
+    conflicts: list[tuple[str, list[dict]]],
+    active_conflicts: list[dict] | None = None,
 ) -> None:
     """Write the user-visible warning to stderr.
 
@@ -283,33 +341,166 @@ def _emit_conflict_warning(
     which is exactly the surface we want — the user sees the warning
     next to the edit it's about to perform without us having to
     inject anything into the conversation.
+
+    Two conflict layers are surfaced together:
+
+    * ``conflicts`` — *teammate* dirty files from ``team-presence.json``.
+      Cross-machine, cross-user; the original Spec Live warning.
+    * ``active_conflicts`` — *your own other AI agents* on this
+      machine that have the same file locked via
+      ``.spec/active-edits.json``. Same-user, cross-tool. Surfaced
+      *first* because a same-machine overlap is the more certain
+      conflict — a teammate could be stale, your Cursor agent
+      writing right now is not.
     """
     lines: list[str] = []
-    if len(conflicts) > 1:
+    active_conflicts = list(active_conflicts or [])
+
+    if active_conflicts:
         lines.append(
-            f"⚠ Spec Live: {len(conflicts)} files have teammates editing them"
+            f"⚠ Spec Live: {len(active_conflicts)} of your own agents "
+            f"have overlapping locks right now"
         )
-    else:
-        lines.append(
-            "⚠ Spec Live: 1 file has a teammate currently editing it"
-        )
-    for rel, holders in conflicts:
-        lines.append(f"  {rel}")
-        for h in holders[:3]:
-            handle = h.get("handle") or h.get("name") or "(unknown)"
-            added = int(h.get("lines_added") or 0)
-            removed = int(h.get("lines_removed") or 0)
-            untracked = " (new file)" if h.get("untracked") else ""
+        for entry in active_conflicts:
+            agent = entry.get("agent") or "agent"
+            session = entry.get("session_id") or "-"
+            intent = entry.get("intent") or "-"
+            paths = entry.get("overlapping_paths") or []
+            paths_fmt = ", ".join(paths) if isinstance(paths, list) else ""
             lines.append(
-                f"    · @{handle} (+{added}/-{removed}){untracked}"
+                f"  · {agent} (session {session}, intent {intent}): {paths_fmt}"
             )
-        if len(holders) > 3:
-            lines.append(f"    · …and {len(holders) - 3} more")
-    lines.append(
-        "  → consider `git pull` first or coordinate before overwriting."
-    )
-    sys.stderr.write("\n".join(lines) + "\n")
-    sys.stderr.flush()
+        lines.append(
+            "  → wait for the other agent to finish, or call "
+            "`spec locks list` to inspect and `spec locks release <id>`."
+        )
+
+    if conflicts:
+        if len(conflicts) > 1:
+            lines.append(
+                f"⚠ Spec Live: {len(conflicts)} files have teammates editing them"
+            )
+        else:
+            lines.append(
+                "⚠ Spec Live: 1 file has a teammate currently editing it"
+            )
+        for rel, holders in conflicts:
+            lines.append(f"  {rel}")
+            for h in holders[:3]:
+                handle = h.get("handle") or h.get("name") or "(unknown)"
+                added = int(h.get("lines_added") or 0)
+                removed = int(h.get("lines_removed") or 0)
+                untracked = " (new file)" if h.get("untracked") else ""
+                lines.append(
+                    f"    · @{handle} (+{added}/-{removed}){untracked}"
+                )
+            if len(holders) > 3:
+                lines.append(f"    · …and {len(holders) - 3} more")
+        lines.append(
+            "  → consider `git pull` first or coordinate before overwriting."
+        )
+
+    if lines:
+        sys.stderr.write("\n".join(lines) + "\n")
+        sys.stderr.flush()
+
+
+def _claude_session_id(payload: dict) -> str | None:
+    """Pull the session identifier Claude Code passes to every hook.
+
+    Claude's hook protocol includes a ``session_id`` field at the top
+    level of the JSON payload. We use it as the active-edit lock's
+    session id so re-firing the hook (e.g. a chain of Edit calls in
+    one conversation) renews the same lock instead of stacking up
+    overlapping ones. Falls back to ``None`` for unfamiliar payload
+    shapes; the store still distinguishes renewals via the
+    ``(agent, session_id=None)`` tuple.
+    """
+    raw = payload.get("session_id") or payload.get("sessionId")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _hook_lock_ttl_secs() -> float:
+    """Hook lock TTL, overridable via ``SPEC_HOOK_LOCK_TTL_SECS``.
+
+    Default is the module constant. Bumped on the cheap by setting
+    the env var in ``.claude/settings.json`` for teams that run very
+    long single-tool calls. Capped server-side in
+    ``ActiveEditsStore.acquire`` regardless.
+    """
+    raw = os.environ.get("SPEC_HOOK_LOCK_TTL_SECS", "").strip()
+    if not raw:
+        return float(DEFAULT_LOCK_TTL_SECS)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(DEFAULT_LOCK_TTL_SECS)
+
+
+# ── Claude Code PostToolUse hook ──────────────────────────────────────
+
+
+@hooks_group.command("claude-post-tool-use")
+def claude_post_tool_use_cmd() -> None:
+    """Claude Code ``PostToolUse`` hook entry point.
+
+    Releases the active-edit lock(s) that the matching PreToolUse
+    hook took for this tool call. Two release strategies, tried in
+    order:
+
+    * If the PreToolUse hook printed a ``spec-lock-id:`` line on
+      stderr, Claude doesn't forward stderr between hooks — instead
+      we use the ``session_id`` carried in both payloads to release
+      every lock the *current Claude session* still holds. That
+      catches the common case ("Edit, then MultiEdit, then Bash")
+      where the PreToolUse hook renewed one cumulative lock per
+      session.
+    * As a safety net, we also accept ``SPEC_ACTIVE_LOCK_ID`` from
+      the environment — a future custom integration could pass the
+      id explicitly.
+
+    Exit ``0`` regardless. A hook that fails to release is a
+    leak the TTL will reclaim on its own; we never want a release
+    failure to block work.
+    """
+    raw = sys.stdin.read()
+    if not raw.strip():
+        sys.exit(0)
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        sys.exit(0)
+    if not isinstance(payload, dict):
+        sys.exit(0)
+
+    session_id = _claude_session_id(payload)
+    tool_name = str(payload.get("tool_name") or "")
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    file_paths = _extract_file_paths(tool_name, tool_input)
+    bundle_root = _find_bundle_for_paths(file_paths)
+    if bundle_root is None:
+        sys.exit(0)
+
+    # Per-id release (if the env var carried it forward) plus
+    # per-session sweep. We do both because the lock might have been
+    # renewed under a different id between PreToolUse and now.
+    explicit_id = os.environ.get("SPEC_ACTIVE_LOCK_ID", "").strip()
+    try:
+        store = ActiveEditsStore(bundle_root)
+        if explicit_id:
+            store.release(explicit_id)
+        if session_id is not None:
+            store.release_for_session(
+                agent=CLAUDE_HOOK_AGENT_ID, session_id=session_id
+            )
+    except Exception:  # noqa: BLE001
+        # Best-effort.
+        pass
+    sys.exit(0)
 
 
 # ── Claude settings install ──────────────────────────────────────────
@@ -432,6 +623,29 @@ def install_claude_settings(bundle_root: Path, *, block_mode: bool) -> Path:
         ],
     }
     hooks_section["PreToolUse"] = _replace_spec_managed(pre_tool_use, pre_block)
+
+    # ── PostToolUse: release the active-edit lock ──────────────────
+    # Matches the PreToolUse matcher: the same tool calls that take
+    # a lock should release it. Without this, a single-agent run is
+    # fine (lock TTL reclaims it) but a Cursor pane checking
+    # locks while Claude is between edits would see stale "in
+    # flight" rows for up to 5 minutes.
+    post_tool_use = hooks_section.get("PostToolUse")
+    if not isinstance(post_tool_use, list):
+        post_tool_use = []
+        hooks_section["PostToolUse"] = post_tool_use
+    post_block = {
+        "matcher": "Edit|MultiEdit|Write|NotebookEdit",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "spec hooks claude-post-tool-use",
+                "spec_managed": True,
+                "spec_version": CLAUDE_HOOK_VERSION,
+            }
+        ],
+    }
+    hooks_section["PostToolUse"] = _replace_spec_managed(post_tool_use, post_block)
 
     # ── UserPromptSubmit: autostart hook ───────────────────────────
     # The autostart command bails fast on opt-out / not-in-bundle —

@@ -69,12 +69,30 @@ def _run_hook(stdin_payload: dict, *, args: list[str] | None = None) -> subproce
     )
 
 
+def _stderr_warnings_only(raw: str) -> str:
+    """Filter the bookkeeping lines the hook always emits (lock id)
+    so legacy tests can keep asserting on user-visible warnings."""
+    keep: list[str] = []
+    for line in raw.splitlines():
+        if line.strip().startswith("spec-lock-id:"):
+            continue
+        keep.append(line)
+    return "\n".join(keep).strip()
+
+
 # ── conflict detection ─────────────────────────────────────────────
 
 
 def test_hook_exits_zero_when_no_presence_data(tmp_path):
     """No ``team-presence.json`` → the watcher isn't running. Fail
-    open: never block edits because the daemon is off."""
+    open: never block edits because the daemon is off.
+
+    The hook still emits a ``spec-lock-id:`` line on stderr because
+    it takes a local active-edit lock regardless of the team-presence
+    state — that's the single-user multi-agent coordination signal.
+    We assert no *user-visible warning* appears, ignoring the
+    bookkeeping line.
+    """
     bundle = _make_bundle(tmp_path)
     target = bundle / "auth.py"
     target.write_text("x", encoding="utf-8")
@@ -82,7 +100,7 @@ def test_hook_exits_zero_when_no_presence_data(tmp_path):
         {"tool_name": "Edit", "tool_input": {"file_path": str(target)}}
     )
     assert res.returncode == 0
-    assert res.stderr.strip() == ""
+    assert _stderr_warnings_only(res.stderr) == ""
 
 
 def test_hook_warns_on_conflict_default(tmp_path):
@@ -162,7 +180,7 @@ def test_hook_silent_when_no_overlap(tmp_path):
         {"tool_name": "Edit", "tool_input": {"file_path": str(target)}}
     )
     assert res.returncode == 0
-    assert res.stderr.strip() == ""
+    assert _stderr_warnings_only(res.stderr) == ""
 
 
 def test_hook_ignores_self_overlap(tmp_path):
@@ -191,7 +209,7 @@ def test_hook_ignores_self_overlap(tmp_path):
         {"tool_name": "Edit", "tool_input": {"file_path": str(target)}}
     )
     assert res.returncode == 0
-    assert res.stderr.strip() == ""
+    assert _stderr_warnings_only(res.stderr) == ""
 
 
 @pytest.mark.parametrize("tool_name", ["Read", "Bash", "Grep", "Glob"])

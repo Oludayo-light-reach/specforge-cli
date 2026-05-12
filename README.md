@@ -208,7 +208,13 @@ spec live on        # re-enable for this bundle (with --verbose for full assista
 | `spec team flag <event_id>` | Flag a teammate's prompt event (`warning` / `question` / `block` / `ack`) in near real time. The flag fans out over the same SSE channel so every connected watcher sees it within an RTT. |
 | `spec presence show` | Show every teammate's current dirty-file list with `+/-` line counts. |
 | `spec presence check <path>` | Exit code is the contract: 0 = clear, 2 = a teammate is editing the path. |
-| `spec hooks install-claude` | Wire the Spec Live `PreToolUse` hook into Claude Code (`spec init` does this for you on first run). Add `--block` to refuse edits on conflict instead of just warning. |
+| `spec locks check <path>` | Same exit-code contract as `presence check`, but ignores a stale presence mirror. `--json` output also carries `pull_alerts` for teammates who are on the same branch and ahead of your `HEAD`. **Also surfaces same-machine multi-agent conflicts** — if your Cursor pane has `auth.py` locked while Claude Code asks, you'll see it. |
+| `spec locks pull-status` | Exit `0` when no teammate is ahead of your branch, `2` when at least one same-branch peer has a different `head_commit` — i.e. they pushed and you should `git pull`. `--json` for hooks. |
+| `spec locks acquire <path>` | Take a per-machine **active-edit** lock for a single AI agent. Use `--agent claude_code\|cursor\|codex\|...` plus `--session <id>` so the same agent renewing doesn't conflict with itself. `--block` exits `2` on cross-agent overlap. Locks have a TTL (default 5 min, cap 60 min) so a crashed agent never deadlocks. |
+| `spec locks release <lock_id>` | Drop a previously-acquired active-edit lock. Unknown ids exit `0` (no-op) — PostToolUse hooks fire unconditionally and must never break. |
+| `spec locks list` | Show every active edit lock in this bundle. Filterable by `--agent` / `--session`; `--include-expired` reveals stale rows. |
+| `spec locks prune` | Physically remove expired active-edit locks. Reads already filter them; this is housekeeping. |
+| `spec hooks install-claude` | Wire the Spec Live `PreToolUse` *and* `PostToolUse` hooks into Claude Code (`spec init` does this for you on first run). PreToolUse warns on teammate conflicts and auto-acquires an active-edit lock; PostToolUse releases it. Add `--block` to refuse edits on conflict instead of just warning. |
 | `spec live status` | Resolved broadcasting state — bundle setting, machine mute, and the final answer. |
 | `spec live on` / `off` | Per-bundle: writes `cloud.prompt_stream` to `spec.yaml`. Commit it so teammates inherit. |
 | `spec live mute` / `unmute` | Per-machine: lives in `~/.spec/preferences.json`. Receivers always work; this only stops your outgoing share. |
@@ -231,6 +237,45 @@ vectors today:
 - **Any AI agent** — `AGENTS.md` (also written by `spec init`) instructs any
   model-driven agent to call `spec locks check <path>` before making
   destructive edits and surface the warning to the user.
+
+**Single-user, multi-agent locks.** `team-presence.json` answers "is a
+teammate dirty here?" — but a single dev commonly has Claude Code, Cursor, and
+Codex all editing the same working tree in parallel. Git can't tell those
+agents apart; `team-presence.json` lumps them under one `self` block. To
+coordinate inside one machine we maintain a second, smaller file:
+
+`.spec/active-edits.json` — a list of short-lived **active-edit locks** keyed
+by `(agent, session_id, paths)`. Each lock has a TTL (default 5 minutes,
+capped at 60). The flow:
+
+1. Before a write tool call, the agent's PreToolUse hook calls
+   `spec locks acquire <path> --agent <name> --session <id>`. Same agent +
+   session re-acquires is a **renewal** (no conflict); cross-agent or
+   cross-session overlap surfaces as a `conflicts` entry in the JSON output.
+2. After the write tool call, PostToolUse calls `spec locks release <id>`
+   (or the matching `claude-post-tool-use` hook does it automatically).
+3. Any caller — `spec locks check <path>`, Cursor's rule, the brief
+   renderer — sees both teammate locks **and** your-own-agent locks merged
+   into one `holders[]` array (with `kind: "active_edit"` on the same-
+   machine rows so renderers can disambiguate).
+
+`spec hooks install-claude` writes both PreToolUse and PostToolUse blocks so
+Claude Code participates in this layer out of the box. Cursor and Codex
+integrations can do the same via their respective rule / config systems —
+the contract is just "call `spec locks acquire` before write, `release`
+after". A crashed agent never holds a lock past the TTL; `spec locks prune`
+is a manual cleanup if you ever need it.
+
+**Post-push pull hint.** When you run `spec push`, the CLI fires one extra
+presence event after the upload succeeds with the new `head_commit` baked in.
+Teammates' watchers receive it over the SSE channel within an RTT, their
+`.spec/team-presence.json` is refreshed, and `.spec/team-editing-brief.md`
+grows a `## Pull needed` section listing every same-branch peer whose
+`head_commit` differs from theirs. `spec locks pull-status` is the dedicated
+exit-code probe that hooks call before write tools (`Edit` / `Write` /
+`MultiEdit`); `spec locks check <path> --json` carries the same `pull_alerts`
+array alongside the per-path holders. Cross-branch divergence is intentionally
+ignored — only same-branch ahead-of-you is treated as a "git pull first" signal.
 
 **Workspace-wide live tail:** `spec team watch` opens one SSE connection to
 `GET /api/me/prompt-stream` (every bundle you can read on Cloud, with

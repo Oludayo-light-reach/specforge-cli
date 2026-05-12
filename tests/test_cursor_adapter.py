@@ -138,6 +138,28 @@ def _add_composer(
             body["modelInfo"] = bubble["modelInfo"]
         if "richText" in bubble:
             body["richText"] = bubble["richText"]
+        # Test-only passthrough of structured activity blobs that
+        # signal a real turn to the adapter even when ``text`` is
+        # empty (tool calls, attachments, etc).
+        for extra in (
+            "toolFormerData",
+            "toolCallId",
+            "toolCalls",
+            "toolUse",
+            "capabilities",
+            "responseMetadata",
+            "completedToolCalls",
+            "intermediateChunks",
+            "attachments",
+            "imageData",
+            "commands",
+            "mentionData",
+            "fileSelections",
+            "selectionData",
+            "voiceInputData",
+        ):
+            if extra in bubble:
+                body[extra] = bubble[extra]
         conn.execute(
             "INSERT OR REPLACE INTO cursorDiskKV VALUES (?, ?)",
             (f"bubbleId:{composer_id}:{bubble['id']}", json.dumps(body)),
@@ -449,6 +471,80 @@ def test_read_cursor_sessions_drops_empty_user_bubbles(tmp_path, monkeypatch):
     roles = [t.role for t in sessions[0].turns]
     assert roles == ["user", "assistant"]
     assert sessions[0].turns[0].text == "actually a question"
+
+
+def test_assistant_bubble_with_tool_data_but_no_text_emits_placeholder(
+    tmp_path, monkeypatch
+):
+    """Cursor sometimes ships agent runs as bubbles with no prose, just
+    ``toolFormerData``. Previously these were silently dropped — making
+    `spec team watch` show the user prompt and then ghost-silence
+    until the no-reply hint fired. The fix: emit a synthetic
+    ``ran tools: …`` summary so the turn lands as a real assistant
+    frame, the watcher's pairing tracker clears, and reviewers can see
+    the agent actually replied."""
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    composer_id = "77777777-7777-4777-a777-777777777777"
+    _make_workspace(tmp_path, "ws-tools", bundle, [composer_id])
+    _add_composer(
+        tmp_path,
+        composer_id,
+        bubbles=[
+            {"id": "u", "type": 1, "text": "edit auth.py"},
+            {
+                "id": "a-tool-only",
+                "type": 2,
+                "text": "",
+                # Structured activity blob with no readable prose.
+                "toolFormerData": {"name": "Edit", "args": {"path": "auth.py"}},
+            },
+        ],
+    )
+
+    sessions = list(read_cursor_sessions(bundle, verbose=True))
+    assert len(sessions) == 1
+    roles = [t.role for t in sessions[0].turns]
+    assert roles == ["user", "assistant"], (
+        "tool-only assistant bubble must not be silently dropped"
+    )
+    ai_turn = sessions[0].turns[1]
+    assert ai_turn.summary is not None and ai_turn.summary.startswith("ran "), (
+        "tool-only assistant turn should carry the ``ran …`` sentinel summary"
+    )
+
+
+def test_user_bubble_with_attachments_but_no_text_emits_placeholder(
+    tmp_path, monkeypatch
+):
+    """Pasted content with control characters or attachment-only
+    prompts would otherwise silently disappear from the stream. The
+    adapter now emits a placeholder so reviewers see the row land."""
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    composer_id = "88888888-8888-4888-a888-888888888888"
+    _make_workspace(tmp_path, "ws-att", bundle, [composer_id])
+    _add_composer(
+        tmp_path,
+        composer_id,
+        bubbles=[
+            {
+                "id": "u-attach",
+                "type": 1,
+                "text": "",
+                "attachments": [{"kind": "file", "path": "auth.py"}],
+            },
+            {"id": "a", "type": 2, "text": "ok"},
+        ],
+    )
+
+    sessions = list(read_cursor_sessions(bundle))
+    assert len(sessions) == 1
+    user_turn = sessions[0].turns[0]
+    assert user_turn.role == "user"
+    assert user_turn.text and "not extractable" in user_turn.text
 
 
 def test_read_cursor_sessions_verbose_keeps_assistant_text(tmp_path, monkeypatch):

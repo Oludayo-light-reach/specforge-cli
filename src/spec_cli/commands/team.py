@@ -586,6 +586,13 @@ def team_watch_cmd(
         event_to_project[ev.id] = ev.project_id
         if not include_presence and ev.role == "presence":
             return
+        # Update the user → AI pairing tracker *before* any visibility
+        # / tool-only filter. Otherwise a teammate's tool-only assistant
+        # reply (synthesized "ran N tools: …" summary, no critic hit)
+        # gets filtered out below and the matching user prompt sits in
+        # ``_open_sessions`` forever — firing a bogus 90s no-reply hint
+        # even though the AI did reply.
+        notifier.record_pairing(ev)
         if not watch_state.is_visible(ev):
             return
         notifier.set_critic_enabled(watch_state.critic_enabled)

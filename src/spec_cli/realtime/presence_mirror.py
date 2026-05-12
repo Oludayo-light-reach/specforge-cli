@@ -35,6 +35,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .active_edits import ActiveEditsStore
 from .presence import LocalPresence, PeerPresence, PresenceCache
 from .team_editing_brief import write_team_editing_brief
 
@@ -136,7 +137,14 @@ class TeamPresenceMirror:
                     "spec-live: team-presence mirror write failed: %s", e
                 )
                 return False
-            if not write_team_editing_brief(self._bundle_root, body):
+            # Surface the user's own active-edit locks (per-machine,
+            # multi-agent coordination) in the same brief so a hook
+            # parsing `team-editing-brief.md` sees both layers in
+            # one read.
+            active_edits = _read_active_edits(self._bundle_root)
+            if not write_team_editing_brief(
+                self._bundle_root, body, active_edits=active_edits
+            ):
                 log.info("spec-live: team-editing-brief write skipped")
             self._last_payload = equality_key
             return True
@@ -257,6 +265,21 @@ def _render(
         "members": members_block,
         "files_index": files_index,
     }
+
+
+def _read_active_edits(bundle_root: Path) -> list[dict]:
+    """Snapshot the local active-edit locks as plain dicts.
+
+    Used by :class:`TeamPresenceMirror` to inject the per-machine
+    lock layer into the brief render. We catch every exception
+    because the brief render must never be the reason a write fails
+    — better to ship a brief without the section than no brief at all.
+    """
+    try:
+        store = ActiveEditsStore(bundle_root)
+        return [lk.to_json() for lk in store.list()]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _iso(value: datetime) -> str:

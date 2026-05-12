@@ -308,6 +308,76 @@ _BUBBLE_TYPE_ASSISTANT = 2
 # captured `.prompts` files visually consistent across sources.
 _SUMMARY_CHARS: int = 200
 
+# Synthetic summary stamped on Cursor assistant bubbles that have
+# structured activity but no extractable prose (e.g. tool runs Cursor
+# stores in opaque ``toolFormerData`` blobs). The ``ran `` prefix is
+# the watcher-side sentinel for "this is a tool-only assistant turn",
+# matching the synthesized summaries emitted by the watcher itself —
+# the receiver routes both through the same critic-or-suppress filter.
+_CURSOR_TOOL_ONLY_SUMMARY = "ran tools: Cursor agent (details not extracted)"
+
+# Bubble fields that indicate Cursor recorded a real user turn even
+# when ``text`` / ``richText`` are empty. Same idea as the assistant
+# probe below — bias toward emitting a placeholder rather than
+# silently dropping the row.
+_CURSOR_USER_ACTIVITY_KEYS = (
+    "attachments",
+    "imageData",
+    "commands",
+    "mentionData",
+    "fileSelections",
+    "selectionData",
+    "voiceInputData",
+)
+
+
+def _bubble_has_user_activity(bubble: dict[str, Any]) -> bool:
+    """True when a user bubble has structured content but no prose.
+
+    We use an explicit allowlist of known activity-signalling fields
+    instead of "any field beyond bare metadata" — Cursor stores a
+    surprising amount of bookkeeping per bubble (``_v`` schema
+    version, ``revisionId``, etc.) and a denylist would emit
+    placeholders for legitimately empty bubbles.
+    """
+    for key in _CURSOR_USER_ACTIVITY_KEYS:
+        if bubble.get(key):
+            return True
+    return False
+
+
+# Bubble fields that indicate Cursor recorded a real assistant turn
+# even when ``text`` / ``richText`` are empty. Probed in
+# :func:`_bubble_has_assistant_activity`; treated as additive so future
+# Cursor builds adding new fields don't accidentally cause silent drops.
+_CURSOR_ASSISTANT_ACTIVITY_KEYS = (
+    "toolFormerData",
+    "toolCallId",
+    "toolCalls",
+    "toolUse",
+    "capabilities",
+    "responseMetadata",
+    "modelInfo",
+    "completedToolCalls",
+    "intermediateChunks",
+)
+
+
+def _bubble_has_assistant_activity(bubble: dict[str, Any]) -> bool:
+    """True when an assistant bubble has structured non-text activity.
+
+    Allowlist-based for the same reason as the user-side probe: Cursor
+    stores schema versioning and revision metadata on every bubble,
+    and a denylist would flip "empty bubble" into a placeholder turn
+    on every quiet poll. We bias toward *under-emitting* placeholders
+    over the noise of fake assistant turns.
+    """
+    for key in _CURSOR_ASSISTANT_ACTIVITY_KEYS:
+        val = bubble.get(key)
+        if val:  # non-empty dict / list / str / int truthy
+            return True
+    return False
+
 # Default cap on the assistant `text` *preview* when `verbose=True`.
 # Large enough for team review + Spec Live; still below the schema hard
 # cap (`MAX_TURN_TEXT_CHARS = 512 KiB`). The watcher truncates again
@@ -547,7 +617,16 @@ def _build_session(
         if btype == _BUBBLE_TYPE_USER:
             text = _bubble_text(bubble)
             if not text.strip():
-                continue
+                # Pasted content with control characters or Cursor builds
+                # that store the prompt in an unfamiliar field would
+                # otherwise vanish silently. We probe for *any* signal
+                # that a real user turn happened (attachments,
+                # imageData, commands, mention metadata) and emit a
+                # placeholder so the reviewer sees the row.
+                if _bubble_has_user_activity(bubble):
+                    text = "(prompt body not extractable — see Cursor)"
+                else:
+                    continue
             builder.turns.append(Turn(role="user", text=text, at=at))
         elif btype == _BUBBLE_TYPE_ASSISTANT:
             text = _bubble_text(bubble)
@@ -560,11 +639,26 @@ def _build_session(
                     bubble_model = m.strip()[:MAX_TURN_MODEL_CHARS]
             if bubble_model is None and default_model:
                 bubble_model = default_model
-            # If the bubble had no human-readable text and we don't yet
-            # extract Cursor's tool calls (deferred — see module-level
-            # docstring), there's nothing meaningful to record.
+            # Previously: assistant bubbles with no extractable text were
+            # silently dropped — which made Cursor agent runs (Edit / Write
+            # / Bash chains with no narration) invisible in ``spec team
+            # watch``. The team saw the user prompt land and then nothing,
+            # and the no-reply hint fired 90 s later as if the AI had
+            # ghosted.
+            #
+            # Fix: when a bubble has zero prose but Cursor *did* record
+            # structured assistant activity (tool calls, attached
+            # capabilities, response metadata, or just a non-cancelled
+            # bubble with a timestamp), emit a synthetic summary so the
+            # turn is broadcast as a real assistant frame. The exact
+            # tool-call extraction is still deferred — we only need
+            # enough signal here to (a) clear the reviewer's no-reply
+            # tracker and (b) tell them an agent run happened.
             if not summary and not (verbose and text):
-                continue
+                if _bubble_has_assistant_activity(bubble):
+                    summary = _CURSOR_TOOL_ONLY_SUMMARY
+                else:
+                    continue
             preview_text = _preview(text) if (verbose and text) else None
             builder.turns.append(
                 Turn(

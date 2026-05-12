@@ -802,8 +802,9 @@ def team_watch_cmd(
         if not qa.assistant_chunks:
             notifier.show_command_result(
                 "no assistant chunks buffered yet — the model may still be "
-                "working, or `spec watch` is not posting assistant rows to "
-                "Spec Cloud for this bundle.",
+                "working, `spec watch` may not be posting assistant rows for "
+                "this bundle, or assistant `session_id` may not match the "
+                "pending user row.",
                 kind="info",
             )
             return
@@ -887,6 +888,13 @@ def team_watch_cmd(
                 critique_event(ev) if watch_state.critic_enabled else []
             )
             if not critiques:
+                # Default view skips drawing these alone, but silently
+                # dropping them breaks Q/A coalescing: ``pending_user`` is
+                # already set and ``/pair`` would see zero assistant chunks.
+                if use_qa_coalesce and qa.buffer_assistant(ev):
+                    if tick_clock:
+                        last_output_at[0] = time.monotonic()
+                    return
                 return
             force_show_assistant = True
 

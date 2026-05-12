@@ -79,9 +79,9 @@ def test_resolve_assistant_quiet_secs_zero_means_timer_off(monkeypatch) -> None:
     assert _resolve_assistant_quiet_secs(0.0) == 0.0
 
 
-def test_resolve_assistant_quiet_secs_default_zero_without_env(monkeypatch) -> None:
+def test_resolve_assistant_quiet_secs_default_from_constant(monkeypatch) -> None:
     monkeypatch.delenv("SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS", raising=False)
-    assert _resolve_assistant_quiet_secs(None) == 0.0
+    assert _resolve_assistant_quiet_secs(None) == 120.0
 
 
 def test_tick_quiet_flush_skipped_when_quiet_secs_zero(monkeypatch) -> None:

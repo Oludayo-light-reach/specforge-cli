@@ -196,11 +196,34 @@ def test_help_lists_known_commands():
         "focus",
         "mute",
         "replay",
+        "pair",
         "search",
         "critic",
         "status",
     ):
         assert keyword in body
+
+
+def test_pair_without_qa_hook_shows_error():
+    ctx, notifier, _, _ = _ctx()
+    dispatch(parse_command("/pair"), ctx)  # type: ignore[arg-type]
+    notifier.show_command_result.assert_called_once()
+    assert "team watch" in notifier.show_command_result.call_args[0][0].lower()
+
+
+def test_pair_invokes_qa_callback():
+    calls: list[str] = []
+    ctx, notifier, fc, state = _ctx()
+    ctx2 = CommandContext(
+        notifier=notifier,
+        state=state,
+        buffer=ctx.buffer,
+        flag_client=fc,
+        project_for_event=ctx.project_for_event,
+        qa_pair_now=lambda: calls.append("x"),
+    )
+    dispatch(parse_command("/pair"), ctx2)  # type: ignore[arg-type]
+    assert calls == ["x"]
 
 
 # ── /focus + /mute ─────────────────────────────────────────────────

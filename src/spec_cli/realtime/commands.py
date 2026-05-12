@@ -29,6 +29,9 @@ Commands
 * ``/replay <n>{h,m}`` — re-emit the last N minutes from the
   in-memory buffer through the same Notifier, so critic and flag
   rendering still apply.
+* ``/pair`` — flush the buffered user+assistant ``paired reply`` block
+  immediately (``spec team watch`` only; for when idle detection has
+  not fired yet or you use ``--assistant-quiet-secs 0``).
 * ``/critic on|off`` — toggle the auto-critic at runtime.
 * ``/status`` — print who is active and on which source.
 * ``/help`` — list the commands.
@@ -124,6 +127,8 @@ class CommandContext:
     # bundles in the workspace stream. Returns ``None`` when the event
     # id is not known to the dispatcher.
     project_for_event: Callable[[int], int | None] | None = None
+    # ``spec team watch`` only: flush Q/A coalescing buffer on ``/pair``.
+    qa_pair_now: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +232,7 @@ def _cmd_help(_cmd: ParsedCommand, ctx: CommandContext) -> None:
             "  /focus <handle> | /focus off   show events only from this teammate",
             "  /mute <handle> | /unmute <handle>  suppress events from a teammate",
             "  /replay <n>{h,m}               re-emit last window through the notifier",
+            "  /pair                          flush buffered user+assistant paired block now",
             "  /search <term>                 grep the in-memory buffer (handle / file / body)",
             "  /critic on | /critic off       toggle the auto-critic at runtime",
             "  /status                        visibility (/focus, /mutes) + who was active",
@@ -325,6 +331,17 @@ def _cmd_search(cmd: ParsedCommand, ctx: CommandContext) -> None:
             f"  #{ev.id:<6} {when}  {ev.role:<5} {ev.author_display:<22}  {body}"
         )
     ctx.notifier.show_command_result("\n".join(lines), kind="info")
+
+
+def _cmd_pair(_cmd: ParsedCommand, ctx: CommandContext) -> None:
+    """Force-print the coalesced user+assistant block (team watch only)."""
+    if ctx.qa_pair_now is None:
+        ctx.notifier.show_command_result(
+            "/pair only works in `spec team watch` (paired-reply mode).",
+            kind="error",
+        )
+        return
+    ctx.qa_pair_now()
 
 
 def _cmd_focus(cmd: ParsedCommand, ctx: CommandContext) -> None:
@@ -660,6 +677,7 @@ _HANDLERS: dict[str, Callable[[ParsedCommand, CommandContext], None]] = {
     "search": _cmd_search,
     "grep": _cmd_search,
     "find": _cmd_search,
+    "pair": _cmd_pair,
 }
 
 

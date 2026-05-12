@@ -339,20 +339,19 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # in the warm-up batch.
 _TEAM_WATCH_BOOTSTRAP_LIMIT = 250
 
-# Default ``0`` = never flush the paired block on a timer alone; we only
-# flush on the next user message, an ``error`` row, or process exit. That
-# way a single assistant run can pause for hours or days without ever
-# splitting mid-reply — the merged body is always whatever chunks have
-# arrived so far. Set ``--assistant-quiet-secs`` or
-# ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS`` to a positive number if you want
-# an idle timeout (e.g. 1800) so a lone prompt still pairs without a follow-up.
-_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 0.0
+# Default ``120`` = two minutes with no new assistant chunk after at
+# least one chunk arrived; then we print the ``paired reply`` block so a
+# solo thread is not silent forever. There is no perfect "model done"
+# signal on the wire without server help — this is a heuristic. Use ``0``
+# (``--assistant-quiet-secs 0`` or env) to disable idle flush and rely on
+# the next user message, ``error``, ``/pair``, or process exit instead.
+_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 120.0
 
 
 def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
     """CLI wins, then env ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS``, then default.
 
-    ``0`` disables idle-based flush (pair only on next user, error, or exit).
+    ``0`` disables idle-based flush (pair on next user, error, ``/pair``, or exit).
     """
     if cli_value is not None:
         return max(0.0, float(cli_value))
@@ -610,10 +609,9 @@ def _stdin_reader(ctx: "CommandContext", stop_event: threading.Event) -> None:
     default=None,
     help=(
         "Seconds with no new assistant chunk before printing the paired "
-        "Q/A block without another user message. Default 0 (wait only for "
-        "the next user message, error, or exit). Set a positive value or "
-        "SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS (e.g. 1800) for an idle "
-        "timeout so a solo thread still pairs without a follow-up prompt."
+        "Q/A block without another user message. Default 120 (2m) or "
+        "SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS; use 0 to flush only on the "
+        "next user message, error, /pair, or exit."
     ),
 )
 def team_watch_cmd(
@@ -636,13 +634,15 @@ def team_watch_cmd(
     second press forces.
 
     **Q/A coalescing (live SSE only):** each user prompt is printed as
-    soon as it arrives. Assistant chunks merge in memory until a flush
-    boundary: the next user message, an ``error`` row, process exit, or
-    (if ``--assistant-quiet-secs`` / env is positive) that many idle
-    seconds with no new assistant chunk. The paired block always repeats
-    the prompt with the **full merged** assistant body received so far.
-    Default quiet is ``0`` (no idle flush). REST warm-up keeps the old
-    per-event layout.
+    soon as it arrives. Assistant chunks merge until a flush boundary:
+    the next user message, an ``error`` row, ``/pair``, process exit, or
+    (unless ``--assistant-quiet-secs 0``) that many idle seconds after
+    the last assistant chunk. There is no wire-perfect "model finished"
+    detector today — the idle window is a best-effort heuristic; use
+    ``/pair`` when you know the reply is done, or ``0`` to rely only on
+    structure + ``/pair``. The paired block always uses the **full merged**
+    assistant body received so far. REST warm-up keeps the old per-event
+    layout.
 
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
@@ -719,12 +719,36 @@ def team_watch_cmd(
         except Exception:  # noqa: BLE001
             flag_client = None
 
+    def _qa_pair_now() -> None:
+        """Slash ``/pair`` — force the merged user+assistant block."""
+        if qa.pending_user is None:
+            notifier.show_command_result(
+                "nothing pending to pair.",
+                kind="info",
+            )
+            return
+        if not qa.assistant_chunks:
+            notifier.show_command_result(
+                "no assistant chunks buffered yet — the model may still be "
+                "working, or `spec watch` is not posting assistant rows to "
+                "Spec Cloud for this bundle.",
+                kind="info",
+            )
+            return
+        if qa.flush_pair(notifier):
+            last_output_at[0] = time.monotonic()
+            notifier.show_command_result(
+                "paired reply printed (forced).",
+                kind="ok",
+            )
+
     cmd_ctx = CommandContext(
         notifier=notifier,
         state=watch_state,
         buffer=event_buffer,
         flag_client=flag_client,
         project_for_event=event_to_project.get,
+        qa_pair_now=_qa_pair_now,
     )
 
     def _on_connect() -> None:
@@ -735,7 +759,8 @@ def team_watch_cmd(
         if commands_enabled:
             notifier.show_command_result(
                 "interactive commands enabled — type /help for the list. "
-                "Two-stage Ctrl+C still exits.",
+                "Use /pair when the assistant reply looks done but the paired "
+                "block has not printed yet. Two-stage Ctrl+C still exits.",
                 kind="info",
             )
         last_output_at[0] = time.monotonic()

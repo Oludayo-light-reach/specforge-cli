@@ -250,6 +250,20 @@ def test_viewer_handle_skips_no_reply_tracking_for_own_user_prompt(
     assert (pid, "sess-peer") in n._open_sessions
 
 
+def test_review_feed_full_bodies_uses_schema_max_for_user_and_assistant() -> None:
+    from spec_cli.prompts.schema import MAX_TURN_TEXT_CHARS
+    from spec_cli.realtime import notifier as notifier_mod
+
+    n = Notifier(critic_enabled=False, review_feed_full_bodies=True)
+    assert n._user_preview_limit() == MAX_TURN_TEXT_CHARS
+    assert n._assistant_body_limit_chars() == MAX_TURN_TEXT_CHARS
+    assert n._error_preview_limit() == MAX_TURN_TEXT_CHARS
+    compact = Notifier(
+        critic_enabled=False, review_feed_full_bodies=True, compact=True
+    )
+    assert compact._user_preview_limit() == notifier_mod._PREVIEW_USER[1]
+
+
 def test_default_team_watch_strips_code_blocks_from_assistant_body(monkeypatch):
     """``spec team watch`` default render must show the AI's
     narration with embedded code blocks collapsed to a compact

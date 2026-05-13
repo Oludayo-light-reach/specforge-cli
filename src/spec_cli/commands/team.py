@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import signal
 import sys
@@ -369,6 +370,9 @@ def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
 # ``GET /api/projects/{id}/prompt-events?since_id=`` hard cap for one
 # Q/A merge — matches the backend list ceiling order of magnitude.
 _TEAM_WATCH_THREAD_FETCH_LIMIT = 500
+# Shorter than the generic Cloud client default so a wedged API cannot
+# stall the team-watch main loop for half a minute on every merge.
+_TEAM_WATCH_THREAD_FETCH_TIMEOUT_SECS = 20.0
 
 
 def _assistant_tail_from_rest_after_user(
@@ -387,6 +391,7 @@ def _assistant_tail_from_rest_after_user(
             pending.project_id,
             since_id=pending.id,
             limit=_TEAM_WATCH_THREAD_FETCH_LIMIT,
+            timeout=_TEAM_WATCH_THREAD_FETCH_TIMEOUT_SECS,
         )
     except ApiError:
         return []
@@ -794,9 +799,11 @@ def team_watch_cmd(
     """Live SSE tail across every bundle you can see (workspace-wide).
 
     Connects to ``GET /api/me/prompt-stream``. Receive-only — does not
-    require a bundle directory. Reconnects with exponential backoff on
-    transient drops; ``Ctrl+C`` once asks for a graceful exit, a
-    second press forces.
+    require a bundle directory. The SSE reader thread only enqueues
+    frames; the **main thread** runs delivery, Q/A merge, and Cloud
+    catch-up fetches so a slow ``GET /prompt-events`` never blocks the
+    socket. Reconnects with exponential backoff on transient drops;
+    ``Ctrl+C`` once asks for a graceful exit, a second press forces.
 
     **Q/A coalescing (REST warm-up + live SSE):** each user prompt is
     printed as soon as it arrives. Assistant chunks merge until a flush
@@ -811,7 +818,9 @@ def team_watch_cmd(
     The paired block merges **SSE-buffered assistant rows with the
     durable project tail** from ``GET /api/projects/{id}/prompt-events``
     (monotonic ids) so reviewers see the full stored reply even when the
-    live stream missed frames or ``/pair`` ran early. The initial REST
+    live stream missed frames or ``/pair`` ran early. **Non-compact**
+    layout prints user + assistant bodies up to the schema wire cap
+    (``MAX_TURN_TEXT_CHARS``) instead of a 48k preview. The initial REST
     warm-up uses the same merge rules.
 
     Two reviewer aids run automatically and can be disabled if the
@@ -865,6 +874,9 @@ def team_watch_cmd(
         # keeps the raw code blocks (reviewers asking for the latter
         # presumably want the former too).
         strip_code_blocks=not show_tool_runs,
+        # Non-compact: print user + assistant bodies up to the schema
+        # wire cap so reviewers see every stored character Cloud ships.
+        review_feed_full_bodies=not compact,
     )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle
@@ -1067,12 +1079,16 @@ def team_watch_cmd(
         notifier.announce_fatal(str(err))
         stop_event.set()
 
-    def on_event(ev: IncomingEvent) -> None:
-        _deliver(ev, tick_clock=True)
-
     def on_flag(flag: IncomingFlag) -> None:
         notifier.show_flag(flag)
         last_output_at[0] = time.monotonic()
+
+    # SSE consumer only enqueues; the main thread runs ``_deliver`` so
+    # REST merges for Q/A pairing never block the socket reader.
+    incoming: queue.Queue[tuple[IncomingEvent, bool]] = queue.Queue()
+
+    def on_event(ev: IncomingEvent) -> None:
+        incoming.put((ev, True))
 
     consumer_thread = run_consumer_in_thread(
         consumer, on_event, on_fatal, on_flag=on_flag
@@ -1122,11 +1138,16 @@ def team_watch_cmd(
 
     notifier.announce_connecting("live prompt stream…")
 
-    # Main thread surfaces the idle heartbeat so the consumer thread
-    # stays a clean network reader. Tick rate is 1Hz which is well
-    # below any reasonable interval.
     try:
         while consumer_thread.is_alive() and not stop_event.is_set():
+            drained = False
+            while True:
+                try:
+                    ev, tick_clock = incoming.get_nowait()
+                except queue.Empty:
+                    break
+                drained = True
+                _deliver(ev, tick_clock=tick_clock)
             qa.tick_quiet_flush(
                 notifier,
                 last_output_at,
@@ -1141,12 +1162,18 @@ def team_watch_cmd(
                 if idle_for >= heartbeat_interval:
                     notifier.announce_heartbeat()
                     last_output_at[0] = time.monotonic()
-            # Sleep in small slices so Ctrl+C is responsive even when
-            # we are otherwise quiet.
-            stop_event.wait(timeout=1.0)
+            # After a burst, sleep briefly so we do not busy-spin the CPU
+            # while still draining faster than the 1s idle cadence.
+            stop_event.wait(timeout=0.05 if drained else 1.0)
     finally:
         consumer.stop()
         consumer_thread.join(timeout=2.0)
+        while True:
+            try:
+                ev, tick_clock = incoming.get_nowait()
+            except queue.Empty:
+                break
+            _deliver(ev, tick_clock=tick_clock)
         qa.flush_shutdown(notifier)
 
 

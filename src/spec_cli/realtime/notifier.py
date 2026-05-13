@@ -314,6 +314,7 @@ class Notifier:
         viewer_handle: str | None = None,
         show_tool_runs: bool = False,
         strip_code_blocks: bool = True,
+        review_feed_full_bodies: bool = False,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
@@ -355,6 +356,10 @@ class Notifier:
         # When the warm-up window skipped the triggering USER row, we
         # still recover the prompt for ``⤷ prompt`` by scanning back.
         self._pairing_buffer = pairing_buffer
+        # ``spec team watch`` (non-compact): print user + assistant bodies
+        # up to :data:`MAX_TURN_TEXT_CHARS` so reviewers see the full
+        # stored Cloud payload instead of a 48k/12k preview cap.
+        self._review_feed_full_bodies = review_feed_full_bodies
         # Signed-in viewer (``spec team watch`` only). Skip no-reply
         # tracking for your own user prompts — the hint is for teammates.
         self._viewer_handle = (viewer_handle or "").strip().lower() or None
@@ -371,13 +376,30 @@ class Notifier:
         without restarting the watcher."""
         self._critic_enabled = bool(enabled)
 
+    def _user_preview_limit(self) -> int:
+        if self._review_feed_full_bodies and not self._compact:
+            return MAX_TURN_TEXT_CHARS
+        lim_u, lim_uc = _PREVIEW_USER
+        return lim_uc if self._compact else lim_u
+
+    def _error_preview_limit(self) -> int:
+        if self._review_feed_full_bodies and not self._compact:
+            return MAX_TURN_TEXT_CHARS
+        lim_e, lim_ec = _PREVIEW_ERROR
+        return lim_ec if self._compact else lim_e
+
     def _assistant_body_limit_chars(self) -> int:
         """Assistant prose cap before ``…`` truncation in the pane.
 
         ``--show-tool-runs`` implies the reviewer wants the full merged
         body even in ``--compact`` mode, so we use the same generous cap
         as non-compact output instead of the 12k compact ceiling.
+
+        ``review_feed_full_bodies`` (``spec team watch`` non-compact)
+        applies the schema wire cap to every assistant body.
         """
+        if self._review_feed_full_bodies and not self._compact:
+            return MAX_TURN_TEXT_CHARS
         if self._show_tool_runs:
             return MAX_TURN_TEXT_CHARS
         return _PREVIEW_ASSISTANT[1] if self._compact else _PREVIEW_ASSISTANT[0]
@@ -446,8 +468,8 @@ class Notifier:
             preview = (ev.text or ev.summary or "").strip()
             if not preview:
                 continue
-            lim_u, lim_uc = _PREVIEW_USER
-            preview = _truncate(preview, lim_uc if self._compact else lim_u)
+            lim_u = self._user_preview_limit()
+            preview = _truncate(preview, lim_u)
             return (ev.author_display, preview)
         return None
 
@@ -490,8 +512,7 @@ class Notifier:
         pending_prompt: tuple[str, str] | None = None
         if event.role == "user":
             preview = (event.text or event.summary or "").strip()
-            lim_u, lim_uc = _PREVIEW_USER
-            preview = _truncate(preview, lim_uc if self._compact else lim_u)
+            preview = _truncate(preview, self._user_preview_limit())
             # USER badge (mint background) + author handle in the
             # source's accent color. A reviewer scanning a fast pane
             # sees the green block and knows immediately a human just
@@ -515,8 +536,7 @@ class Notifier:
             # Red badge + short message in the header keeps the eye
             # snapping to it even on a busy pane.
             preview = (event.text or event.summary or "").strip()
-            lim_e, lim_ec = _PREVIEW_ERROR
-            preview = _truncate(preview, lim_ec if self._compact else lim_e)
+            preview = _truncate(preview, self._error_preview_limit())
             model = event.model or "agent"
             head = (
                 f"{_ERROR_BADGE} [bold #ff8a98]{model}[/] "
@@ -696,8 +716,7 @@ class Notifier:
             f"{u_bundle}"
         )
         u_preview_raw = (user.text or user.summary or "").strip()
-        lim_u, lim_uc = _PREVIEW_USER
-        u_preview = _truncate(u_preview_raw, lim_uc if self._compact else lim_u)
+        u_preview = _truncate(u_preview_raw, self._user_preview_limit())
         u_ctx = _ctx_line(user)
 
         a_author = assistant.author_display

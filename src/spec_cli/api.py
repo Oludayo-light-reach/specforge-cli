@@ -246,6 +246,7 @@ class CloudClient:
         *,
         since_id: int | None = None,
         limit: int | None = None,
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Read recent prompt events for a project.
 
@@ -259,10 +260,14 @@ class CloudClient:
             params["since_id"] = since_id
         if limit is not None:
             params["limit"] = limit
+        req_kw: dict[str, Any] = {}
+        if timeout is not None:
+            req_kw["timeout"] = timeout
         data = self._request(
             "GET",
             f"/api/projects/{project_id}/prompt-events",
             params=params or None,
+            **req_kw,
         )
         return data or []
 

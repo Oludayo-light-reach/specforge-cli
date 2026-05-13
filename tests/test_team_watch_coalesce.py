@@ -236,6 +236,25 @@ def test_flush_on_assistant_closed_none_closes_id_still_flushes() -> None:
     n.show_completed_pair.assert_called_once()
 
 
+def test_tick_quiet_flush_cloud_only_assistant_without_sse_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle flush runs when Cloud has assistant rows but SSE buffer is empty."""
+    monkeypatch.setattr("time.monotonic", lambda: 500.0)
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    qa.pending_user = _ev(id=1, role="user", text="hi")
+    qa.assistant_chunks = []
+    qa.pending_since_mono = 0.0
+    qa.pair_cloud = MagicMock()
+    monkeypatch.setattr(
+        "spec_cli.commands.team._assistant_tail_from_rest_after_user",
+        lambda _c, _p: [_ev(id=2, role="assistant", text="from cloud only")],
+    )
+    qa.tick_quiet_flush(n, [0.0], quiet_secs=10.0)
+    n.show_completed_pair.assert_called_once()
+
+
 def test_tick_quiet_flush_skipped_when_quiet_secs_zero(monkeypatch) -> None:
     """``quiet_secs=0`` never flushes on idle — only user/error/shutdown."""
     monkeypatch.setattr("time.monotonic", lambda: 1e12)

@@ -416,7 +416,8 @@ class _TeamWatchQAState:
     broadcaster's ``spec watch`` (tail stability), the next user
     message, ``error``, ``/pair``, process exit, or (unless
     ``--assistant-quiet-secs 0``) idle quiet after the last assistant
-    chunk. Assistant rows must match the pending user's ``project_id``
+    chunk (or after the user prompt landed when only Cloud carries
+    assistant rows). Assistant rows must match the pending user's ``project_id``
     and ``session_id`` so a workspace-wide stream cannot attach another
     thread's reply — see :meth:`Notifier.show_completed_pair`.
     """
@@ -425,6 +426,10 @@ class _TeamWatchQAState:
         self.pending_user: IncomingEvent | None = None
         self.assistant_chunks: list[IncomingEvent] = []
         self.last_assistant_mono: float | None = None
+        # ``time.monotonic()`` when :attr:`pending_user` was set — used by
+        # :meth:`tick_quiet_flush` when no SSE assistant chunk ever
+        # arrived but Cloud already has rows (``combined_assistant_chunks``).
+        self.pending_since_mono: float | None = None
         # Optional ``CloudClient`` — when set, :meth:`flush_pair` merges
         # SSE-buffered assistant rows with the durable project tail from
         # REST so ``/pair`` and idle flush see the same text the server
@@ -518,6 +523,7 @@ class _TeamWatchQAState:
         self.assistant_chunks.clear()
         self.pending_user = None
         self.last_assistant_mono = None
+        self.pending_since_mono = None
         return True
 
     def on_user(
@@ -531,6 +537,7 @@ class _TeamWatchQAState:
         self.assistant_chunks.clear()
         self.last_assistant_mono = None
         self.pending_user = ev
+        self.pending_since_mono = time.monotonic()
         notifier.show(ev)
         last_output_at[0] = time.monotonic()
 
@@ -582,13 +589,19 @@ class _TeamWatchQAState:
         # or shutdown so a single turn can run arbitrarily long (hours).
         if quiet_secs <= 0:
             return
-        if (
-            self.pending_user is None
-            or not self.assistant_chunks
-            or self.last_assistant_mono is None
-        ):
+        if self.pending_user is None:
             return
-        if time.monotonic() - self.last_assistant_mono < quiet_secs:
+        if not self.combined_assistant_chunks():
+            return
+        # Anchor idle detection on the last SSE assistant chunk when we
+        # have one; otherwise on the user prompt arrival time so a
+        # Cloud-only tail (missed SSE) still becomes eligible for flush.
+        anchor = self.last_assistant_mono
+        if anchor is None:
+            anchor = self.pending_since_mono
+        if anchor is None:
+            return
+        if time.monotonic() - anchor < quiet_secs:
             return
         if self.flush_pair(notifier):
             last_output_at[0] = time.monotonic()
@@ -600,23 +613,27 @@ class _TeamWatchQAState:
         self.pending_user = None
         self.assistant_chunks.clear()
         self.last_assistant_mono = None
+        self.pending_since_mono = None
 
     def flush_shutdown(self, notifier: Notifier) -> None:
         if self.pending_user is None:
             self.assistant_chunks.clear()
             self.last_assistant_mono = None
+            self.pending_since_mono = None
             return
         combined = self.combined_assistant_chunks()
         if not combined:
             self.pending_user = None
             self.assistant_chunks.clear()
             self.last_assistant_mono = None
+            self.pending_since_mono = None
             return
         merged = self._merge_assistant_chunks(combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.pending_user = None
         self.assistant_chunks.clear()
         self.last_assistant_mono = None
+        self.pending_since_mono = None
 
 
 def _stdin_is_interactive() -> bool:
@@ -787,7 +804,9 @@ def team_watch_cmd(
     ``spec watch`` (when their tail assistant bubble stabilizes), the
     next user message, an ``error`` row, ``/pair``, process exit, or
     (unless ``--assistant-quiet-secs 0``) that many idle seconds after
-    the last assistant chunk. The idle window remains a fallback when the
+    the last SSE assistant chunk — or after the user prompt when only
+    Cloud holds assistant rows the stream missed. The idle window
+    remains a fallback when the
     broadcaster runs an older CLI that does not emit ``assistant_closed``.
     The paired block merges **SSE-buffered assistant rows with the
     durable project tail** from ``GET /api/projects/{id}/prompt-events``

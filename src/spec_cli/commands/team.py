@@ -487,10 +487,9 @@ class _TeamWatchQAState:
             return False
         if self.pending_user is None or not self.assistant_chunks:
             return False
-        if (self.pending_user.project_id, self.pending_user.session_id) != (
-            ev.project_id,
-            ev.session_id,
-        ):
+        # Match :meth:`buffer_assistant` — normalize ``session_id`` so a
+        # stray whitespace mismatch does not strand buffered chunks.
+        if self._session_key(self.pending_user) != self._session_key(ev):
             return False
         key = self._session_key(self.pending_user)
         scoped = [
@@ -869,6 +868,7 @@ def team_watch_cmd(
 
     def _deliver(ev: IncomingEvent, *, tick_clock: bool = True) -> None:
         """Shared path for live SSE frames and the one-shot REST warm."""
+        use_qa_coalesce = tick_clock
         event_buffer.append(ev)
         event_to_project[ev.id] = ev.project_id
         if not include_presence and ev.role == "presence":
@@ -915,8 +915,6 @@ def team_watch_cmd(
                     return
                 return
             force_show_assistant = True
-
-        use_qa_coalesce = tick_clock
 
         # Never render this wire sentinel; flush only on the live SSE path.
         if ev.role == "assistant_closed":

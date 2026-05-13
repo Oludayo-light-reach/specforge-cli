@@ -57,12 +57,13 @@ def test_merge_assistant_chunks_prefers_longest_text_and_latest_meta() -> None:
     assert "full body here" in (merged.text or "")
 
 
-def test_merge_assistant_chunks_tie_length_prefers_higher_id() -> None:
-    """When two bodies tie on length, the newer row wins (streaming snapshot)."""
+def test_merge_assistant_chunks_tie_length_disjoint_keeps_both() -> None:
+    """Equal-length bodies that are not cumulative must not drop the first row."""
     a = _ev(id=10, role="assistant", text="12345")
     b = _ev(id=11, role="assistant", text="abcde")
     merged = _TeamWatchQAState._merge_assistant_chunks([a, b])
-    assert merged.text == "abcde"
+    assert "12345" in (merged.text or "")
+    assert "abcde" in (merged.text or "")
     assert merged.id == 11
 
 
@@ -70,6 +71,16 @@ def test_merge_assistant_chunks_single() -> None:
     a = _ev(id=3, role="assistant", text="only")
     merged = _TeamWatchQAState._merge_assistant_chunks([a])
     assert merged.text == "only"
+
+
+def test_merge_assistant_chunks_joins_disjoint_segments() -> None:
+    """Non-cumulative rows (e.g. separate paragraphs per snapshot) must not be dropped."""
+    a = _ev(id=10, role="assistant", text="First paragraph alpha.")
+    b = _ev(id=11, role="assistant", text="Second paragraph beta.")
+    merged = _TeamWatchQAState._merge_assistant_chunks([a, b])
+    assert "First paragraph alpha" in (merged.text or "")
+    assert "Second paragraph beta" in (merged.text or "")
+    assert "\n\n" in (merged.text or "")
 
 
 def test_merge_assistant_chunks_empty_raises() -> None:

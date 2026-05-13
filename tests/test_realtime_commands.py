@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -48,6 +49,7 @@ def _event(
     source: str = "claude_code",
     bundle_label: str | None = "acme/widgets",
     project_id: int = 1,
+    session_id: str = "s",
     minutes_ago: float = 0.0,
     model: str | None = None,
 ) -> IncomingEvent:
@@ -55,7 +57,7 @@ def _event(
     return IncomingEvent(
         id=eid,
         project_id=project_id,
-        session_id="s",
+        session_id=session_id,
         source=source,
         role=role,
         branch="main",
@@ -77,7 +79,9 @@ def _event(
 
 
 def _ctx(
-    *, buffer_events: list[IncomingEvent] | None = None
+    *,
+    buffer_events: list[IncomingEvent] | None = None,
+    bundle_root: Path | None = None,
 ) -> tuple[CommandContext, MagicMock, MagicMock, WatchState]:
     notifier = MagicMock()
     flag_client = MagicMock()
@@ -93,6 +97,7 @@ def _ctx(
         buffer=buf,
         flag_client=flag_client,
         project_for_event=pid_map.get,
+        bundle_root=bundle_root,
     )
     return ctx, notifier, flag_client, state
 
@@ -126,7 +131,43 @@ def test_parse_command_lowercases_name():
     assert cmd.name == "flag"
 
 
-# ── parse_window ──────────────────────────────────────────────────
+def test_parse_command_push_shorthand():
+    cmd = parse_command("/push@alice please push your WIP")
+    assert cmd is not None
+    assert cmd.name == "push"
+    assert cmd.args[0] == "alice"
+    assert "please" in cmd.args
+
+
+def test_dispatch_push_without_bundle_root_errors():
+    ctx, notifier, _, _ = _ctx()
+    dispatch(parse_command("/push alice"), ctx)
+    assert notifier.show_command_result.called
+    msg = notifier.show_command_result.call_args[0][0]
+    assert "bundle" in msg.lower()
+
+
+def test_dispatch_push_writes_yaml(tmp_path, monkeypatch):
+    from spec_cli.realtime import commands as cmd_mod
+
+    creds = MagicMock()
+    creds.user_handle = "bob"
+    creds.user_name = "Bob"
+    monkeypatch.setattr(cmd_mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr(
+        cmd_mod,
+        "read_git_context",
+        lambda _root: MagicMock(branch="feature/x"),
+    )
+    ctx, notifier, _, _ = _ctx(bundle_root=tmp_path)
+    dispatch(parse_command("/push@alice need your commits"), ctx)
+    yaml_path = tmp_path / ".spec" / "team-push-requests.yaml"
+    assert yaml_path.is_file()
+    text = yaml_path.read_text(encoding="utf-8")
+    assert "alice" in text
+    assert "bob" in text
+    assert notifier.show_command_result.called
+    assert notifier.show_command_result.call_args[1].get("kind") == "ok"
 
 
 @pytest.mark.parametrize(
@@ -191,15 +232,21 @@ def test_help_lists_known_commands():
     notifier.show_command_result.assert_called_once()
     body = notifier.show_command_result.call_args[0][0]
     for keyword in (
+        "aliases",
         "summarize",
         "flag",
         "focus",
         "mute",
         "replay",
         "pair",
+        "turn",
+        "full",
         "search",
         "critic",
         "status",
+        "help",
+        "glyphs",
+        "pager",
     ):
         assert keyword in body
 
@@ -596,6 +643,149 @@ def test_search_alias_grep_is_wired():
     dispatch(parse_command("/grep refactor"), ctx)  # type: ignore[arg-type]
     body = notifier.show_command_result.call_args[0][0]
     assert "#7" in body
+
+
+def _prompt_event_row(
+    eid: int,
+    role: str,
+    *,
+    session_id: str,
+    project_id: int = 1,
+    text: str | None = "body",
+    summary: str | None = None,
+) -> dict:
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "id": eid,
+        "project_id": project_id,
+        "session_id": session_id,
+        "source": "cursor",
+        "role": role,
+        "branch": "main",
+        "commit_sha": None,
+        "model": "default" if role == "assistant" else None,
+        "summary": summary,
+        "text": text,
+        "title": None,
+        "cwd": None,
+        "paths_touched": [],
+        "turn_at": ts,
+        "received_at": ts,
+        "author": {"user_id": 1, "handle": "jon", "name": "Jon"},
+    }
+
+
+def test_turn_without_cloud_shows_error():
+    ctx, notifier, _, _ = _ctx()
+    dispatch(parse_command("/turn"), ctx)  # type: ignore[arg-type]
+    notifier.show_command_result.assert_called_once()
+    assert "cloud" in notifier.show_command_result.call_args[0][0].lower()
+
+
+def test_turn_ambiguous_prefix_does_not_hit_cloud():
+    cloud = MagicMock()
+    e1 = _event(1, role="user", session_id="abcd111")
+    e2 = _event(2, role="user", session_id="abcd222")
+    ctx, notifier, _, state = _ctx(buffer_events=[e1, e2])
+    ctx2 = CommandContext(
+        notifier=notifier,
+        state=state,
+        buffer=ctx.buffer,
+        cloud_client=cloud,
+        project_for_event=ctx.project_for_event,
+    )
+    dispatch(parse_command("/turn abcd"), ctx2)  # type: ignore[arg-type]
+    assert "matches" in notifier.show_command_result.call_args[0][0]
+    cloud.list_prompt_events.assert_not_called()
+
+
+def test_turn_merges_last_assistant_chunks_from_cloud(monkeypatch):
+    monkeypatch.setenv("SPEC_TEAM_WATCH_PAGER", "cat")
+    cloud = MagicMock()
+    sid = "sess123456789"
+    cloud.list_prompt_events.return_value = [
+        _prompt_event_row(1, "user", text="q1", session_id=sid),
+        _prompt_event_row(2, "assistant", text="a1 short", session_id=sid),
+        _prompt_event_row(3, "user", text="q2", session_id=sid),
+        _prompt_event_row(4, "assistant", text="part", session_id=sid),
+        _prompt_event_row(5, "assistant", text="part two longer", session_id=sid),
+    ]
+    buf_ev = _event(99, role="user", session_id=sid)
+    ctx, notifier, _, state = _ctx(buffer_events=[buf_ev])
+    ctx2 = CommandContext(
+        notifier=notifier,
+        state=state,
+        buffer=ctx.buffer,
+        cloud_client=cloud,
+        project_for_event=ctx.project_for_event,
+    )
+    dispatch(parse_command("/turn sess"), ctx2)  # type: ignore[arg-type]
+    cloud.list_prompt_events.assert_called_once_with(
+        1,
+        since_id=0,
+        limit=1000,
+        session_id=sid,
+        timeout=25.0,
+    )
+    notifier.show_in_system_pager.assert_called_once()
+    call_kw = notifier.show_in_system_pager.call_args
+    assert "q2" in call_kw[0][0]
+    assert "part two longer" in call_kw[0][0]
+    assert "q1" not in call_kw[0][0]
+
+
+def test_turn_uses_last_digest_when_no_arg(monkeypatch):
+    monkeypatch.setenv("SPEC_TEAM_WATCH_PAGER", "cat")
+    cloud = MagicMock()
+    sid = "xyz999888777"
+    cloud.list_prompt_events.return_value = [
+        _prompt_event_row(1, "user", text="via digest", session_id=sid),
+        _prompt_event_row(2, "assistant", text="reply", session_id=sid),
+    ]
+    notifier = MagicMock()
+    notifier.last_turn_digest.return_value = (sid, 1, 1, 2)
+    ctx = CommandContext(
+        notifier=notifier,
+        state=WatchState(),
+        buffer=make_buffer(),
+        cloud_client=cloud,
+    )
+    dispatch(parse_command("/turn"), ctx)  # type: ignore[arg-type]
+    cloud.list_prompt_events.assert_called_once_with(
+        1,
+        since_id=0,
+        limit=1000,
+        session_id=sid,
+        timeout=25.0,
+    )
+    notifier.show_in_system_pager.assert_called_once()
+    body = notifier.show_in_system_pager.call_args[0][0]
+    assert "via digest" in body and "reply" in body
+
+
+def test_full_prints_multiple_turns_from_cloud(monkeypatch):
+    monkeypatch.setenv("SPEC_TEAM_WATCH_PAGER", "cat")
+    cloud = MagicMock()
+    sid = "onefull999000"
+    cloud.list_prompt_events.return_value = [
+        _prompt_event_row(1, "user", text="a", session_id=sid),
+        _prompt_event_row(2, "assistant", text="A", session_id=sid),
+        _prompt_event_row(3, "user", text="b", session_id=sid),
+        _prompt_event_row(4, "assistant", text="B", session_id=sid),
+    ]
+    notifier = MagicMock()
+    notifier.last_turn_digest.return_value = (sid, 1, 3, 4)
+    ctx = CommandContext(
+        notifier=notifier,
+        state=WatchState(),
+        buffer=make_buffer(),
+        cloud_client=cloud,
+    )
+    dispatch(parse_command("/full"), ctx)  # type: ignore[arg-type]
+    notifier.show_in_system_pager.assert_called_once()
+    body = notifier.show_in_system_pager.call_args[0][0]
+    assert "turn 1" in body and "turn 2" in body
+    assert "a" in body and "b" in body
 
 
 # ── make_buffer ───────────────────────────────────────────────────

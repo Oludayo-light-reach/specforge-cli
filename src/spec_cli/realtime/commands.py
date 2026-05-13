@@ -32,9 +32,21 @@ Commands
 * ``/pair`` — flush the buffered user+assistant ``paired reply`` block
   immediately (``spec team watch`` only; for when idle detection has
   not fired yet or you use ``--assistant-quiet-secs 0``).
+* ``/turn [<session-chip>]`` — **Latest turn only:** after loading the full
+  session from Cloud (paginated ``session_id`` + ``since_id``), print the
+  last user row and the merged assistant reply for that prompt only.
+* ``/full [<session-chip>]`` — **Entire session:** same Cloud fetch, but print
+  **every** user→assistant turn in order (still subject to a 50k-row fetch cap
+  and ``~180k`` terminal print cap).
 * ``/critic on|off`` — toggle the auto-critic at runtime.
-* ``/status`` — print who is active and on which source.
-* ``/help`` — list the commands.
+* ``/status`` (``/who``) — print who is active and on which source.
+* ``/push <handle> [message…]`` / ``/push@handle [message…]`` — from a
+  bundle cwd, append a git-push handoff row to
+  ``.spec/team-push-requests.yaml`` (merged into ``team-presence.json`` /
+  ``team-editing-brief.md`` by ``spec watch``).
+* ``/help`` (``/h``, ``/?``) — list the commands.
+
+**Aliases:** ``/summary`` → ``/summarize``; ``/grep``, ``/find`` → ``/search``.
 
 The buffer is a bounded ``deque`` and lives in
 :class:`CommandContext.buffer`; the live watcher appends to it on
@@ -47,9 +59,16 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Deque, Protocol
+from pathlib import Path
+from typing import Any, Callable, Deque, Protocol
 
+from ..api import ApiError
+from ..config import load_credentials
+from ..git import read_git_context
 from .events import IncomingEvent
+from .merge_turns import merge_assistant_snapshots
+from .notifier import Notifier, _format_tool_call_line
+from .team_push_requests import record_push_request
 
 
 # Bounded event memory for /summarize / /replay / /status. 500 events
@@ -113,6 +132,12 @@ class _NotifierProtocol(Protocol):
         self, body: str, *, kind: str = "info"
     ) -> None: ...
 
+    def show_in_system_pager(self, body: str, *, banner: str) -> None: ...
+
+    def last_turn_digest(
+        self,
+    ) -> tuple[str, int, int, int] | None: ...
+
 
 @dataclass
 class CommandContext:
@@ -129,9 +154,14 @@ class CommandContext:
     project_for_event: Callable[[int], int | None] | None = None
     # ``spec team watch`` only: flush Q/A coalescing buffer on ``/pair``.
     qa_pair_now: Callable[[], None] | None = None
-    # ``spec team watch`` only: one-line digest of verbose / compact /
-    # ``--show-tool-runs`` for ``/status`` and debugging.
+    # ``spec team watch`` only: same CloudClient used for /flag — also
+    # powers ``/turn`` and ``/full`` thread expansion from storage.
+    cloud_client: Any | None = None
+    # ``spec team watch`` only: one-line digest of SSE / layout for ``/status``.
     team_watch_receiver_brief: str | None = None
+    # When set (cwd is inside a bundle), ``/push`` / ``/push@…`` can write
+    # ``.spec/team-push-requests.yaml``.
+    bundle_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +200,11 @@ def parse_command(line: str) -> ParsedCommand | None:
     parts = body.split(None, 1)
     name = parts[0].lower()
     rest = parts[1] if len(parts) > 1 else ""
+    # ``/push@alice …`` → same as ``/push alice …`` (team handoff ping).
+    if name.startswith("push@"):
+        target = name[5:].lstrip("@").lower()
+        name = "push"
+        rest = f"{target} {rest}".strip() if target else rest.strip()
     # Most commands take whitespace-separated args except /flag and
     # /summarize-like commands that have a free-form note tail. We
     # keep the args simple here and let the handler decide how to
@@ -230,16 +265,28 @@ def _cmd_help(_cmd: ParsedCommand, ctx: CommandContext) -> None:
     body = "\n".join(
         [
             "available commands:",
+            "  aliases: /h /? = /help   /summary = /summarize   "
+            "/grep /find = /search   /who = /status",
             "  /summarize <n>{h,m}            dump last window for the agent to synthesise",
             "  /flag <event_id> <kind> [note] post a flag (kinds: warning, question, block, ack)",
             "  /focus <handle> | /focus off   show events only from this teammate",
             "  /mute <handle> | /unmute <handle>  suppress events from a teammate",
             "  /replay <n>{h,m}               re-emit last window through the notifier",
             "  /pair                          flush buffered user+assistant paired block now",
+            "  /turn [<session-chip>]         last user + merged AI reply in",
+            "                                 system pager (q = back to live);",
+            "                                 no arg = last ● turn; 50k row cap",
+            "  /full [<session-chip>]         full session in pager (q = live);",
+            "                                 print cap ~180k chars",
             "  /search <term>                 grep the in-memory buffer (handle / file / body)",
             "  /critic on | /critic off       toggle the auto-critic at runtime",
             "  /status                        visibility (/focus, /mutes) + who was active",
+            "  /push <handle> [message…]        from bundle cwd: request @handle git-push",
+            "  /push@handle [message…]        same (shorthand)",
             "  /help                          this list",
+            "",
+            "  output glyphs: · info   ✓ ok   ✗ error   ≡ large blocks (/summarize /turn /full)",
+            "  full reference: spec-cli/docs/team-watch-slash-commands.md",
         ]
     )
     ctx.notifier.show_command_result(body, kind="info")
@@ -336,6 +383,56 @@ def _cmd_search(cmd: ParsedCommand, ctx: CommandContext) -> None:
     ctx.notifier.show_command_result("\n".join(lines), kind="info")
 
 
+def _cmd_push_request(cmd: ParsedCommand, ctx: CommandContext) -> None:
+    """Record a teammate push handoff in ``.spec/team-push-requests.yaml``."""
+    if ctx.bundle_root is None:
+        ctx.notifier.show_command_result(
+            "/push needs a Spec bundle as cwd — `cd` to the bundle root first "
+            "(workspace-wide `spec team watch` has no single `.spec/` to write).",
+            kind="error",
+        )
+        return
+    if not cmd.args:
+        ctx.notifier.show_command_result(
+            "usage: /push@handle [optional message]  or  /push handle [message]",
+            kind="error",
+        )
+        return
+    target = cmd.args[0].lstrip("@").lower()
+    note = " ".join(cmd.args[1:]).strip() or None
+    creds = load_credentials()
+    fh = (creds.user_handle or "").strip().lstrip("@").lower() if creds else None
+    disp: str | None = None
+    if creds:
+        if creds.user_handle:
+            disp = f"@{creds.user_handle.lstrip('@')}"
+        if creds.user_name:
+            disp = f"{creds.user_name} ({disp})" if disp else creds.user_name
+    git = read_git_context(ctx.bundle_root)
+    branch = git.branch
+    try:
+        path = record_push_request(
+            ctx.bundle_root,
+            to_handle=target,
+            from_handle=fh or None,
+            from_display=disp,
+            branch=branch,
+            message=note,
+        )
+    except ValueError as e:
+        ctx.notifier.show_command_result(str(e), kind="error")
+        return
+    except OSError as e:
+        ctx.notifier.show_command_result(f"write failed: {e}", kind="error")
+        return
+    ctx.notifier.show_command_result(
+        f"push handoff recorded for @{target} → {path}\n"
+        "(merged into team-presence / editing-brief on the next `spec watch` tick, "
+        "≤30s if the daemon is running.)",
+        kind="ok",
+    )
+
+
 def _cmd_pair(_cmd: ParsedCommand, ctx: CommandContext) -> None:
     """Force-print the coalesced user+assistant block (team watch only)."""
     if ctx.qa_pair_now is None:
@@ -345,6 +442,319 @@ def _cmd_pair(_cmd: ParsedCommand, ctx: CommandContext) -> None:
         )
         return
     ctx.qa_pair_now()
+
+
+# Page size for ``GET /prompt-events`` — must stay within server
+# ``PROMPT_EVENT_LIST_LIMIT_MAX`` (1000). ``/full`` pages with
+# ``since_id`` + ``session_id`` until the session is exhausted.
+_THREAD_PAGE_SIZE = 1000
+_THREAD_FETCH_TIMEOUT = 25.0
+# Hard cap on rows pulled for one ``/full`` / ``/turn`` (abuse / memory).
+_THREAD_MAX_SESSION_ROWS = 50_000
+# Hard cap on printed characters so a huge session cannot stall Rich.
+_THREAD_PRINT_MAX_CHARS = 180_000
+
+
+def _session_matches_prefix(prefix: str, session_id: str) -> bool:
+    ps = prefix.strip()
+    sid = (session_id or "").strip()
+    if not ps or not sid:
+        return False
+    return sid == ps or sid.startswith(ps)
+
+
+def _resolve_session_for_thread(
+    ctx: CommandContext,
+    prefix: str | None,
+) -> tuple[int, str] | None:
+    raw = (prefix or "").strip()
+    if not raw:
+        try:
+            d = ctx.notifier.last_turn_digest()
+        except Exception:  # noqa: BLE001
+            d = None
+        if (
+            isinstance(d, tuple)
+            and len(d) == 4
+            and isinstance(d[0], str)
+            and d[0].strip()
+            and isinstance(d[1], int)
+        ):
+            sid, pid, _, _ = d
+            return (pid, sid.strip())
+        return None
+    candidates: set[tuple[int, str]] = set()
+    for ev in ctx.buffer:
+        if ev.role not in ("user", "assistant", "error"):
+            continue
+        sid = (ev.session_id or "").strip()
+        if not _session_matches_prefix(raw, sid):
+            continue
+        candidates.add((ev.project_id, sid))
+    if len(candidates) > 1:
+        ctx.notifier.show_command_result(
+            f"`{raw}` matches {len(candidates)} different sessions in the "
+            "buffer — type a longer chip.",
+            kind="error",
+        )
+        return None
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return None
+
+
+def _fetch_entire_session_events(
+    client: Any,
+    project_id: int,
+    session_id: str,
+) -> tuple[list[IncomingEvent], bool]:
+    """All user/assistant/error rows for ``session_id``, ascending by ``id``.
+
+    Pages with ``since_id`` + optional ``session_id`` (Cloud >= this release).
+    Rows are always filtered to ``session_id`` client-side so older servers
+    that ignore the query param still return correct data (at the cost of
+    more round-trips on busy projects).
+
+    Returns ``(events, truncated)`` where ``truncated`` is True when the
+    hard row cap was hit mid-session.
+    """
+    target = (session_id or "").strip()
+    if not target:
+        return [], False
+    out: list[IncomingEvent] = []
+    since = 0
+    truncated = False
+    while len(out) < _THREAD_MAX_SESSION_ROWS:
+        rows = client.list_prompt_events(
+            project_id,
+            since_id=since,
+            limit=_THREAD_PAGE_SIZE,
+            session_id=target,
+            timeout=_THREAD_FETCH_TIMEOUT,
+        )
+        if not rows:
+            break
+        raw_ids: list[int] = []
+        for r in rows:
+            if not isinstance(r, dict) or r.get("id") is None:
+                continue
+            try:
+                raw_ids.append(int(r["id"]))
+            except (TypeError, ValueError):
+                continue
+        if not raw_ids:
+            break
+        batch: list[IncomingEvent] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                ev = IncomingEvent.from_json(r)
+            except Exception:  # noqa: BLE001
+                continue
+            if (ev.session_id or "").strip() != target:
+                continue
+            if ev.role not in ("user", "assistant", "error"):
+                continue
+            batch.append(ev)
+        out.extend(batch)
+        if len(out) >= _THREAD_MAX_SESSION_ROWS:
+            truncated = True
+            del out[_THREAD_MAX_SESSION_ROWS:]
+            break
+        page_max = max(raw_ids)
+        if len(rows) < _THREAD_PAGE_SIZE:
+            break
+        since = page_max
+    out.sort(key=lambda e: e.id)
+    return out, truncated
+
+
+def _iter_user_assistant_turns(
+    evs: list[IncomingEvent],
+) -> list[tuple[IncomingEvent, list[IncomingEvent]]]:
+    turns: list[tuple[IncomingEvent, list[IncomingEvent]]] = []
+    cur_u: IncomingEvent | None = None
+    cur_a: list[IncomingEvent] = []
+    for ev in evs:
+        if ev.role == "user":
+            if cur_u is not None:
+                turns.append((cur_u, cur_a))
+            cur_u = ev
+            cur_a = []
+        elif ev.role == "assistant" and cur_u is not None:
+            cur_a.append(ev)
+    if cur_u is not None:
+        turns.append((cur_u, cur_a))
+    return turns
+
+
+def _format_merged_turn(
+    label: str,
+    user: IncomingEvent,
+    merged: IncomingEvent,
+) -> str:
+    chip = (user.session_id or "").strip()[:8] or "?"
+    ubody = (user.text or user.summary or "").strip()
+    abody = Notifier._assistant_visible_prose(
+        merged.text, merged.summary
+    ).strip()
+    lines = [
+        f"── {label} · session {chip}… · #{user.id} → #{merged.id} ──",
+        "",
+        "USER",
+        ubody,
+        "",
+        "ASSISTANT",
+        abody,
+    ]
+    if merged.tool_calls:
+        lines.extend(
+            [
+                "",
+                f"TOOL RUNS ({len(merged.tool_calls)})",
+            ]
+        )
+        shown = merged.tool_calls[:50]
+        for tc in shown:
+            lines.append(f"  · {_format_tool_call_line(tc)}")
+        extra = len(merged.tool_calls) - len(shown)
+        if extra > 0:
+            lines.append(f"  · …+{extra} more tools")
+    return "\n".join(lines)
+
+
+def _cmd_turn(cmd: ParsedCommand, ctx: CommandContext) -> None:
+    if ctx.cloud_client is None:
+        ctx.notifier.show_command_result(
+            "/turn needs `spec team watch` with cloud commands enabled "
+            "(signed in).",
+            kind="error",
+        )
+        return
+    prefix = " ".join(cmd.args).strip() if cmd.args else ""
+    resolved = _resolve_session_for_thread(ctx, prefix or None)
+    if resolved is None:
+        if prefix:
+            ctx.notifier.show_command_result(
+                f"no session in the buffer matches `{prefix}` — check the "
+                "session chip, or wait until that session appears.",
+                kind="error",
+            )
+        else:
+            ctx.notifier.show_command_result(
+                "no session — pass a chip from the buffer "
+                "(e.g. `/turn a6c8b1`) or complete a digest turn first "
+                "(● turn complete).",
+                kind="error",
+            )
+        return
+    pid, sid = resolved
+    try:
+        evs, truncated = _fetch_entire_session_events(ctx.cloud_client, pid, sid)
+    except ApiError as e:
+        ctx.notifier.show_command_result(f"/turn fetch failed: {e}", kind="error")
+        return
+    except Exception as e:  # noqa: BLE001
+        ctx.notifier.show_command_result(f"/turn fetch failed: {e}", kind="error")
+        return
+    if truncated:
+        ctx.notifier.show_command_result(
+            f"session `{sid[:8]}…` hit the {_THREAD_MAX_SESSION_ROWS:,}-row "
+            "fetch cap — `/turn` may be incomplete.",
+            kind="error",
+        )
+        return
+    turns = _iter_user_assistant_turns(evs)
+    if not turns:
+        ctx.notifier.show_command_result(
+            f"no user rows for session `{sid[:8]}…` in Cloud storage.",
+            kind="info",
+        )
+        return
+    user, chunks = turns[-1]
+    if not chunks:
+        ctx.notifier.show_command_result(
+            f"no assistant rows after the latest user prompt "
+            f"(#{user.id}) — the model may still be streaming.",
+            kind="info",
+        )
+        return
+    merged = merge_assistant_snapshots(chunks)
+    body = _format_merged_turn("/turn", user, merged)
+    chip = (user.session_id or "").strip()[:8] or (sid[:8] if sid else "?")
+    ctx.notifier.show_in_system_pager(body, banner=f"/turn · session {chip}…")
+
+
+def _cmd_full(cmd: ParsedCommand, ctx: CommandContext) -> None:
+    if ctx.cloud_client is None:
+        ctx.notifier.show_command_result(
+            "/full needs `spec team watch` with cloud commands enabled "
+            "(signed in).",
+            kind="error",
+        )
+        return
+    prefix = " ".join(cmd.args).strip() if cmd.args else ""
+    resolved = _resolve_session_for_thread(ctx, prefix or None)
+    if resolved is None:
+        if prefix:
+            ctx.notifier.show_command_result(
+                f"no session in the buffer matches `{prefix}` — check the "
+                "session chip, or wait until that session appears.",
+                kind="error",
+            )
+        else:
+            ctx.notifier.show_command_result(
+                "no session — pass a chip from the buffer "
+                "(e.g. `/full a6c8b1`) or complete a digest turn first "
+                "(● turn complete).",
+                kind="error",
+            )
+        return
+    pid, sid = resolved
+    try:
+        evs, truncated = _fetch_entire_session_events(ctx.cloud_client, pid, sid)
+    except ApiError as e:
+        ctx.notifier.show_command_result(f"/full fetch failed: {e}", kind="error")
+        return
+    except Exception as e:  # noqa: BLE001
+        ctx.notifier.show_command_result(f"/full fetch failed: {e}", kind="error")
+        return
+    turns = _iter_user_assistant_turns(evs)
+    if not turns:
+        ctx.notifier.show_command_result(
+            f"no user rows for session `{sid[:8]}…` in Cloud storage.",
+            kind="info",
+        )
+        return
+    blocks: list[str] = []
+    if truncated:
+        blocks.append(
+            f"[note] session fetch stopped at {_THREAD_MAX_SESSION_ROWS:,} rows "
+            "— older turns may be missing.\n"
+        )
+    for idx, (user, chunks) in enumerate(turns, start=1):
+        if not chunks:
+            chip = (user.session_id or "").strip()[:8] or "?"
+            blocks.append(
+                f"── turn {idx} · session {chip}… · #{user.id} "
+                f"(no assistant rows in window) ──\n\n"
+                f"USER\n{(user.text or user.summary or '').strip()}"
+            )
+            continue
+        merged = merge_assistant_snapshots(chunks)
+        blocks.append(_format_merged_turn(f"/full · turn {idx}", user, merged))
+    body = "\n\n".join(blocks)
+    if len(body) > _THREAD_PRINT_MAX_CHARS:
+        body = (
+            body[:_THREAD_PRINT_MAX_CHARS]
+            + "\n\n… [truncated — narrow the window or inspect Cloud export]\n"
+        )
+    chip = sid[:8] if sid else "?"
+    ctx.notifier.show_in_system_pager(
+        body,
+        banner=f"/full · session {chip}… · {len(turns)} turn(s)",
+    )
 
 
 def _cmd_focus(cmd: ParsedCommand, ctx: CommandContext) -> None:
@@ -684,6 +1094,9 @@ _HANDLERS: dict[str, Callable[[ParsedCommand, CommandContext], None]] = {
     "grep": _cmd_search,
     "find": _cmd_search,
     "pair": _cmd_pair,
+    "turn": _cmd_turn,
+    "full": _cmd_full,
+    "push": _cmd_push_request,
 }
 
 

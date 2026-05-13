@@ -23,6 +23,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shlex
+import shutil
+import subprocess
 from collections import deque
 import threading
 from datetime import datetime, timedelta, timezone
@@ -281,6 +284,23 @@ _NO_REPLY_AGE_SECS = 90.0
 _OPEN_SESSIONS_MAX = 256
 
 
+def _resolve_system_pager_argv() -> list[str] | None:
+    """Argv for ``subprocess.run`` to page plain text, or ``None`` to inline."""
+    raw = (os.environ.get("SPEC_TEAM_WATCH_PAGER") or "").strip()
+    if raw:
+        return shlex.split(raw)
+    pg = (os.environ.get("PAGER") or "").strip()
+    if pg:
+        return shlex.split(pg)
+    less = shutil.which("less")
+    if less:
+        return [less, "-R", "-X", "+1"]
+    more = shutil.which("more")
+    if more:
+        return [more]
+    return None
+
+
 class Notifier:
     """Thread-safe printer for incoming Spec Live events.
 
@@ -315,6 +335,7 @@ class Notifier:
         show_tool_runs: bool = False,
         strip_code_blocks: bool = True,
         review_feed_full_bodies: bool = False,
+        assistant_live_cap: int | None = None,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
@@ -356,10 +377,17 @@ class Notifier:
         # When the warm-up window skipped the triggering USER row, we
         # still recover the prompt for ``⤷ prompt`` by scanning back.
         self._pairing_buffer = pairing_buffer
-        # ``spec team watch`` (non-compact): print user + assistant bodies
-        # up to :data:`MAX_TURN_TEXT_CHARS` so reviewers see the full
-        # stored Cloud payload instead of a 48k/12k preview cap.
+        # ``spec team watch`` (non-compact): widen user / error preview
+        # toward the schema wire cap. Assistant prose uses
+        # :attr:`_assistant_live_cap` when set (digest mode) so the live
+        # pane stays scannable; ``/turn`` / ``/full`` print the stored body.
         self._review_feed_full_bodies = review_feed_full_bodies
+        # When set (e.g. 400), assistant ``show`` / ``show_completed_pair``
+        # prose is capped after merging ``text`` + ``summary`` sensibly.
+        # ``None`` means use :meth:`_assistant_body_limit_chars` rules.
+        self._assistant_live_cap = assistant_live_cap
+        # Latest completed pair for ``/turn`` with no args (digest mode).
+        self._last_turn_digest: tuple[str, int, int, int] | None = None
         # Signed-in viewer (``spec team watch`` only). Skip no-reply
         # tracking for your own user prompts — the hint is for teammates.
         self._viewer_handle = (viewer_handle or "").strip().lower() or None
@@ -369,6 +397,35 @@ class Notifier:
         self._recent_completed_pairs: deque[
             tuple[IncomingEvent, IncomingEvent]
         ] = deque(maxlen=50)
+        # ``/turn`` / ``/full``: while a system pager (``less``) owns the
+        # screen, suppress live stream prints so output does not interleave.
+        self._live_suppress = False
+        self._skipped_while_suppressed = 0
+
+    @staticmethod
+    def _assistant_visible_prose(text: str | None, summary: str | None) -> str:
+        """Prefer stored ``text``; fold in ``summary`` when it adds context.
+
+        Cursor and other adapters often ship a short headline in
+        ``summary`` and the long reply in ``text`` — but some rows only
+        carry one field. Avoid showing *only* the headline when the body
+        exists on the wire.
+        """
+        t = (text or "").strip()
+        s = (summary or "").strip()
+        if not t:
+            return s
+        if not s:
+            return t
+        if s in t:
+            return t
+        if len(s) <= 400 and not t.startswith(s[: min(len(s), 120)]):
+            return f"{s}\n\n{t}"
+        return t
+
+    def last_turn_digest(self) -> tuple[str, int, int, int] | None:
+        """``(session_id, project_id, user_event_id, assistant_event_id)``."""
+        return self._last_turn_digest
 
     def set_critic_enabled(self, enabled: bool) -> None:
         """Toggle the auto-critic at runtime. Used by the ``/critic``
@@ -391,16 +448,15 @@ class Notifier:
     def _assistant_body_limit_chars(self) -> int:
         """Assistant prose cap before ``…`` truncation in the pane.
 
-        ``--show-tool-runs`` implies the reviewer wants the full merged
-        body even in ``--compact`` mode, so we use the same generous cap
-        as non-compact output instead of the 12k compact ceiling.
-
-        ``review_feed_full_bodies`` (``spec team watch`` non-compact)
-        applies the schema wire cap to every assistant body.
+        Digest mode (``spec team watch`` without ``--show-tool-runs``)
+        sets :attr:`_assistant_live_cap` (~400 chars). ``--show-tool-runs``
+        keeps the schema wire cap so reviewers see full prose + tools.
         """
-        if self._review_feed_full_bodies and not self._compact:
-            return MAX_TURN_TEXT_CHARS
+        if self._assistant_live_cap is not None:
+            return int(self._assistant_live_cap)
         if self._show_tool_runs:
+            return MAX_TURN_TEXT_CHARS
+        if self._review_feed_full_bodies and not self._compact:
             return MAX_TURN_TEXT_CHARS
         return _PREVIEW_ASSISTANT[1] if self._compact else _PREVIEW_ASSISTANT[0]
 
@@ -560,7 +616,8 @@ class Notifier:
         else:
             # Prefer full ``text`` over ``summary`` — both are usually set
             # for assistant turns, and the summary is only a headline.
-            preview = (event.text or event.summary or "").strip()
+            raw = self._assistant_visible_prose(event.text, event.summary)
+            preview = raw.strip()
             # By default, fenced code blocks collapse to a compact
             # ``[code: lang ~N lines]`` placeholder. The user pulls the
             # raw body back via ``--show-tool-runs`` or by setting
@@ -592,6 +649,9 @@ class Notifier:
                 pending_prompt = self._pairing_prompt_from_buffer(event)
 
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             if self._compact:
                 # Compact mode lives on one line — context chips ride
                 # at the end so the row still parses even when piped
@@ -736,7 +796,9 @@ class Notifier:
             f"[sf.muted]· {a_branch} · {a_time}[/]"
             f"{a_bundle}"
         )
-        a_preview = (assistant.text or assistant.summary or "").strip()
+        a_preview = self._assistant_visible_prose(
+            assistant.text, assistant.summary
+        ).strip()
         if a_preview and self._strip_code_blocks and not self._show_tool_runs:
             a_preview = _strip_code_blocks(a_preview)
         a_preview = _truncate(a_preview, self._assistant_body_limit_chars())
@@ -748,6 +810,9 @@ class Notifier:
             a_critiques = critique_event(assistant)
 
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print()
             console.print(
                 f"  [sf.muted]· paired reply ·[/] "
@@ -771,6 +836,20 @@ class Notifier:
                 if self._show_tool_runs and assistant.tool_calls:
                     self._render_tool_calls(assistant.tool_calls)
                 self._render_critiques(assistant, a_critiques)
+                if self._assistant_live_cap is not None:
+                    sid = (user.session_id or "").strip()
+                    chip = _short_session(sid) or (sid[:8] if sid else "?")
+                    self._last_turn_digest = (
+                        sid,
+                        user.project_id,
+                        user.id,
+                        assistant.id,
+                    )
+                    console.print(
+                        f"  [bold #9ee37d]● turn complete[/]  "
+                        f"[sf.label]/turn {chip}[/]  [sf.muted]·[/]  "
+                        f"[sf.label]/full {chip}[/]"
+                    )
                 return
 
             console.print()
@@ -817,6 +896,19 @@ class Notifier:
             if self._show_tool_runs and assistant.tool_calls:
                 self._render_tool_calls(assistant.tool_calls)
             self._render_critiques(assistant, a_critiques)
+            if self._assistant_live_cap is not None:
+                sid = (user.session_id or "").strip()
+                chip = _short_session(sid) or (sid[:8] if sid else "?")
+                self._last_turn_digest = (sid, user.project_id, user.id, assistant.id)
+                console.print(
+                    f"  [bold #9ee37d]● turn complete[/]  [sf.muted]#"
+                    f"{user.id} → #{assistant.id} · session[/] [sf.label]{chip}[/]"
+                )
+                console.print(
+                    "  [sf.muted]expand this reply:[/] [sf.label]/turn "
+                    f"{chip}[/]   [sf.muted]whole session:[/] [sf.label]/full "
+                    f"{chip}[/]"
+                )
 
     def _render_tool_calls(self, calls: list[ToolCallPayload]) -> None:
         """Print one line per tool invocation under the assistant body.
@@ -902,9 +994,6 @@ class Notifier:
         except Exception:  # noqa: BLE001
             pass
         try:
-            import shutil
-            import subprocess
-
             osa = shutil.which("osascript")
             if not osa:
                 return
@@ -972,6 +1061,9 @@ class Notifier:
         for ev_id, author, ts in to_warn:
             age = max(0, int((now - ts).total_seconds()))
             with self._lock:
+                if self._live_suppress:
+                    self._skipped_while_suppressed += 1
+                    continue
                 console.print(
                     f"  [sf.warn]⏳ no-reply[/]  "
                     f"[sf.muted]{author}'s prompt #{ev_id} is "
@@ -994,6 +1086,9 @@ class Notifier:
             note_short = _truncate(note, 220 if not self._compact else 100)
             note_part = f" [sf.muted]· {note_short}[/]"
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print(
                 f"  [{color}]{glyph} {flag.kind:<8}[/] "
                 f"[sf.label]{author}[/] [sf.muted]· flagged #{flag.prompt_event_id}[/]"
@@ -1006,6 +1101,9 @@ class Notifier:
         that the stream is alive even when the team is quiet."""
         ts = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print(
                 f"[sf.muted]· still watching · {ts}[/]"
             )
@@ -1032,6 +1130,9 @@ class Notifier:
         }.get(kind, ("·", "sf.point"))
         lines = body.splitlines() or [body]
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print()
             console.print(
                 f"[{color}]{glyph}[/] [bold {color}]spec>[/] "
@@ -1042,8 +1143,70 @@ class Notifier:
             for extra in lines[1:]:
                 console.print(f"   {extra}", markup=False, highlight=False)
 
+    def show_in_system_pager(self, body: str, *, banner: str) -> None:
+        """Pause live stream prints and show ``body`` in ``less`` / ``$PAGER``.
+
+        Uses :func:`_resolve_system_pager_argv` (``SPEC_TEAM_WATCH_PAGER``,
+        then ``PAGER``, then ``less`` / ``more``). When no pager exists,
+        falls back to :meth:`show_command_result` inline. The pager buffer
+        starts with a short reminder that **q** returns to the live feed.
+        """
+        blog = (
+            f"spec team watch — thread view\n{banner.strip()}\n\n"
+            "────────────────────────────────────────────────────────────────\n"
+            "  Press q to leave the pager and return to the live team feed.\n"
+            "────────────────────────────────────────────────────────────────\n\n"
+            f"{body}"
+        )
+        argv = _resolve_system_pager_argv()
+        with self._lock:
+            self._live_suppress = True
+            self._skipped_while_suppressed = 0
+            console.print(
+                "[sf.point]●[/] [sf.label]opening system pager[/] "
+                "[sf.muted](less or PAGER env — press q when done)[/]"
+            )
+        try:
+            if not argv:
+                with self._lock:
+                    self._live_suppress = False
+                    self._skipped_while_suppressed = 0
+                self.show_command_result(blog, kind="summarize")
+                return
+            env = os.environ.copy()
+            env.setdefault("LESS", "-R -X")
+            subprocess.run(
+                argv,
+                input=blog.encode("utf-8", errors="replace"),
+                stdin=subprocess.PIPE,
+                env=env,
+            )
+        except OSError as e:
+            with self._lock:
+                self._live_suppress = False
+                self._skipped_while_suppressed = 0
+            self.show_command_result(
+                f"[pager failed: {e}]\n\n{blog}",
+                kind="summarize",
+            )
+        finally:
+            with self._lock:
+                skipped = self._skipped_while_suppressed
+                self._live_suppress = False
+                self._skipped_while_suppressed = 0
+                if skipped:
+                    console.print(
+                        f"[sf.muted]·[/] {skipped} live line(s) were not drawn while "
+                        "the pager had the screen — try `[sf.label]/replay 5m[/]` "
+                        "if you need them.",
+                        highlight=False,
+                    )
+
     def announce_connected(self, project_label: str) -> None:
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print(
                 f"[sf.mint]●[/] connected · [sf.label]{project_label}[/] [sf.muted]· "
                 f"streaming team prompts[/]"
@@ -1055,10 +1218,16 @@ class Notifier:
         Runs *after* the REST bootstrap replay so reviewers are not
         misled into thinking this was a mid-stream disconnect."""
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print(f"[sf.warn]…[/] connecting [sf.muted]({detail})[/]")
 
     def announce_broadcast_disabled(self) -> None:
         with self._lock:
+            if self._live_suppress:
+                self._skipped_while_suppressed += 1
+                return
             console.print(
                 "[sf.muted]·[/] receive-only mode "
                 "(run [sf.label]spec live on[/] to share, or "

@@ -141,6 +141,39 @@ def render_team_editing_brief(
         lines.append(f"**Mirror updated:** {updated} (UTC)")
         lines.append("")
 
+    # ── git push handoffs (YAML + JSON mirror) ────────────────────
+    push_req = body.get("push_requests")
+    if isinstance(push_req, list) and push_req:
+        lines.append("## Git push handoff — read `.spec/team-push-requests.yaml`")
+        lines.append("")
+        lines.append(
+            "**Canonical file:** `.spec/team-push-requests.yaml` (YAML). "
+            "The rows below are copied into this brief and "
+            "`.spec/team-presence.json` under `push_requests` so every AI "
+            "tool sees them. If **your** Spec handle matches `to_handle`, "
+            "help the user **commit** if needed and **`git push`** to "
+            "`origin` on the listed branch (never force-push unless the "
+            "user explicitly asks)."
+        )
+        lines.append("")
+        for row in push_req:
+            if not isinstance(row, dict):
+                continue
+            to_h = row.get("to_handle") or "?"
+            from_h = row.get("from_handle")
+            from_d = row.get("from_display")
+            if not from_d:
+                from_d = f"@{from_h}" if from_h else "(unknown)"
+            br = row.get("branch") or "(branch unknown)"
+            msg = row.get("message")
+            exp = row.get("expires_at") or "?"
+            lines.append(
+                f"- **@{to_h}** is asked to push — from {from_d} · branch `{br}` "
+                f"· expires `{exp}`"
+                + (f" · note: {msg}" if msg else "")
+            )
+        lines.append("")
+
     members = body.get("members") or []
     if not isinstance(members, list):
         members = []

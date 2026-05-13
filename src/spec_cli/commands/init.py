@@ -336,6 +336,13 @@ example when `spec watch` is not running) so you do not act on zombie
 data. For a readable summary you can also open
 `.spec/team-editing-brief.md` (updated by `spec watch`).
 
+**Git push handoffs:** when teammates run `spec team request-push <handle>`
+(or `/push@handle` from `spec team watch` in a bundle cwd), rows land in
+`.spec/team-push-requests.yaml` and are merged into the same mirror files.
+If **the user's Spec handle** matches `to_handle` in that YAML, help them
+**commit** if needed and **`git push`** to `origin` on the listed branch
+(never force-push unless the user explicitly asks).
+
 Legacy: `spec presence check` is still available — same exit codes,
 but it does not apply the stale-mirror guard.
 
@@ -410,6 +417,17 @@ spec locks check <bundle-relative-path>
 
 Legacy: `spec presence check` uses the same exit codes without the
 stale-mirror guard.
+
+## Git push handoffs (Spec Live)
+
+Teammates can request that **you** push your branch so they can `git pull`:
+
+- Read **`.spec/team-push-requests.yaml`** and the **Git push handoff** section
+  in `.spec/team-editing-brief.md` (also copied into `.spec/team-presence.json`
+  as `push_requests` when `spec watch` is running).
+- If **your Spec handle** matches `to_handle`, help the user **commit** if
+  needed and run **`git push`** to `origin` on the listed branch (never
+  force-push unless the user explicitly asks).
 
 ## Team journal (optional)
 

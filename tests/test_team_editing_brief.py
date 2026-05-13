@@ -134,6 +134,31 @@ def test_pull_alerts_skip_detached_head():
     assert _compute_pull_alerts(body) == []
 
 
+def test_render_team_editing_brief_includes_push_handoff():
+    body = {
+        "schema": 1,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "self": None,
+        "members": [],
+        "files_index": {},
+        "push_requests": [
+            {
+                "to_handle": "jc",
+                "from_handle": "alice",
+                "from_display": "@alice",
+                "branch": "main",
+                "message": "need your WIP",
+                "requested_at": "2026-01-01T00:00:00+00:00",
+                "expires_at": "2026-01-01T01:00:00+00:00",
+            }
+        ],
+    }
+    md = render_team_editing_brief(body)
+    assert "team-push-requests.yaml" in md
+    assert "@jc" in md or "jc" in md
+    assert "need your WIP" in md
+
+
 def test_render_team_editing_brief_renders_pull_alerts():
     """The rendered markdown should surface a "Pull needed" section
     above the dirty-files list when a same-branch peer is ahead."""

@@ -264,6 +264,18 @@ def test_review_feed_full_bodies_uses_schema_max_for_user_and_assistant() -> Non
     assert compact._user_preview_limit() == notifier_mod._PREVIEW_USER[1]
 
 
+def test_digest_mode_assistant_live_cap_overrides_schema_max() -> None:
+    from spec_cli.prompts.schema import MAX_TURN_TEXT_CHARS
+
+    n = Notifier(
+        critic_enabled=False,
+        review_feed_full_bodies=True,
+        assistant_live_cap=400,
+    )
+    assert n._user_preview_limit() == MAX_TURN_TEXT_CHARS
+    assert n._assistant_body_limit_chars() == 400
+
+
 def test_default_team_watch_strips_code_blocks_from_assistant_body(monkeypatch):
     """``spec team watch`` default render must show the AI's
     narration with embedded code blocks collapsed to a compact

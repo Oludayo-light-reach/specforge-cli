@@ -14,6 +14,10 @@ Subcommands:
 * ``spec team flag <event_id> --kind …`` — post a flag (reaction /
   warning / question / ack) on a prompt event. The flag fans out
   over the same SSE channel so peers see it within an RTT.
+* ``spec team request-push <handle>`` — append a git-push handoff row
+  to ``.spec/team-push-requests.yaml`` (merged into team-presence /
+  editing-brief by ``spec watch``). Same intent as ``/push@handle`` in
+  ``spec team watch`` when your cwd is the bundle root.
 """
 from __future__ import annotations
 
@@ -25,8 +29,9 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import replace
 from datetime import datetime, timezone
+
+from pathlib import Path
 
 import click
 
@@ -39,6 +44,7 @@ from ..config import (
     load_manifest,
     parse_cloud_project,
 )
+from ..git import read_git_context
 from ..realtime.commands import (
     CommandContext,
     WatchState,
@@ -52,7 +58,12 @@ from ..realtime.critic import (
     suggested_flag_command,
 )
 from ..realtime.events import IncomingEvent, IncomingFlag
+from ..realtime.merge_turns import merge_assistant_snapshots
 from ..realtime.notifier import Notifier
+from ..realtime.team_push_requests import (
+    DEFAULT_PUSH_REQUEST_TTL_SECS,
+    record_push_request,
+)
 from ..realtime.transport import SSEConsumer, SSEStreamError, run_consumer_in_thread
 from ..ui import console, dim, fatal, ok
 
@@ -314,6 +325,7 @@ def team_group(
       spec team
       spec team --org --limit 50
       spec team --user alice
+      spec team request-push jc -m "need your branch"
       spec team watch
       spec team flag 4711 --kind warning --note "race condition risk"
     """
@@ -447,50 +459,7 @@ class _TeamWatchQAState:
 
     @staticmethod
     def _merge_assistant_chunks(chunks: list[IncomingEvent]) -> IncomingEvent:
-        if not chunks:
-            raise ValueError("merge requires non-empty chunks")
-        by_id = max(chunks, key=lambda e: e.id)
-        # Prefer the longest non-empty ``text``; break ties by highest
-        # event id so the newest cumulative snapshot wins when lengths match
-        # (avoids picking an older partial over a newer full body).
-        text_candidates = [c for c in chunks if (c.text or "").strip()]
-        if text_candidates:
-            text_src = max(
-                text_candidates,
-                key=lambda e: (len((e.text or "").strip()), e.id),
-            )
-            text = (text_src.text or "").strip() or None
-        else:
-            text = (by_id.text or "").strip() or None
-        summary = (by_id.summary or "").strip() or None
-        if not summary:
-            by_sum = max(
-                chunks,
-                key=lambda e: len((e.summary or "").strip()),
-            )
-            summary = (by_sum.summary or "").strip() or None
-        merged_tools: list = []
-        seen_sig: set[tuple[str, str]] = set()
-        for c in sorted(chunks, key=lambda e: e.id):
-            for tc in c.tool_calls or []:
-                try:
-                    sig = (
-                        tc.name,
-                        json.dumps(tc.args, sort_keys=True, default=str),
-                    )
-                except TypeError:
-                    sig = (tc.name, str(tc.args))
-                if sig in seen_sig:
-                    continue
-                seen_sig.add(sig)
-                merged_tools.append(tc)
-        tool_calls = merged_tools
-        return replace(
-            by_id,
-            text=text,
-            summary=summary,
-            tool_calls=tool_calls,
-        )
+        return merge_assistant_snapshots(chunks)
 
     def combined_assistant_chunks(self) -> list[IncomingEvent]:
         """Local SSE buffer plus assistant rows from REST (when configured).
@@ -681,6 +650,72 @@ def _stdin_reader(ctx: "CommandContext", stop_event: threading.Event) -> None:
         dispatch(cmd, ctx)
 
 
+@team_group.command("request-push")
+@click.argument("handle", type=str)
+@click.option(
+    "--message",
+    "-m",
+    default=None,
+    help="Optional note shown to the target's AI in the handoff YAML.",
+)
+@click.option(
+    "--ttl",
+    type=click.IntRange(60, 86400),
+    default=DEFAULT_PUSH_REQUEST_TTL_SECS,
+    show_default=True,
+    help="Seconds before this request expires from the mirror files.",
+)
+def team_request_push_cmd(handle: str, message: str | None, ttl: int) -> None:
+    """Ask a teammate (by Spec handle) to git-push — shared YAML + mirror.
+
+    Writes ``.spec/team-push-requests.yaml`` in the current bundle. With
+    ``spec watch`` running on teammates' machines, the row is merged into
+    ``team-presence.json`` and ``team-editing-brief.md`` so their AI tools
+    see the handoff (same as ``/push@handle`` inside ``spec team watch``
+    when cwd is the bundle root).
+
+    \b
+    Examples:
+      spec team request-push jc
+      spec team request-push jc -m "need your WIP for integration"
+    """
+    try:
+        root = find_bundle_root()
+    except BundleNotFoundError as e:
+        fatal(str(e))
+        return
+    creds = load_credentials()
+    fh = (creds.user_handle or "").strip().lstrip("@").lower() if creds else None
+    disp: str | None = None
+    if creds:
+        if creds.user_handle:
+            disp = f"@{creds.user_handle.lstrip('@')}"
+        if creds.user_name:
+            disp = f"{creds.user_name} ({disp})" if disp else creds.user_name
+    git = read_git_context(root)
+    try:
+        path = record_push_request(
+            root,
+            to_handle=handle,
+            from_handle=fh or None,
+            from_display=disp,
+            branch=git.branch,
+            message=message,
+            ttl_secs=int(ttl),
+        )
+    except ValueError as e:
+        fatal(str(e))
+        return
+    except OSError as e:
+        fatal(str(e))
+        return
+    ok(
+        f"recorded push handoff for @{handle.lstrip('@').lower()} → {path}\n"
+        "Teammates pick it up on the next `spec watch` mirror tick (≤30s) "
+        "if their daemon is running."
+    )
+
+
 @team_group.command("watch")
 @click.option(
     "--compact",
@@ -757,7 +792,8 @@ def _stdin_reader(ctx: "CommandContext", stop_event: threading.Event) -> None:
     help=(
         "Enable the in-pane slash-command layer (default). Disable for "
         "fully passive read-only mode. Commands include /summarize, "
-        "/flag, /focus, /mute, /replay, /search, /critic, /status, /help."
+        "/flag, /focus, /mute, /replay, /search, /turn, /full, /push, "
+        "/critic, /status, /help."
     ),
 )
 @click.option(
@@ -819,9 +855,13 @@ def team_watch_cmd(
     durable project tail** from ``GET /api/projects/{id}/prompt-events``
     (monotonic ids) so reviewers see the full stored reply even when the
     live stream missed frames or ``/pair`` ran early. **Non-compact**
-    layout prints user + assistant bodies up to the schema wire cap
-    (``MAX_TURN_TEXT_CHARS``) instead of a 48k preview. The initial REST
-    warm-up uses the same merge rules.
+    default layout keeps **user** bodies up to the schema wire cap while
+    **assistant** prose is capped (~400 characters) after merging
+    ``text`` and ``summary`` so the headline is not shown without the
+    body. Use ``/turn`` or ``/full`` (session chip from ``● turn complete``)
+    to print full stored turns from Cloud; ``--show-tool-runs`` lifts the
+    live assistant cap to the full stored body and shows tools + code.
+    The initial REST warm-up uses the same merge rules.
 
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
@@ -846,6 +886,7 @@ def team_watch_cmd(
       spec team watch --compact
       spec team watch --no-heartbeat
       spec team watch --no-critic   # silence rule-based suggestions
+      spec team request-push jc --message "need your branch for rebase"
     """
     creds = load_credentials()
     if not creds or not creds.access_token:
@@ -853,6 +894,12 @@ def team_watch_cmd(
         return
 
     assistant_quiet_resolved = _resolve_assistant_quiet_secs(assistant_quiet_secs)
+
+    bundle_watch_root: Path | None = None
+    try:
+        bundle_watch_root = find_bundle_root()
+    except BundleNotFoundError:
+        bundle_watch_root = None
 
     # Bounded in-memory event memory shared with the command layer:
     # /summarize, /replay, /status all read from this. Updated in
@@ -874,9 +921,14 @@ def team_watch_cmd(
         # keeps the raw code blocks (reviewers asking for the latter
         # presumably want the former too).
         strip_code_blocks=not show_tool_runs,
-        # Non-compact: print user + assistant bodies up to the schema
-        # wire cap so reviewers see every stored character Cloud ships.
+        # Non-compact digest: user/error bodies can use the schema cap;
+        # assistant prose gets a ~400-char live preview so the pane stays
+        # scannable. ``--show-tool-runs`` lifts the assistant cap to the
+        # full stored body; ``/turn`` / ``/full`` always re-fetch full text.
         review_feed_full_bodies=not compact,
+        assistant_live_cap=(
+            None if (compact or show_tool_runs) else 400
+        ),
     )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle
@@ -942,7 +994,9 @@ def team_watch_cmd(
         flag_client=flag_client,
         project_for_event=event_to_project.get,
         qa_pair_now=_qa_pair_now,
+        cloud_client=flag_client,
         team_watch_receiver_brief=recv_brief,
+        bundle_root=bundle_watch_root,
     )
 
     def _on_connect() -> None:
@@ -955,6 +1009,11 @@ def team_watch_cmd(
                 "interactive commands enabled — type /help for the list. "
                 "Use /pair to print the merged Q/A block from Cloud + SSE "
                 "(even if intermediate live frames were missed). "
+                "From a bundle cwd, /push@handle records a git-push handoff "
+                "in `.spec/team-push-requests.yaml`. "
+                "After each paired reply, `/turn` (last turn) and `/full` "
+                "(whole session) re-fetch full bodies from Cloud using the "
+                "session chip from the footer. "
                 "Two-stage Ctrl+C still exits.",
                 kind="info",
             )

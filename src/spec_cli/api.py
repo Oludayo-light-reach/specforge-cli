@@ -246,20 +246,24 @@ class CloudClient:
         *,
         since_id: int | None = None,
         limit: int | None = None,
+        session_id: str | None = None,
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         """Read recent prompt events for a project.
 
         With ``since_id``, returns ascending events with ``id > since_id``
-        (catch-up replay). Without, returns the most recent ``limit``
-        events in descending order — what ``spec team`` uses for a
-        one-shot snapshot.
+        (catch-up replay). Optional ``session_id`` restricts to one agent
+        session (exact match). Without ``since_id``, returns the most recent
+        ``limit`` events in descending order. Without ``since_id``, optional
+        ``session_id`` limits that descending window to one session.
         """
         params: dict[str, Any] = {}
         if since_id is not None:
             params["since_id"] = since_id
         if limit is not None:
             params["limit"] = limit
+        if session_id is not None:
+            params["session_id"] = session_id
         req_kw: dict[str, Any] = {}
         if timeout is not None:
             req_kw["timeout"] = timeout

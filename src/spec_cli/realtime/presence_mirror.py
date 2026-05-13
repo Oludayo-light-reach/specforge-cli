@@ -38,6 +38,7 @@ from pathlib import Path
 from .active_edits import ActiveEditsStore
 from .presence import LocalPresence, PeerPresence, PresenceCache
 from .team_editing_brief import write_team_editing_brief
+from .team_push_requests import attach_push_requests_to_body
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ class TeamPresenceMirror:
             self_name=self_name,
             branch=branch,
         )
+        attach_push_requests_to_body(self._bundle_root, body)
 
         # Idempotency check: compare on everything *except* ``updated_at``
         # (which is a wall-clock timestamp regenerated on every render and
@@ -179,8 +181,17 @@ def _render(
             "auth.py": [{"handle": "alice", "lines_added": 12,
                          "lines_removed": 3, "untracked": false,
                          "self": false}]
-         }
+         },
+         "push_requests": [
+            {"to_handle": "jc", "from_handle": "alice",
+             "branch": "main", "message": null,
+             "requested_at": "<iso>", "expires_at": "<iso>"}
+         ]
        }
+
+    ``push_requests`` is optional — merged from ``.spec/team-push-requests.yaml``
+    when present (see ``spec team request-push``). Empty/absent means no
+    pending handoff pings.
 
     ``files_index`` is the secret weapon for hooks: a hook gets a
     file path and needs the answer in O(1), not by walking every

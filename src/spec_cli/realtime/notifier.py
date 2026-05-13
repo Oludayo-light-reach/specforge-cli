@@ -1178,7 +1178,6 @@ class Notifier:
             subprocess.run(
                 argv,
                 input=blog.encode("utf-8", errors="replace"),
-                stdin=subprocess.PIPE,
                 env=env,
             )
         except OSError as e:

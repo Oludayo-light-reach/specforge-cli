@@ -366,6 +366,48 @@ def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
     return _TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT
 
 
+# ``GET /api/projects/{id}/prompt-events?since_id=`` hard cap for one
+# Q/A merge — matches the backend list ceiling order of magnitude.
+_TEAM_WATCH_THREAD_FETCH_LIMIT = 500
+
+
+def _assistant_tail_from_rest_after_user(
+    client: CloudClient,
+    pending: IncomingEvent,
+) -> list[IncomingEvent]:
+    """Assistant rows persisted after ``pending`` for server-backed merge.
+
+    Wraps the project catch-up list (``id`` ascending) and stops at the
+    next ``user`` event so a later prompt in the same project cannot
+    attach to this thread. Rows from other ``session_id`` values are
+    skipped so interleaved workspace traffic does not corrupt the pair.
+    """
+    try:
+        rows = client.list_prompt_events(
+            pending.project_id,
+            since_id=pending.id,
+            limit=_TEAM_WATCH_THREAD_FETCH_LIMIT,
+        )
+    except ApiError:
+        return []
+    key = (pending.project_id, (pending.session_id or "").strip())
+    out: list[IncomingEvent] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            ev = IncomingEvent.from_json(r)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (ev.project_id, (ev.session_id or "").strip()) != key:
+            continue
+        if ev.role == "user":
+            break
+        if ev.role == "assistant":
+            out.append(ev)
+    return out
+
+
 class _TeamWatchQAState:
     """Coalesce streaming assistant rows into one readable Q/A block.
 
@@ -383,6 +425,11 @@ class _TeamWatchQAState:
         self.pending_user: IncomingEvent | None = None
         self.assistant_chunks: list[IncomingEvent] = []
         self.last_assistant_mono: float | None = None
+        # Optional ``CloudClient`` — when set, :meth:`flush_pair` merges
+        # SSE-buffered assistant rows with the durable project tail from
+        # REST so ``/pair`` and idle flush see the same text the server
+        # stored (heals missed SSE frames and early ``/pair`` races).
+        self.pair_cloud: CloudClient | None = None
 
     @staticmethod
     def _session_key(ev: IncomingEvent) -> tuple[int, str]:
@@ -435,18 +482,38 @@ class _TeamWatchQAState:
             tool_calls=tool_calls,
         )
 
-    def flush_pair(self, notifier: Notifier) -> bool:
+    def combined_assistant_chunks(self) -> list[IncomingEvent]:
+        """Local SSE buffer plus assistant rows from REST (when configured).
+
+        Deduplicates by monotonic ``id`` so the merged assistant body
+        prefers every snapshot the broadcaster successfully POSTed,
+        even when the live SSE consumer missed intermediate frames.
+        """
         if self.pending_user is None:
-            return False
+            return []
         key = self._session_key(self.pending_user)
-        self.assistant_chunks = [
+        local = [
             c
             for c in self.assistant_chunks
             if c.role == "assistant" and self._session_key(c) == key
         ]
-        if not self.assistant_chunks:
+        remote: list[IncomingEvent] = []
+        if self.pair_cloud is not None:
+            remote = _assistant_tail_from_rest_after_user(
+                self.pair_cloud, self.pending_user
+            )
+        by_id: dict[int, IncomingEvent] = {}
+        for ev in sorted(remote + local, key=lambda e: e.id):
+            by_id[ev.id] = ev
+        return list(by_id.values())
+
+    def flush_pair(self, notifier: Notifier) -> bool:
+        if self.pending_user is None:
             return False
-        merged = self._merge_assistant_chunks(self.assistant_chunks)
+        combined = self.combined_assistant_chunks()
+        if not combined:
+            return False
+        merged = self._merge_assistant_chunks(combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.assistant_chunks.clear()
         self.pending_user = None
@@ -459,7 +526,7 @@ class _TeamWatchQAState:
         notifier: Notifier,
         last_output_at: list[float],
     ) -> None:
-        if self.pending_user is not None and self.assistant_chunks:
+        if self.pending_user is not None and self.combined_assistant_chunks():
             self.flush_pair(notifier)
         self.assistant_chunks.clear()
         self.last_assistant_mono = None
@@ -485,23 +552,18 @@ class _TeamWatchQAState:
         """Flush when ``spec watch`` posts ``role=assistant_closed`` for this session."""
         if ev.role != "assistant_closed":
             return False
-        if self.pending_user is None or not self.assistant_chunks:
+        if self.pending_user is None:
             return False
         # Match :meth:`buffer_assistant` — normalize ``session_id`` so a
         # stray whitespace mismatch does not strand buffered chunks.
         if self._session_key(self.pending_user) != self._session_key(ev):
             return False
-        key = self._session_key(self.pending_user)
-        scoped = [
-            c
-            for c in self.assistant_chunks
-            if c.role == "assistant" and self._session_key(c) == key
-        ]
-        if not scoped:
+        combined = self.combined_assistant_chunks()
+        if not combined:
             return False
         cid = ev.closes_event_id
         if cid is not None:
-            a_ids = [c.id for c in scoped]
+            a_ids = [c.id for c in combined]
             lo, hi = min(a_ids), max(a_ids)
             if cid < lo or cid > hi:
                 return False
@@ -532,7 +594,7 @@ class _TeamWatchQAState:
             last_output_at[0] = time.monotonic()
 
     def flush_on_error(self, notifier: Notifier, last_output_at: list[float]) -> None:
-        if self.pending_user is not None and self.assistant_chunks:
+        if self.pending_user is not None and self.combined_assistant_chunks():
             self.flush_pair(notifier)
             last_output_at[0] = time.monotonic()
         self.pending_user = None
@@ -540,12 +602,17 @@ class _TeamWatchQAState:
         self.last_assistant_mono = None
 
     def flush_shutdown(self, notifier: Notifier) -> None:
-        if self.pending_user is None or not self.assistant_chunks:
+        if self.pending_user is None:
+            self.assistant_chunks.clear()
+            self.last_assistant_mono = None
+            return
+        combined = self.combined_assistant_chunks()
+        if not combined:
             self.pending_user = None
             self.assistant_chunks.clear()
             self.last_assistant_mono = None
             return
-        merged = self._merge_assistant_chunks(self.assistant_chunks)
+        merged = self._merge_assistant_chunks(combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.pending_user = None
         self.assistant_chunks.clear()
@@ -722,9 +789,11 @@ def team_watch_cmd(
     (unless ``--assistant-quiet-secs 0``) that many idle seconds after
     the last assistant chunk. The idle window remains a fallback when the
     broadcaster runs an older CLI that does not emit ``assistant_closed``.
-    The paired block always uses the **full merged** assistant body
-    received so far. The initial REST replay uses the same rules so
-    ``/pair`` matches what you see on screen.
+    The paired block merges **SSE-buffered assistant rows with the
+    durable project tail** from ``GET /api/projects/{id}/prompt-events``
+    (monotonic ids) so reviewers see the full stored reply even when the
+    live stream missed frames or ``/pair`` ran early. The initial REST
+    warm-up uses the same merge rules.
 
     Two reviewer aids run automatically and can be disabled if the
     output ever gets noisy:
@@ -783,6 +852,10 @@ def team_watch_cmd(
     # heartbeat printer doesn't fire on top of fresh content.
     last_output_at = [time.monotonic()]
     qa = _TeamWatchQAState()
+    try:
+        qa.pair_cloud = CloudClient(creds)
+    except Exception:  # noqa: BLE001
+        qa.pair_cloud = None
 
     watch_state = WatchState(critic_enabled=critic_enabled)
 
@@ -809,12 +882,12 @@ def team_watch_cmd(
                 kind="info",
             )
             return
-        if not qa.assistant_chunks:
+        if not qa.combined_assistant_chunks():
             notifier.show_command_result(
-                "no assistant chunks buffered yet — the model may still be "
-                "working, `spec watch` may not be posting assistant rows for "
-                "this bundle, or assistant `session_id` may not match the "
-                "pending user row.",
+                "no assistant rows in the Cloud tail for this prompt yet — "
+                "the model may still be streaming, `spec watch` may not have "
+                "posted assistant rows for this bundle, or assistant "
+                "`session_id` may not match the pending user row.",
                 kind="info",
             )
             return
@@ -849,8 +922,8 @@ def team_watch_cmd(
         if commands_enabled:
             notifier.show_command_result(
                 "interactive commands enabled — type /help for the list. "
-                "Use /pair if the merged Q/A block has not printed yet "
-                "(e.g. older broadcaster without a close signal). "
+                "Use /pair to print the merged Q/A block from Cloud + SSE "
+                "(even if intermediate live frames were missed). "
                 "Two-stage Ctrl+C still exits.",
                 kind="info",
             )

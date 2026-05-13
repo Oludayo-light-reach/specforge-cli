@@ -148,6 +148,55 @@ def test_merge_tool_calls_dedupes_identical_entries() -> None:
     assert len(merged.tool_calls) == 1
 
 
+def test_flush_pair_prefers_cloud_tail_over_partial_sse_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    qa.pending_user = _ev(id=10, role="user", text="question")
+    qa.assistant_chunks = [_ev(id=11, role="assistant", text="partial")]
+    qa.pair_cloud = MagicMock()
+
+    def _fake_tail(_client: object, pending: IncomingEvent) -> list[IncomingEvent]:
+        assert pending.id == 10
+        return [
+            _ev(id=11, role="assistant", text="partial"),
+            _ev(
+                id=12,
+                role="assistant",
+                text="much longer assistant body from stored snapshots",
+            ),
+        ]
+
+    monkeypatch.setattr(
+        "spec_cli.commands.team._assistant_tail_from_rest_after_user",
+        _fake_tail,
+    )
+    assert qa.flush_pair(n)
+    _u, merged = n.show_completed_pair.call_args[0]
+    assert "much longer assistant" in (merged.text or "")
+
+
+def test_flush_on_assistant_closed_uses_cloud_when_sse_buffer_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    qa.pending_user = _ev(id=1, role="user", text="hi")
+    qa.assistant_chunks = []
+    qa.pair_cloud = MagicMock()
+    monkeypatch.setattr(
+        "spec_cli.commands.team._assistant_tail_from_rest_after_user",
+        lambda _c, _p: [_ev(id=2, role="assistant", text="from cloud")],
+    )
+    assert qa.flush_on_assistant_closed(
+        _ev(id=5, role="assistant_closed", text=None, closes_event_id=2),
+        n,
+        [0.0],
+    )
+    n.show_completed_pair.assert_called_once()
+
+
 def test_flush_on_assistant_closed_matches_session() -> None:
     qa = _TeamWatchQAState()
     n = MagicMock()

@@ -101,35 +101,60 @@ class HTTPPoster:
         ``None`` means success without a usable id (legacy proxy) or
         parse failure — callers may still treat the POST as delivered.
 
+        Retries a few times on transient network errors and 429 / 5xx so
+        a brief blip does not drop a prompt-event row the hub would have
+        fanned out to teammates.
+
         On failure returns ``(False, None)``.
         """
-        try:
-            r = self._session.post(
-                self._url,
-                json=event.to_json(),
-                timeout=timeout if timeout is not None else POST_TIMEOUT_SECS,
-            )
-        except requests.RequestException as e:
-            log.warning("spec-live: post failed (network): %s", e)
-            return False, None
-        if r.status_code >= 400:
-            body = r.text[:200]
-            log.warning(
-                "spec-live: post rejected (%s): %s",
-                r.status_code,
-                body,
-            )
-            return False, None
-        created: int | None = None
-        try:
-            data = r.json()
-            if isinstance(data, dict):
-                raw_id = data.get("id")
-                if isinstance(raw_id, int) and raw_id >= 1:
-                    created = raw_id
-        except (TypeError, ValueError):
-            pass
-        return True, created
+        deadline_timeout = timeout if timeout is not None else POST_TIMEOUT_SECS
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                r = self._session.post(
+                    self._url,
+                    json=event.to_json(),
+                    timeout=deadline_timeout,
+                )
+            except requests.RequestException as e:
+                log.warning(
+                    "spec-live: post failed (network, attempt %s/%s): %s",
+                    attempt + 1,
+                    max_attempts,
+                    e,
+                )
+                if attempt + 1 >= max_attempts:
+                    return False, None
+                time.sleep(min(2.0, 0.25 * (2**attempt)))
+                continue
+            if r.status_code in (429, 502, 503, 504) and attempt + 1 < max_attempts:
+                log.warning(
+                    "spec-live: post transient HTTP %s — retrying (%s/%s)",
+                    r.status_code,
+                    attempt + 1,
+                    max_attempts,
+                )
+                time.sleep(min(2.0, 0.25 * (2**attempt)))
+                continue
+            if r.status_code >= 400:
+                body = r.text[:200]
+                log.warning(
+                    "spec-live: post rejected (%s): %s",
+                    r.status_code,
+                    body,
+                )
+                return False, None
+            created: int | None = None
+            try:
+                data = r.json()
+                if isinstance(data, dict):
+                    raw_id = data.get("id")
+                    if isinstance(raw_id, int) and raw_id >= 1:
+                        created = raw_id
+            except (TypeError, ValueError):
+                pass
+            return True, created
+        return False, None
 
     def close(self) -> None:
         try:

@@ -5,7 +5,10 @@ Two integrations live in the same rc-file block:
 1. **``git init`` → ``spec init``** wrapper. Git has no post-init hook;
    wrapping the user's ``git`` shell function is the only way to make
    ``spec init`` run alongside ``git init`` for fresh repos.
-2. **Autostart hook** for ``spec live``. Fires ``spec live ensure
+2. **``git clone`` → ``spec bundle doctor``** (when the cloned tree
+   contains a ``spec.yaml``). Surfaces ``cloud.project`` / access issues
+   right after clone. Opt out with ``SPEC_NO_CLONE_DOCTOR=1``.
+3. **Autostart hook** for ``spec live``. Fires ``spec live ensure
    --quiet`` from the shell's prompt-render hook (zsh ``precmd``,
    bash ``PROMPT_COMMAND``, fish ``__fish_preexec``-class event)
    so the watcher daemon "flicks on" the moment the user is
@@ -26,9 +29,9 @@ autostart off``, or remove the rc-file block entirely.
 
 The wrappers are deliberately conservative:
 
-* ``git`` wrapper only acts when the first argument is ``init``,
-  skips ``--bare`` / ``--shared=*``, skips when ``spec.yaml``
-  already exists, and preserves git's exit code.
+* ``git`` wrapper: on ``init``, runs ``spec init`` when appropriate; on
+  successful ``clone``, may run ``spec bundle doctor`` inside the new
+  tree (see ``SPEC_NO_CLONE_DOCTOR``). Preserves git's exit code.
 * Autostart hook bails on the fast path the moment ``$PWD`` doesn't
   contain a ``spec.yaml`` — saves ~50ms on every shell prompt for
   users in a non-Spec directory.
@@ -62,11 +65,14 @@ SHELL_INTEGRATION_END: str = "# <<< spec shell integration <<<"
 # the moment we cross the home directory, so the fast path is fast.
 SHELL_INTEGRATION_BODY_BASH_ZSH: str = f"""\
 {SHELL_INTEGRATION_BEGIN}
-# Auto-installed by `spec shell install`. Two integrations:
+# Auto-installed by `spec shell install`. Three integrations:
 #   1. Wraps `git init` so a fresh Spec bundle is scaffolded
 #      immediately. Skipped when `spec.yaml` already exists at the
 #      target.
-#   2. Auto-starts `spec watch` in the background the first time you
+#   2. After a successful `git clone`, runs `spec bundle doctor` in the
+#      new tree when it contains a `spec.yaml` (any depth under the
+#      clone root). Opt out: `export SPEC_NO_CLONE_DOCTOR=1`.
+#   3. Auto-starts `spec watch` in the background the first time you
 #      prompt inside a `spec init`'d bundle each shell session. The
 #      daemon is idempotent and runs `spec live ensure --quiet`,
 #      which is a no-op in 99% of prompts. Disable on this machine
@@ -88,6 +94,59 @@ git() {{
     done
     if [ $__spec_skip -eq 0 ] && [ -d "$__spec_target" ] && [ ! -f "$__spec_target/spec.yaml" ]; then
       ( cd "$__spec_target" && spec init )
+    fi
+  fi
+  if [ "$1" = "clone" ] && [ $__spec_rc -eq 0 ] && command -v spec >/dev/null 2>&1; then
+    if [ "${{SPEC_NO_CLONE_DOCTOR:-0}}" != "1" ]; then
+      local __spec_skip_cd=0
+      case "$*" in
+        *"--bare"*|*"--mirror"*|*"--help"*|*" -h "*|*" -h"*|*"-h "*)
+          __spec_skip_cd=1
+          ;;
+      esac
+      local __spec_pos=()
+      local __spec_after_clone=0
+      local __spec_skip_pair=0
+      local __spec_a
+      for __spec_a in "$@"; do
+        if [ $__spec_after_clone -eq 0 ]; then
+          [ "$__spec_a" = "clone" ] && __spec_after_clone=1
+          continue
+        fi
+        if [ $__spec_skip_pair -eq 1 ]; then
+          __spec_skip_pair=0
+          continue
+        fi
+        case "$__spec_a" in
+          -o|-b|-u|-c|--depth|-j|--reference|--server-option|--config)
+            __spec_skip_pair=1
+            continue
+            ;;
+        esac
+        case "$__spec_a" in
+          -*) continue ;;
+          *) __spec_pos+=("$__spec_a") ;;
+        esac
+      done
+      local __spec_n=0
+      for __spec_x in "${{__spec_pos[@]}}"; do
+        __spec_n=$((__spec_n + 1))
+      done
+      local __spec_tdir=""
+      if [ $__spec_skip_cd -eq 0 ] && [ $__spec_n -ge 1 ]; then
+        if [ $__spec_n -eq 1 ]; then
+          __spec_tdir=$(basename "${{__spec_pos[0]}}" .git)
+        else
+          __spec_tdir="${{__spec_pos[$((__spec_n - 1))]}}"
+        fi
+        case "$__spec_tdir" in
+          /*) ;;
+          *) __spec_tdir="${{PWD}}/$__spec_tdir" ;;
+        esac
+        if [ -d "$__spec_tdir" ] && find "$__spec_tdir" -name .git -prune -o -name spec.yaml -print 2>/dev/null | head -n 1 | grep -q .; then
+          ( cd "$__spec_tdir" && spec bundle doctor ) || true
+        fi
+      fi
     fi
   fi
   return $__spec_rc
@@ -164,13 +223,12 @@ fi
 # moment the bash/zsh ``PROMPT_COMMAND``/``precmd`` paths do.
 SHELL_INTEGRATION_BODY_FISH: str = f"""\
 {SHELL_INTEGRATION_BEGIN}
-# Auto-installed by `spec shell install`. Two integrations:
-#   1. Wraps `git init` so a fresh Spec bundle is scaffolded
-#      in the same directory immediately after the git worktree.
-#   2. Auto-starts `spec watch` in the background the first time you
-#      prompt inside a `spec init`'d bundle each shell session.
-# Run `spec shell uninstall` to remove. Disable autostart only with
-# `spec live autostart off` or `set -x SPEC_NO_AUTOSTART 1`.
+# Auto-installed by `spec shell install`. Integrations:
+#   1. Wraps `git init` → `spec init` when appropriate.
+#   2. After `git clone`, runs `spec bundle doctor` when the tree has
+#      a `spec.yaml`. Opt out: `set -x SPEC_NO_CLONE_DOCTOR 1`.
+#   3. Auto-starts `spec watch` via `spec live ensure` on prompt.
+# Run `spec shell uninstall` to remove.
 function git
     command git $argv
     set -l __spec_rc $status
@@ -190,6 +248,60 @@ function git
             pushd $__spec_target
             spec init
             popd
+        end
+    end
+    if test (count $argv) -ge 1; and test "$argv[1]" = clone; and test $__spec_rc -eq 0; and type -q spec
+        if test "$SPEC_NO_CLONE_DOCTOR" != 1
+            set -l __spec_join (string join ' ' $argv)
+            set -l __spec_skip_cd 0
+            if string match -q '*--bare*' $__spec_join; or string match -q '*--mirror*' $__spec_join
+                set __spec_skip_cd 1
+            end
+            if test $__spec_skip_cd -eq 0
+                set -l __spec_pos
+                set -l __spec_after 0
+                set -l __spec_skip_pair 0
+                for __spec_a in $argv
+                    if test $__spec_after -eq 0
+                        if test "$__spec_a" = clone
+                            set __spec_after 1
+                        end
+                        continue
+                    end
+                    if test $__spec_skip_pair -eq 1
+                        set __spec_skip_pair 0
+                        continue
+                    end
+                    switch $__spec_a
+                        case -o -b -u -c --depth -j --reference --server-option --config
+                            set __spec_skip_pair 1
+                            continue
+                    end
+                    switch $__spec_a
+                        case '-*'
+                        case '*'
+                            set __spec_pos $__spec_pos $__spec_a
+                    end
+                end
+                set -l __spec_n (count $__spec_pos)
+                if test $__spec_n -ge 1
+                    set -l __spec_tdir ""
+                    if test $__spec_n -eq 1
+                        set __spec_tdir (basename $__spec_pos[1] .git)
+                    else
+                        set __spec_tdir $__spec_pos[-1]
+                    end
+                    if not string match -q '/*' $__spec_tdir
+                        set __spec_tdir "$PWD/$__spec_tdir"
+                    end
+                    if test -d $__spec_tdir
+                        set -l __spec_yaml_hit (find $__spec_tdir -name .git -prune -o -name spec.yaml -print 2>/dev/null | head -n 1)
+                        if test -n "$__spec_yaml_hit"
+                            fish -c "cd '$__spec_tdir'; and spec bundle doctor" || true
+                        end
+                    end
+                end
+            end
         end
     end
     return $__spec_rc
@@ -355,9 +467,10 @@ def _uninstall_shell_block(rc_path: Path) -> tuple[str, Path]:
 @click.group(
     "shell",
     help=(
-        "Manage the `git init` → `spec init` shell wrapper "
-        "(installed by the curl installer; commands here are for review, "
-        "manual installs, switching shells, and uninstall)."
+        "Manage Spec shell integrations: `git init` → `spec init`, "
+        "`git clone` → `spec bundle doctor` when applicable, and optional "
+        "`spec live` autostart (installed by the curl installer; commands "
+        "here are for review, manual installs, switching shells, and uninstall)."
     ),
 )
 def shell_group() -> None:
@@ -402,8 +515,9 @@ def shell_install_cmd(shell_flag: str | None, rc_file: Path | None) -> None:
     info("")
     dim(
         "From now on, `git init` (or `git init <dir>`) also runs `spec init` "
-        "in the new repo. Skipped when `spec.yaml` already exists or for "
-        "`--bare` repos."
+        "in the new repo when there is no `spec.yaml` yet (skipped for `--bare`). "
+        "After `git clone`, if the new tree contains a `spec.yaml`, `spec bundle doctor` "
+        "runs once from the clone root — disable with `export SPEC_NO_CLONE_DOCTOR=1`."
     )
     dim("Remove later with: spec shell uninstall")
 

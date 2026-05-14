@@ -45,6 +45,12 @@ def bundle_doctor_cmd() -> None:
     cloud_raw = manifest.cloud_project
     bundle_id = manifest.cloud_bundle_id
     hints: list[str] = []
+    # ``cloud.project: myslug`` (no slash) is resolved with the *viewer's*
+    # handle — not the bundle's personal owner on Cloud. That surprises
+    # teammates who clone a repo whose yaml still has a bare slug.
+    cloud_project_bare_slug = bool(
+        cloud_raw and isinstance(cloud_raw, str) and "/" not in cloud_raw.strip()
+    )
 
     console.print("[sf.label]Bundle doctor[/]")
     console.print(f"  [sf.muted]root[/]       {root}")
@@ -67,6 +73,11 @@ def bundle_doctor_cmd() -> None:
             dh = creds.user_handle if creds else None
             cloud_handle, cloud_slug = parse_cloud_project(cloud_raw, default_handle=dh)
             console.print(f"  [sf.muted]cloud[/]     {cloud_handle}/{cloud_slug}")
+            if cloud_project_bare_slug:
+                dim(
+                    "  note: bare `cloud.project` uses **your** Spec handle + that slug on the API. "
+                    "For bundles owned by someone else, commit `cloud.project: <their-handle>/<slug>`."
+                )
         except RemoteUrlError as e:
             warn(f"  cloud.project invalid: {e}")
     else:
@@ -93,10 +104,19 @@ def bundle_doctor_cmd() -> None:
                 )
         except ApiError as e:
             st = getattr(e, "status", None)
-            hints.append(
-                f"Your Spec login cannot use `{cloud_handle}/{cloud_slug}` ({e}; status={st}). "
-                f"Ask `@{cloud_handle}` (or a workspace admin) to grant access, then re-run this command."
-            )
+            if cloud_project_bare_slug:
+                hints.append(
+                    f"Cloud rejected `{cloud_handle}/{cloud_slug}` ({e}; status={st}). "
+                    f"`cloud.project` is the bare slug {cloud_raw!r}, so the CLI queried "
+                    f"`{cloud_handle}/{cloud_slug}` using **your** login — not the bundle owner's "
+                    "namespace. Fix: set `cloud.project` to `<owner-handle>/<slug>` (e.g. the handle "
+                    "shown on the team Bundles page) and commit."
+                )
+            else:
+                hints.append(
+                    f"Your Spec login cannot use `{cloud_handle}/{cloud_slug}` ({e}; status={st}). "
+                    f"Ask `@{cloud_handle}` (or a workspace admin) to grant access, then re-run this command."
+                )
     elif cloud_handle and cloud_slug:
         dim("  cloud access: (run `spec login` to verify access)")
 

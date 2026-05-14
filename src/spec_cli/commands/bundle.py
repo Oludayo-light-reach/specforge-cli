@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import click
 
+from ..api import ApiError, CloudClient
 from ..config import (
     BundleNotFoundError,
     dump_manifest,
@@ -23,10 +24,12 @@ def bundle_group() -> None:
 
 @bundle_group.command("doctor")
 def bundle_doctor_cmd() -> None:
-    """Show ``spec.yaml`` ``name``, directory name, ``origin`` repo name, and cloud slug.
+    """Show ``spec.yaml`` identity, git alignment, and cloud linkage.
 
-    Surfaces mismatches so bundle labels stay aligned with the GitHub
-    repo engineers expect.
+    Resolves the bundle from ``cwd`` the same way as ``spec watch`` (walk-up,
+    ``SPEC_BUNDLE_ROOT``, or git-tracked ``spec.yaml`` in a monorepo). When
+    logged in, asks Cloud whether your account can access ``cloud.project`` —
+    the usual blocker for team clones before ``spec team watch`` / ``spec watch``.
     """
     try:
         root = find_bundle_root()
@@ -40,6 +43,8 @@ def bundle_doctor_cmd() -> None:
     origin_url = read_origin_url(root)
     origin_repo = repo_name_from_remote_url(origin_url)
     cloud_raw = manifest.cloud_project
+    bundle_id = manifest.cloud_bundle_id
+    hints: list[str] = []
 
     console.print("[sf.label]Bundle doctor[/]")
     console.print(f"  [sf.muted]root[/]       {root}")
@@ -51,18 +56,50 @@ def bundle_doctor_cmd() -> None:
     else:
         dim("  origin: (no remote.origin.url — cannot infer repo name)")
 
+    cloud_handle: str | None = None
+    cloud_slug: str | None = None
+    if bundle_id:
+        console.print(f"  [sf.muted]bundle_id[/] {bundle_id}")
+
     if cloud_raw:
         try:
             creds = load_credentials()
             dh = creds.user_handle if creds else None
-            handle, slug = parse_cloud_project(cloud_raw, default_handle=dh)
-            console.print(f"  [sf.muted]cloud[/]     {handle}/{slug}")
+            cloud_handle, cloud_slug = parse_cloud_project(cloud_raw, default_handle=dh)
+            console.print(f"  [sf.muted]cloud[/]     {cloud_handle}/{cloud_slug}")
         except RemoteUrlError as e:
             warn(f"  cloud.project invalid: {e}")
     else:
         dim("  cloud: (cloud.project unset)")
 
-    hints: list[str] = []
+    creds = load_credentials()
+    if cloud_handle and cloud_slug and creds and creds.access_token:
+        try:
+            client = CloudClient(creds)
+            proj = client.resolve_project(cloud_handle, cloud_slug)
+            pid = proj.get("id")
+            remote_bid = proj.get("bundle_id")
+            tail = f", remote bundle_id={remote_bid}" if remote_bid else ""
+            console.print(f"  [sf.muted]cloud access[/]  ok — project id {pid}{tail}")
+            if (
+                bundle_id
+                and remote_bid
+                and str(bundle_id).strip() != str(remote_bid).strip()
+            ):
+                hints.append(
+                    f"Local `cloud.bundle_id` ({bundle_id!r}) differs from Cloud ({remote_bid!r}). "
+                    "Resolve before `spec push`: bind to the tree that matches Cloud, or adopt "
+                    "after a deliberate first push (see push command bundle mismatch error)."
+                )
+        except ApiError as e:
+            st = getattr(e, "status", None)
+            hints.append(
+                f"Your Spec login cannot use `{cloud_handle}/{cloud_slug}` ({e}; status={st}). "
+                f"Ask `@{cloud_handle}` (or a workspace admin) to grant access, then re-run this command."
+            )
+    elif cloud_handle and cloud_slug:
+        dim("  cloud access: (run `spec login` to verify access)")
+
     if origin_repo and yaml_name and origin_repo != yaml_name:
         hints.append(
             f"manifest `name` ({yaml_name!r}) differs from origin repo ({origin_repo!r}) "
@@ -85,7 +122,12 @@ def bundle_doctor_cmd() -> None:
             warn(h)
     else:
         console.print()
-        ok("no obvious naming mismatches detected.")
+        if cloud_handle and cloud_slug and creds and creds.access_token:
+            ok("no issues detected.")
+        elif cloud_handle and cloud_slug:
+            ok("no issues detected (run `spec login` to verify cloud access).")
+        else:
+            ok("no issues detected.")
 
 
 @bundle_group.command("sync-name")

@@ -8,6 +8,7 @@ into the **same** commit (via the ``commit-msg`` hook), and `git push` runs
 from __future__ import annotations
 
 import os
+import os
 import shlex
 import shutil
 import subprocess
@@ -17,7 +18,12 @@ from pathlib import Path, PurePosixPath
 import click
 import yaml
 
-from ..config import BundleNotFoundError, find_bundle_root, load_manifest
+from ..config import (
+    BundleNotFoundError,
+    discover_bundle_roots_under_git_root,
+    find_bundle_root,
+    load_manifest,
+)
 from ..constants import MANIFEST_FILENAME, is_bundle_path, is_spec_file
 from ..frontmatter import read_frontmatter
 from ..git import repo_toplevel
@@ -32,83 +38,26 @@ def _spec_cmd_prefix() -> list[str]:
     return [sys.executable, "-m", "spec_cli"]
 
 
-def _is_bundle_manifest(path: Path) -> bool:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    schema = data.get("schema")
-    return isinstance(schema, str) and schema.startswith("spec/")
-
-
-def discover_bundle_roots_under_git_root(git_root: Path) -> list[Path]:
-    """Return directories under ``git_root`` that contain a bundle ``spec.yaml``."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(git_root), "ls-files"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if result.returncode != 0:
-        return []
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for line in result.stdout.splitlines():
-        line = line.strip().replace("\\", "/")
-        if not line.endswith(MANIFEST_FILENAME):
-            continue
-        if PurePosixPath(line).name != MANIFEST_FILENAME:
-            continue
-        manifest = (git_root / line).resolve()
-        parent = manifest.parent
-        if parent in seen:
-            continue
-        if not _is_bundle_manifest(manifest):
-            continue
-        seen.add(parent)
-        roots.append(parent)
-    return sorted(roots, key=lambda p: str(p))
-
-
 def resolve_bundle_root_for_git_hook(git_top: Path | None = None) -> Path | None:
     """Pick the bundle root when git hooks run at the worktree top.
 
-    Honors ``SPEC_BUNDLE_ROOT``. Otherwise uses :func:`find_bundle_root`
-    from ``git_top``. If that fails (nested bundle), discovers tracked
-    ``spec.yaml`` files; with multiple bundles prefers ``<top>/spec`` when
-    present, else prints a hint and returns ``None``.
+    Delegates to :func:`find_bundle_root` (``SPEC_BUNDLE_ROOT``, walk-up,
+    then git-tracked discovery). Returns ``None`` when resolution fails so
+    hooks can skip quietly; prints a hint when multiple bundles match.
     """
-    env = os.environ.get("SPEC_BUNDLE_ROOT", "").strip()
-    if env:
-        p = Path(env).expanduser().resolve()
-        if (p / MANIFEST_FILENAME).is_file():
-            return p
     top = (git_top or Path.cwd()).resolve()
     try:
         return find_bundle_root(top)
     except BundleNotFoundError:
-        pass
-    candidates = discover_bundle_roots_under_git_root(top)
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        preferred = (top / "spec").resolve()
-        if preferred in candidates:
-            return preferred
-        print(
-            "spec: multiple bundles in this repo; set SPEC_BUNDLE_ROOT to the bundle "
-            "directory, or run `spec push` manually.",
-            file=sys.stderr,
-        )
+        if not os.environ.get("SPEC_BUNDLE_ROOT", "").strip():
+            candidates = discover_bundle_roots_under_git_root(top)
+            if len(candidates) > 1:
+                print(
+                    "spec: multiple bundles in this repo; set SPEC_BUNDLE_ROOT to the bundle "
+                    "directory, or run `spec push` manually.",
+                    file=sys.stderr,
+                )
         return None
-    return None
 
 
 def _repo_relative_path_under_bundle(

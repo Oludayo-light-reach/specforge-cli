@@ -13,7 +13,9 @@ Reads/writes the two config surfaces the CLI owns:
      when present.
 
 Everything path-related is resolved from the bundle root, which we find by
-walking up from cwd looking for a `spec.yaml`.
+walking up from cwd (or ``SPEC_BUNDLE_ROOT``), and — when inside a git repo
+without a parent ``spec.yaml`` — by discovering tracked bundle manifests
+under the worktree (same rules as git hooks).
 """
 
 from __future__ import annotations
@@ -22,8 +24,9 @@ import json
 import os
 import re
 import stat
+import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
@@ -184,15 +187,104 @@ class Manifest:
         return self.path.parent
 
 
+def _is_bundle_manifest_file(manifest_path: Path) -> bool:
+    """True when ``manifest_path`` looks like a Spec bundle (not a random yaml)."""
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    schema = data.get("schema")
+    return isinstance(schema, str) and schema.startswith("spec/")
+
+
+def discover_bundle_roots_under_git_root(git_root: Path) -> list[Path]:
+    """Directories under ``git_root`` that contain a tracked bundle ``spec.yaml``."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(git_root), "ls-files"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for line in (result.stdout or "").splitlines():
+        line = line.strip().replace("\\", "/")
+        if not line.endswith(MANIFEST_FILENAME):
+            continue
+        if PurePosixPath(line).name != MANIFEST_FILENAME:
+            continue
+        manifest = (git_root / line).resolve()
+        parent = manifest.parent
+        if parent in seen:
+            continue
+        if not _is_bundle_manifest_file(manifest):
+            continue
+        seen.add(parent)
+        roots.append(parent)
+    return sorted(roots, key=lambda p: str(p))
+
+
 def find_bundle_root(start: Path | None = None) -> Path:
-    """Walk up from `start` (default cwd) until we find a `spec.yaml`."""
+    """Resolve the bundle directory containing ``spec.yaml``.
+
+    Resolution order:
+
+    1. ``SPEC_BUNDLE_ROOT`` — absolute path to the bundle when set (multi-
+       bundle monorepos, or when ``cwd`` is outside the tree).
+    2. Walk upward from ``start`` / the current working directory until a
+       ``spec.yaml`` is found (classic single-bundle layout).
+    3. If still missing, use the git worktree root and scan **tracked**
+       ``spec.yaml`` files (same discovery as git hooks). Exactly one match
+       wins; several matches prefer ``<repo>/spec`` when present; otherwise
+       raises with a hint to set ``SPEC_BUNDLE_ROOT``.
+    """
     here = (start or Path.cwd()).resolve()
+
+    env_root = os.environ.get("SPEC_BUNDLE_ROOT", "").strip()
+    if env_root:
+        p = Path(env_root).expanduser().resolve()
+        if (p / MANIFEST_FILENAME).is_file():
+            return p
+        raise BundleNotFoundError(
+            f"SPEC_BUNDLE_ROOT is set to {p} but there is no {MANIFEST_FILENAME} there."
+        )
+
     for candidate in [here, *here.parents]:
         if (candidate / MANIFEST_FILENAME).is_file():
             return candidate
+
+    from .git import repo_toplevel
+
+    gt = repo_toplevel(here)
+    if gt is not None:
+        roots = discover_bundle_roots_under_git_root(gt)
+        if len(roots) == 1:
+            return roots[0]
+        if len(roots) > 1:
+            preferred = (gt / "spec").resolve()
+            if preferred in roots:
+                return preferred
+            rels = [str(r.relative_to(gt)) for r in roots[:8]]
+            tail = "…" if len(roots) > 8 else ""
+            listed = ", ".join(rels) + tail
+            raise BundleNotFoundError(
+                f"No {MANIFEST_FILENAME} in parents of {here}; this git repo has "
+                f"multiple bundles ({listed}). "
+                f"Export SPEC_BUNDLE_ROOT to the bundle directory you want, then retry."
+            )
+
     raise BundleNotFoundError(
         f"No {MANIFEST_FILENAME} found in {here} or any parent. "
-        "Run `spec init` to scaffold one."
+        "Run `spec init` to scaffold one, or `cd` into the bundle directory."
     )
 
 

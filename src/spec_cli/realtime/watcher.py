@@ -172,7 +172,7 @@ class WatcherOptions:
     self_user_id: int | None
     self_handle: str | None = None
     self_name: str | None = None
-    # Stable per-bundle install id (``.spec/live-broadcast-client-id``).
+    # Stable per-(machine, bundle) id (``~/.spec/broadcast-client-ids/``).
     # Used when posting and when filtering SSE echoes on ``spec watch``.
     broadcast_client_id: str | None = None
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECS

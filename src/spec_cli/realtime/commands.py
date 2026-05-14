@@ -583,10 +583,16 @@ def _fetch_entire_session_events(
             truncated = True
             del out[_thread_max_session_rows() :]
             break
-        page_max = max(raw_ids)
         if len(rows) < _THREAD_PAGE_SIZE:
             break
-        since = page_max
+        # Advance the cursor using ids from **this session only**. When the
+        # server ignores ``session_id`` (legacy) or interleaves other traffic,
+        # ``max(raw_ids)`` can belong to another session and skip rows in the
+        # target session — ``/turn`` / ``/full`` then show a truncated reply.
+        if batch:
+            since = max(ev.id for ev in batch)
+        else:
+            since = max(raw_ids)
     out.sort(key=lambda e: e.id)
     return out, truncated
 

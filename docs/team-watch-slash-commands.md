@@ -153,23 +153,24 @@ Snippet is a short extract around the first body hit, or `no matches…`.
 
 **Input:** Optional **prefix** of `session_id` (must match **exactly one** `(project_id, session_id)` among user/assistant/error rows in the **in-memory buffer**). If omitted, uses **`notifier.last_turn_digest()`** after **`● turn complete`** (digest mode).
 
-**Cloud:** Paginated fetch for that `session_id` (see Requirements). If the session exceeds **50 000** stored rows, `/turn` aborts with **`✗`** (the last turn might not be trustworthy without the tail).
+**Cloud:** Paginated fetch for that `session_id` (see Requirements). If the session exceeds the configured row cap (default **120 000**, override with env **`SPEC_LIVE_THREAD_MAX_ROWS`**), a **`[note]`** line is prepended: earliest events may be missing and the last turn may be incomplete.
 
 **Output:** Opens in your **system pager** (see Requirements): a banner at the top of the buffer reminds you **Press q** to return to the live feed. The live stream does **not** print underneath while the pager runs (missed lines are counted; a hint suggests `/replay` if needed). If no pager executable is found, the same text is printed inline as a `≡` block.
 
 **Errors / info:**  
 - `✗` Cloud client missing; fetch failed; no buffer match; ambiguous chip (**no** HTTP call on ambiguous).  
-- `✗` Session hit the 50k-row fetch cap.  
 - `·` No user rows in Cloud for that session; no assistant after latest user (still streaming).
 
 ```text
-── /turn · session <8-char>… · #<user_id> → #<assistant_id> ──
+── /turn · session <8-char>… · user #<user_id> ──
 
 USER
 <full user text>
 
-ASSISTANT
+ASSISTANT (#<id>–#<id>)
 <full merged assistant text + summary per merge rules>
+
+ERROR (#<id>) — <model>     # when agent error rows exist in the turn window
 
 TOOL RUNS (N)    # only if tool_calls present
   · <one line per tool, up to 50>
@@ -180,15 +181,15 @@ TOOL RUNS (N)    # only if tool_calls present
 
 ### `/full [<session-chip>]` — **entire session** (all user→assistant turns)
 
-**Meaning:** Every **user** row in that `session_id`, in order, each paired with the **assistant** rows that follow until the next user — same merge rules as `/turn`, but **all** turns, not just the last one.
+**Meaning:** Every **user** row in that `session_id`, in order, each paired with the **assistant** and **error** rows that follow until the next user — same merge rules as `/turn`, but **all** turns, not just the last one.
 
 **Input:** Same session resolution as `/turn`.
 
-**Cloud:** Same paginated `session_id` fetch as `/turn`. If the fetch hits **50 000** rows, a **`[note]`** line is prepended: older rows may be missing. Independently, the **printed** output is capped at **~180 000 characters** (then a truncation footer).
+**Cloud:** Same paginated `session_id` fetch as `/turn`. If the fetch hits the row cap, a **`[note]`** line is prepended: older rows may be missing. Independently, the **printed** output is capped (default **~900 000** characters; override with **`SPEC_LIVE_THREAD_PRINT_MAX_CHARS`**) with a truncation footer.
 
 **Output:** Same pager behaviour as `/turn` (banner + **q** to return). Multiple turns are concatenated in one pager session.
 
-**Errors:** Same family as `/turn` (`✗` / `·`), except `/full` continues with a note when the row cap is hit instead of hard-failing.
+**Errors:** Same family as `/turn` (`✗` / `·`), except `/full` always continues with a note when the row cap is hit instead of aborting.
 
 ---
 

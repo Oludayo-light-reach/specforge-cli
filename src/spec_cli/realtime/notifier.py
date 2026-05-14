@@ -336,6 +336,8 @@ class Notifier:
         strip_code_blocks: bool = True,
         review_feed_full_bodies: bool = False,
         assistant_live_cap: int | None = None,
+        self_user_id: int | None = None,
+        local_broadcast_client_id: str | None = None,
     ) -> None:
         self._compact = compact
         self._lock = threading.Lock()
@@ -397,6 +399,12 @@ class Notifier:
         self._recent_completed_pairs: deque[
             tuple[IncomingEvent, IncomingEvent]
         ] = deque(maxlen=50)
+        # ``spec watch``: signed-in user id + this bundle's install id so
+        # we can label same-account traffic from a different computer.
+        self._self_user_id = self_user_id
+        self._local_broadcast_client_id = (
+            (local_broadcast_client_id or "").strip() or None
+        )
         # ``/turn`` / ``/full``: while a system pager (``less``) owns the
         # screen, suppress live stream prints so output does not interleave.
         self._live_suppress = False
@@ -547,9 +555,25 @@ class Notifier:
             return (ev.author_display, preview)
         return None
 
+    def _other_machine_note(self, event: IncomingEvent) -> str:
+        """Tag same-account events from a different ``spec watch`` install."""
+        lb = self._local_broadcast_client_id
+        wb = (event.broadcast_client_id or "").strip()
+        if not lb or not wb or wb == lb:
+            return ""
+        vh = self._viewer_handle
+        if vh:
+            ah = (event.author_handle or "").strip().lstrip("@").lower()
+            if ah == vh:
+                return " [sf.warn]· other machine[/]"
+        if self._self_user_id is not None and event.author_user_id == self._self_user_id:
+            return " [sf.warn]· other machine[/]"
+        return ""
+
     def show(self, event: IncomingEvent) -> None:
         time_label = _short_time(event.turn_at or event.received_at)
         author = event.author_display
+        om = self._other_machine_note(event)
         branch = event.branch or "-"
         source_label = _source_label(event.source)
         bundle = (
@@ -592,7 +616,7 @@ class Notifier:
             # sees the green block and knows immediately a human just
             # typed something.
             head = (
-                f"{_USER_BADGE} [bold #3ddab4]{author}[/] "
+                f"{_USER_BADGE} [bold #3ddab4]{author}[/]{om} "
                 f"[sf.muted]· prompt to[/] {source_label} "
                 f"[sf.muted]· {branch} · {time_label}[/]"
                 f"{bundle}"
@@ -614,7 +638,7 @@ class Notifier:
             model = event.model or "agent"
             head = (
                 f"{_ERROR_BADGE} [bold #ff8a98]{model}[/] "
-                f"[sf.muted]· failed on[/] [bold #3ddab4]{author}[/] "
+                f"[sf.muted]· failed on[/] [bold #3ddab4]{author}[/]{om} "
                 f"[sf.muted]· in[/] {source_label} "
                 f"[sf.muted]· {branch} · {time_label}[/]"
                 f"{bundle}"
@@ -650,7 +674,7 @@ class Notifier:
             # and "codex/gpt-5" read as cleanly separable identities.
             head = (
                 f"{_AI_BADGE} [bold #7de3ff]{model}[/] "
-                f"[sf.muted]· replying to[/] [bold #3ddab4]{author}[/] "
+                f"[sf.muted]· replying to[/] [bold #3ddab4]{author}[/]{om} "
                 f"[sf.muted]· in[/] {source_label} "
                 f"[sf.muted]· {branch} · {time_label}[/]"
                 f"{bundle}"
@@ -787,8 +811,9 @@ class Notifier:
             f" [sf.muted]· {user.bundle_label}[/]" if user.bundle_label else ""
         )
         u_time = _short_time(user.turn_at or user.received_at)
+        u_om = self._other_machine_note(user)
         u_head = (
-            f"{_USER_BADGE} [bold #3ddab4]{u_author}[/] "
+            f"{_USER_BADGE} [bold #3ddab4]{u_author}[/]{u_om} "
             f"[sf.muted]· prompt to[/] {u_src} "
             f"[sf.muted]· {u_branch} · {u_time}[/]"
             f"{u_bundle}"
@@ -807,9 +832,10 @@ class Notifier:
         )
         a_time = _short_time(assistant.turn_at or assistant.received_at)
         model = assistant.model or "assistant"
+        a_om = self._other_machine_note(assistant)
         a_head = (
             f"{_AI_BADGE} [bold #7de3ff]{model}[/] "
-            f"[sf.muted]· replying to[/] [bold #3ddab4]{a_author}[/] "
+            f"[sf.muted]· replying to[/] [bold #3ddab4]{a_author}[/]{a_om} "
             f"[sf.muted]· in[/] {a_src} "
             f"[sf.muted]· {a_branch} · {a_time}[/]"
             f"{a_bundle}"

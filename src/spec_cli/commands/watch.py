@@ -268,12 +268,13 @@ def watch_cmd(
         project_id = int(project_info["id"])
 
         # Self-id + display block for echo suppression and the local
-        # team-presence mirror. Best-effort: when the user's own
-        # broadcasts come back over the SSE stream, we filter them by
-        # ``author.user_id == self_user_id``. If the server doesn't return
-        # ``user_id`` from ``/api/auth/me`` (older deploys), echo
-        # suppression silently no-ops and the user sees their own events
-        # — annoying but not broken.
+        # team-presence mirror. Echo filtering matches ``author.user_id``
+        # **and** ``broadcast_client_id`` from the wire so the same
+        # account on a second computer is not suppressed as a local echo.
+        # If the server doesn't return ``user_id`` from ``/api/auth/me``
+        # (older deploys), echo suppression silently no-ops on the user
+        # dimension — the client id still distinguishes installs when the
+        # field is present on events.
         self_user_id: int | None = None
         self_handle: str | None = creds.user_handle
         self_name: str | None = None

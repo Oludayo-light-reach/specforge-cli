@@ -36,8 +36,8 @@ Commands
   session from Cloud (paginated ``session_id`` + ``since_id``), print the
   last user row and the merged assistant reply for that prompt only.
 * ``/full [<session-chip>]`` — **Entire session:** same Cloud fetch, but print
-  **every** user→assistant turn in order (still subject to a 50k-row fetch cap
-  and ``~180k`` terminal print cap).
+  **every** user→assistant turn in order (subject to row / print caps;
+  override with ``SPEC_LIVE_THREAD_MAX_ROWS`` / ``SPEC_LIVE_THREAD_PRINT_MAX_CHARS``).
 * ``/critic on|off`` — toggle the auto-critic at runtime.
 * ``/status`` (``/who``) — print who is active and on which source.
 * ``/push <handle> [message…]`` / ``/push@handle [message…]`` — from a
@@ -55,6 +55,7 @@ last hour of an active team without bloating memory.
 """
 from __future__ import annotations
 
+import os
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -450,10 +451,29 @@ def _cmd_pair(_cmd: ParsedCommand, ctx: CommandContext) -> None:
 # ``since_id`` + ``session_id`` until the session is exhausted.
 _THREAD_PAGE_SIZE = 1000
 _THREAD_FETCH_TIMEOUT = 25.0
-# Hard cap on rows pulled for one ``/full`` / ``/turn`` (abuse / memory).
-_THREAD_MAX_SESSION_ROWS = 50_000
-# Hard cap on printed characters so a huge session cannot stall Rich.
-_THREAD_PRINT_MAX_CHARS = 180_000
+
+
+def _thread_max_session_rows() -> int:
+    """Upper bound on rows pulled for one ``/full`` / ``/turn`` session.
+
+    Env ``SPEC_LIVE_THREAD_MAX_ROWS`` overrides (clamped 1k–2M). Default
+    raised from 50k so long agent threads truncate less often.
+    """
+    raw = (os.environ.get("SPEC_LIVE_THREAD_MAX_ROWS") or "").strip()
+    if raw.isdigit():
+        return max(1000, min(int(raw), 2_000_000))
+    return 120_000
+
+
+def _thread_print_max_chars() -> int:
+    """Pager body cap for ``/full`` (and symmetrically sized ``/turn``).
+
+    Env ``SPEC_LIVE_THREAD_PRINT_MAX_CHARS`` overrides (clamped).
+    """
+    raw = (os.environ.get("SPEC_LIVE_THREAD_PRINT_MAX_CHARS") or "").strip()
+    if raw.isdigit():
+        return max(50_000, min(int(raw), 10_000_000))
+    return 900_000
 
 
 def _session_matches_prefix(prefix: str, session_id: str) -> bool:
@@ -525,7 +545,7 @@ def _fetch_entire_session_events(
     out: list[IncomingEvent] = []
     since = 0
     truncated = False
-    while len(out) < _THREAD_MAX_SESSION_ROWS:
+    while len(out) < _thread_max_session_rows():
         rows = client.list_prompt_events(
             project_id,
             since_id=since,
@@ -559,9 +579,9 @@ def _fetch_entire_session_events(
                 continue
             batch.append(ev)
         out.extend(batch)
-        if len(out) >= _THREAD_MAX_SESSION_ROWS:
+        if len(out) >= _thread_max_session_rows():
             truncated = True
-            del out[_THREAD_MAX_SESSION_ROWS:]
+            del out[_thread_max_session_rows() :]
             break
         page_max = max(raw_ids)
         if len(rows) < _THREAD_PAGE_SIZE:
@@ -583,45 +603,80 @@ def _iter_user_assistant_turns(
                 turns.append((cur_u, cur_a))
             cur_u = ev
             cur_a = []
-        elif ev.role == "assistant" and cur_u is not None:
+        elif ev.role in ("assistant", "error") and cur_u is not None:
             cur_a.append(ev)
     if cur_u is not None:
         turns.append((cur_u, cur_a))
     return turns
 
 
-def _format_merged_turn(
+def _format_thread_turn_block(
     label: str,
     user: IncomingEvent,
-    merged: IncomingEvent,
+    reply_chunks: list[IncomingEvent],
 ) -> str:
+    """One user prompt plus ordered assistant/error segments for ``/turn`` / ``/full``."""
     chip = (user.session_id or "").strip()[:8] or "?"
     ubody = (user.text or user.summary or "").strip()
-    abody = Notifier._assistant_visible_prose(
-        merged.text, merged.summary
-    ).strip()
-    lines = [
-        f"── {label} · session {chip}… · #{user.id} → #{merged.id} ──",
+    ordered = sorted(reply_chunks, key=lambda e: e.id)
+    lines: list[str] = [
+        f"── {label} · session {chip}… · user #{user.id} ──",
         "",
         "USER",
         ubody,
-        "",
-        "ASSISTANT",
-        abody,
     ]
-    if merged.tool_calls:
-        lines.extend(
-            [
-                "",
-                f"TOOL RUNS ({len(merged.tool_calls)})",
-            ]
-        )
-        shown = merged.tool_calls[:50]
-        for tc in shown:
-            lines.append(f"  · {_format_tool_call_line(tc)}")
-        extra = len(merged.tool_calls) - len(shown)
-        if extra > 0:
-            lines.append(f"  · …+{extra} more tools")
+    if not ordered:
+        lines.extend(["", "(no assistant or error rows in this window)"])
+        return "\n".join(lines)
+
+    i = 0
+    while i < len(ordered):
+        ev = ordered[i]
+        if ev.role == "error":
+            err_body = Notifier._assistant_visible_prose(
+                ev.text, ev.summary
+            ).strip()
+            lines.extend(
+                [
+                    "",
+                    f"ERROR (#{ev.id}) — {ev.model or 'agent'}",
+                    err_body or "(no message)",
+                ]
+            )
+            i += 1
+            continue
+        if ev.role == "assistant":
+            j = i
+            while j < len(ordered) and ordered[j].role == "assistant":
+                j += 1
+            group = ordered[i:j]
+            merged = merge_assistant_snapshots(group)
+            abody = Notifier._assistant_visible_prose(
+                merged.text, merged.summary
+            ).strip()
+            lines.extend(
+                [
+                    "",
+                    f"ASSISTANT (#{group[0].id}–#{group[-1].id})",
+                    abody or "(empty body)",
+                ]
+            )
+            if merged.tool_calls:
+                lines.extend(
+                    [
+                        "",
+                        f"TOOL RUNS ({len(merged.tool_calls)})",
+                    ]
+                )
+                shown = merged.tool_calls[:50]
+                for tc in shown:
+                    lines.append(f"  · {_format_tool_call_line(tc)}")
+                extra = len(merged.tool_calls) - len(shown)
+                if extra > 0:
+                    lines.append(f"  · …+{extra} more tools")
+            i = j
+            continue
+        i += 1
     return "\n".join(lines)
 
 
@@ -651,6 +706,7 @@ def _cmd_turn(cmd: ParsedCommand, ctx: CommandContext) -> None:
             )
         return
     pid, sid = resolved
+    row_cap = _thread_max_session_rows()
     try:
         evs, truncated = _fetch_entire_session_events(ctx.cloud_client, pid, sid)
     except ApiError as e:
@@ -659,13 +715,12 @@ def _cmd_turn(cmd: ParsedCommand, ctx: CommandContext) -> None:
     except Exception as e:  # noqa: BLE001
         ctx.notifier.show_command_result(f"/turn fetch failed: {e}", kind="error")
         return
+    notes: list[str] = []
     if truncated:
-        ctx.notifier.show_command_result(
-            f"session `{sid[:8]}…` hit the {_THREAD_MAX_SESSION_ROWS:,}-row "
-            "fetch cap — `/turn` may be incomplete.",
-            kind="error",
+        notes.append(
+            f"[note] session fetch stopped at {row_cap:,} rows — earliest "
+            "events may be missing; the last turn may be incomplete.\n"
         )
-        return
     turns = _iter_user_assistant_turns(evs)
     if not turns:
         ctx.notifier.show_command_result(
@@ -681,8 +736,7 @@ def _cmd_turn(cmd: ParsedCommand, ctx: CommandContext) -> None:
             kind="info",
         )
         return
-    merged = merge_assistant_snapshots(chunks)
-    body = _format_merged_turn("/turn", user, merged)
+    body = "".join(notes) + _format_thread_turn_block("/turn", user, chunks)
     chip = (user.session_id or "").strip()[:8] or (sid[:8] if sid else "?")
     ctx.notifier.show_in_system_pager(body, banner=f"/turn · session {chip}…")
 
@@ -713,6 +767,8 @@ def _cmd_full(cmd: ParsedCommand, ctx: CommandContext) -> None:
             )
         return
     pid, sid = resolved
+    row_cap = _thread_max_session_rows()
+    print_cap = _thread_print_max_chars()
     try:
         evs, truncated = _fetch_entire_session_events(ctx.cloud_client, pid, sid)
     except ApiError as e:
@@ -731,7 +787,7 @@ def _cmd_full(cmd: ParsedCommand, ctx: CommandContext) -> None:
     blocks: list[str] = []
     if truncated:
         blocks.append(
-            f"[note] session fetch stopped at {_THREAD_MAX_SESSION_ROWS:,} rows "
+            f"[note] session fetch stopped at {row_cap:,} rows "
             "— older turns may be missing.\n"
         )
     for idx, (user, chunks) in enumerate(turns, start=1):
@@ -743,13 +799,16 @@ def _cmd_full(cmd: ParsedCommand, ctx: CommandContext) -> None:
                 f"USER\n{(user.text or user.summary or '').strip()}"
             )
             continue
-        merged = merge_assistant_snapshots(chunks)
-        blocks.append(_format_merged_turn(f"/full · turn {idx}", user, merged))
+        blocks.append(
+            _format_thread_turn_block(f"/full · turn {idx}", user, chunks)
+        )
     body = "\n\n".join(blocks)
-    if len(body) > _THREAD_PRINT_MAX_CHARS:
+    if len(body) > print_cap:
         body = (
-            body[:_THREAD_PRINT_MAX_CHARS]
-            + "\n\n… [truncated — narrow the window or inspect Cloud export]\n"
+            body[:print_cap]
+            + "\n\n… [truncated at "
+            f"{print_cap:,} chars — raise SPEC_LIVE_THREAD_PRINT_MAX_CHARS "
+            "or inspect Cloud / REST export]\n"
         )
     chip = sid[:8] if sid else "?"
     ctx.notifier.show_in_system_pager(

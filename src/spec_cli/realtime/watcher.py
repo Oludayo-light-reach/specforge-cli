@@ -46,7 +46,7 @@ from ..sources import (
 )
 from ..stage import historical_bundle_paths, record_bundle_path
 from ..ui import dim
-from .events import OutgoingEvent, ToolCallPayload
+from .broadcast_identity import load_or_create_broadcast_client_id
 from .mirror import PeerMirror
 from .notifier import Notifier
 from .presence import (
@@ -150,6 +150,7 @@ def _post_assistant_closed(
         paths_touched=list(session.paths_touched or []),
         turn_at=_now_utc(),
         closes_event_id=last_assistant_cloud_id,
+        broadcast_client_id=opts.broadcast_client_id,
     )
     ok, _ = poster.send(evt)
     if not ok:
@@ -170,6 +171,9 @@ class WatcherOptions:
     self_user_id: int | None
     self_handle: str | None = None
     self_name: str | None = None
+    # Stable per-bundle install id (``.spec/live-broadcast-client-id``).
+    # Used when posting and when filtering SSE echoes on ``spec watch``.
+    broadcast_client_id: str | None = None
     poll_interval: float = DEFAULT_POLL_INTERVAL_SECS
     presence_interval: float = DEFAULT_PRESENCE_INTERVAL_SECS
     broadcast: bool = True
@@ -218,6 +222,11 @@ def run_watcher(
     cursor = LiveCursor.load(bundle_root, project_id=opts.project_id)
     cursor.project_id = opts.project_id
 
+    if opts.broadcast_client_id is None:
+        opts.broadcast_client_id = load_or_create_broadcast_client_id(
+            bundle_root
+        )
+
     notifier = Notifier(
         compact=opts.compact_output,
         show_tool_runs=opts.show_tool_runs,
@@ -226,6 +235,8 @@ def run_watcher(
         # the code itself. When off, strip code blocks so the default
         # pane shows prose narration without dumps of pasted code.
         strip_code_blocks=not opts.show_tool_runs,
+        self_user_id=opts.self_user_id,
+        local_broadcast_client_id=opts.broadcast_client_id,
     )
     notifier.announce_connected(opts.project_label)
     if not opts.broadcast:
@@ -314,15 +325,16 @@ def run_watcher(
 
         def _on_event(event) -> None:  # type: ignore[no-untyped-def]
             cursor.record_received(event.id)
-            if (
-                opts.self_user_id is not None
-                and event.author_user_id == opts.self_user_id
+            if opts.self_user_id is not None and (
+                event.author_user_id == opts.self_user_id
             ):
-                # Skip echoes of our own broadcasts. The server fans
-                # out unconditionally; the client filters. We still
-                # advanced the cursor above so the next reconnect
-                # doesn't re-receive this row.
-                return
+                # Skip only this install's echoes (same bearer + same client id).
+                # Missing ``broadcast_client_id`` on the wire means we cannot
+                # tell another machine from a legacy echo — prefer showing the row.
+                local_bid = (opts.broadcast_client_id or "").strip()
+                wire_bid = (event.broadcast_client_id or "").strip()
+                if wire_bid and local_bid and wire_bid == local_bid:
+                    return
             if event.role == "presence":
                 # Presence updates land in the cache (and trigger a
                 # mirror rewrite below); we do NOT print them to the
@@ -583,6 +595,7 @@ def _broadcast_presence(
         paths_touched=[f.path for f in payload.files][:64],
         presence=payload,
         turn_at=datetime.now(timezone.utc),
+        broadcast_client_id=opts.broadcast_client_id,
     )
     return poster.send(event, timeout=timeout)[0]
 
@@ -844,6 +857,7 @@ def _build_outgoing(
         paths_touched=list(session.paths_touched or []),
         turn_at=turn.at or _now_utc(),
         tool_calls=tool_calls_out,
+        broadcast_client_id=opts.broadcast_client_id,
     )
 
 

@@ -45,6 +45,7 @@ from ..config import (
     parse_cloud_project,
 )
 from ..git import read_git_context
+from ..realtime.broadcast_identity import load_or_create_broadcast_client_id
 from ..realtime.commands import (
     CommandContext,
     WatchState,
@@ -384,10 +385,10 @@ def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
 
 # ``GET /api/projects/{id}/prompt-events?since_id=`` hard cap for one
 # Q/A merge — matches the backend list ceiling order of magnitude.
-_TEAM_WATCH_THREAD_FETCH_LIMIT = 500
+_TEAM_WATCH_THREAD_FETCH_LIMIT = 2500
 # Shorter than the generic Cloud client default so a wedged API cannot
 # stall the team-watch main loop for half a minute on every merge.
-_TEAM_WATCH_THREAD_FETCH_TIMEOUT_SECS = 20.0
+_TEAM_WATCH_THREAD_FETCH_TIMEOUT_SECS = 28.0
 
 
 def _assistant_tail_from_rest_after_user(
@@ -904,6 +905,22 @@ def team_watch_cmd(
     except BundleNotFoundError:
         bundle_watch_root = None
 
+    team_watch_self_id: int | None = None
+    try:
+        _me_client = CloudClient(creds)
+        me_raw = _me_client._request("GET", "/api/auth/me")  # noqa: SLF001
+        if isinstance(me_raw, dict) and isinstance(me_raw.get("id"), int):
+            team_watch_self_id = int(me_raw["id"])
+    except Exception:  # noqa: BLE001
+        team_watch_self_id = None
+
+    team_local_bid: str | None = None
+    if bundle_watch_root is not None:
+        try:
+            team_local_bid = load_or_create_broadcast_client_id(bundle_watch_root)
+        except OSError:
+            team_local_bid = None
+
     # Bounded in-memory event memory shared with the command layer:
     # /summarize, /replay, /status all read from this. Updated in
     # the consumer callback, so command handlers see exactly what
@@ -933,6 +950,8 @@ def team_watch_cmd(
         assistant_live_cap=(
             None if (compact or show_tool_runs) else 400
         ),
+        self_user_id=team_watch_self_id,
+        local_broadcast_client_id=team_local_bid,
     )
     stop_event = threading.Event()
     # Tracks the timestamp of the last *visible* output so the idle

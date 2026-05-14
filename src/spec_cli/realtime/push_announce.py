@@ -37,7 +37,7 @@ from typing import Any
 import requests
 
 from ..config import Credentials
-from .events import OutgoingEvent
+from .broadcast_identity import load_or_create_broadcast_client_id
 from .presence import LocalPresence, compute_local_presence
 
 _USER_AGENT = "spec-cli/push-announce"
@@ -120,6 +120,7 @@ def _build_event(
     Kept in sync by shape — we don't import the watcher's helper to
     avoid pulling the daemon module into the push CLI startup path.
     """
+    broadcast_client_id = load_or_create_broadcast_client_id(bundle_root)
     payload = local.to_payload()
     # Force-clean: even if the working tree still has dirty files
     # (unlikely after a successful push, but possible if the user
@@ -157,6 +158,7 @@ def _build_event(
         paths_touched=[f.path for f in payload.files][:64],
         presence=payload,
         turn_at=datetime.now(timezone.utc),
+        broadcast_client_id=broadcast_client_id,
     )
 
 

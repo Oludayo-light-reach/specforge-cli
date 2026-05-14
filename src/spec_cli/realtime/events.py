@@ -7,7 +7,8 @@ The CLI never imports the server schemas directly (no shared package),
 so everything that crosses the wire round-trips through these.
 
 Keep these in lockstep with ``backend/app/schemas.py`` and
-``PROMPT-LIVE-PLAN.md`` §4.1.
+``PROMPT-LIVE-PLAN.md`` §4.1 (including ``broadcast_client_id`` on
+``PromptEventCreate`` / ``PromptEventOut``).
 """
 from __future__ import annotations
 
@@ -181,6 +182,10 @@ class OutgoingEvent:
     # ``role == "assistant_closed"`` only — references the last assistant
     # row id returned by ``POST /prompt-events`` for this session.
     closes_event_id: int | None = None
+    # Per-install id (persisted under ``.spec/``) so ``spec watch`` can
+    # suppress only this machine's SSE echoes, not another computer on
+    # the same account.
+    broadcast_client_id: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -201,6 +206,8 @@ class OutgoingEvent:
         }
         if self.closes_event_id is not None and self.closes_event_id >= 1:
             out["closes_event_id"] = self.closes_event_id
+        if self.broadcast_client_id:
+            out["broadcast_client_id"] = self.broadcast_client_id
         return out
 
 
@@ -282,6 +289,7 @@ class IncomingEvent:
     bundle_label: str | None = None
     tool_calls: list[ToolCallPayload] = field(default_factory=list)
     closes_event_id: int | None = None
+    broadcast_client_id: str | None = None
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "IncomingEvent":
@@ -299,6 +307,10 @@ class IncomingEvent:
         closes_event_id: int | None = None
         if isinstance(raw_close, int) and raw_close >= 1:
             closes_event_id = raw_close
+        bc_raw = payload.get("broadcast_client_id")
+        broadcast_client_id: str | None = None
+        if isinstance(bc_raw, str) and bc_raw.strip():
+            broadcast_client_id = bc_raw.strip()[:128]
         return cls(
             id=int(payload["id"]),
             project_id=int(payload["project_id"]),
@@ -324,6 +336,7 @@ class IncomingEvent:
             bundle_label=_str_or_none(payload.get("bundle_label")),
             tool_calls=tool_calls,
             closes_event_id=closes_event_id,
+            broadcast_client_id=broadcast_client_id,
         )
 
     @property

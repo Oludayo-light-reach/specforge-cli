@@ -277,6 +277,30 @@ def test_digest_mode_assistant_live_cap_overrides_schema_max() -> None:
     assert n._assistant_body_limit_for_completed_pair() == MAX_TURN_TEXT_CHARS
 
 
+def test_assistant_visible_prose_prefers_text_over_long_summary() -> None:
+    """Long ``summary`` must not be prepended as a wall — body column wins."""
+    tail = "ONLY_IN_SUMMARY_" + "x" * 200
+    long_summary = ("section " * 80).strip() + "\n" + tail
+    assert len(long_summary) > 400
+    short_text = "early streaming snapshot"
+    assert tail not in short_text
+    out = Notifier._assistant_visible_prose(short_text, long_summary)
+    assert out == short_text
+
+
+def test_assistant_visible_prose_short_headline_prepended_when_distinct() -> None:
+    out = Notifier._assistant_visible_prose("body text here", "Headline")
+    assert out.startswith("Headline")
+    assert "body text here" in out
+
+
+def test_assistant_visible_prose_returns_longer_when_text_embedded_in_summary() -> None:
+    """When the full prose lives in ``summary`` and ``text`` is a substring."""
+    t = "tiny"
+    s = "before tiny after"
+    assert Notifier._assistant_visible_prose(t, s) == s
+
+
 def test_show_completed_pair_digest_mode_does_not_truncate_merged_assistant(
     monkeypatch,
 ) -> None:

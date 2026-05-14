@@ -404,12 +404,12 @@ class Notifier:
 
     @staticmethod
     def _assistant_visible_prose(text: str | None, summary: str | None) -> str:
-        """Prefer stored ``text``; fold in ``summary`` when it adds context.
+        """Prefer the stored assistant ``text`` (full model reply body).
 
-        Cursor and other adapters often ship a short headline in
-        ``summary`` and the long reply in ``text`` — but some rows only
-        carry one field. Avoid showing *only* the headline when the body
-        exists on the wire.
+        A *short* ``summary`` headline (≤400 chars) may be prepended when it
+        is not already the opening of ``text``. Long summaries are never
+        pasted above the body — reviewers and ``/turn`` should rely on verbose
+        assistant ``text`` rows from the broadcaster, not headline walls.
         """
         t = (text or "").strip()
         s = (summary or "").strip()
@@ -419,6 +419,8 @@ class Notifier:
             return t
         if s in t:
             return t
+        if t in s:
+            return s
         if len(s) <= 400 and not t.startswith(s[: min(len(s), 120)]):
             return f"{s}\n\n{t}"
         return t
@@ -1134,11 +1136,10 @@ class Notifier:
         the watcher is acknowledging an action, raising an error, or
         emitting a large structured block for the agent.
 
-        ``/summarize`` output, in particular, is meant to be read
-        verbatim by the agent running in the terminal — we therefore
-        render it with ``markup=False`` so any literal ``[…]`` text
-        in a teammate's prompt does not get interpreted as a Rich
-        tag and disappear from the agent's context.
+        ``/summarize`` output uses Rich markup on **trusted** lines (role
+        colours, separators). User-authored lines must already be
+        escaped with :func:`rich.markup.escape` where they are assembled — see
+        :func:`spec_cli.realtime.commands._cmd_summarize`.
         """
         glyph, color = {
             "ok": ("✓", "sf.mint"),
@@ -1152,6 +1153,7 @@ class Notifier:
                 self._skipped_while_suppressed += 1
                 return
             console.print()
+            markup_body = kind == "summarize"
             console.print(
                 f"[{color}]{glyph}[/] [bold {color}]spec>[/] "
                 f"{lines[0]}",
@@ -1159,7 +1161,11 @@ class Notifier:
                 highlight=False,
             )
             for extra in lines[1:]:
-                console.print(f"   {extra}", markup=False, highlight=False)
+                console.print(
+                    f"   {extra}",
+                    markup=markup_body,
+                    highlight=False,
+                )
 
     def show_in_system_pager(self, body: str, *, banner: str) -> None:
         """Pause live stream prints and show ``body`` in ``less`` / ``$PAGER``.

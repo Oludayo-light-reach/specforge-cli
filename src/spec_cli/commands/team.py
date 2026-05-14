@@ -352,7 +352,10 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # thread they joined mid-flight. Keep this comfortably above bursty
 # assistant-only streaks (Claude Code JSONL) so the USER row is still
 # in the warm-up batch.
-_TEAM_WATCH_BOOTSTRAP_LIMIT = 250
+# Workspace bootstrap before SSE: most recent N events across bundles.
+# Kept modest so the first ``spec team watch`` connect does not replay
+# an overwhelming backlog (use ``/replay`` / REST for deep history).
+_TEAM_WATCH_BOOTSTRAP_LIMIT = 60
 
 # Default ``120`` = two minutes with no new assistant chunk after at
 # least one chunk arrived; then we print the ``paired reply`` block so a

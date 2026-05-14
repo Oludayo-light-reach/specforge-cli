@@ -62,6 +62,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Protocol
 
+from rich.markup import escape
+
 from ..api import ApiError
 from ..config import load_credentials
 from ..git import read_git_context
@@ -71,10 +73,9 @@ from .notifier import Notifier, _format_tool_call_line
 from .team_push_requests import record_push_request
 
 
-# Bounded event memory for /summarize / /replay / /status. 500 events
-# is roughly an hour of an active team — comfortably more than the
-# usual review window without making the watcher footprint grow.
-EVENT_BUFFER_MAX = 500
+# Bounded event memory for /summarize / /replay / /status. ~300 rows
+# keeps RAM flat while still covering long /summarize windows.
+EVENT_BUFFER_MAX = 300
 
 
 @dataclass
@@ -980,34 +981,50 @@ def _cmd_summarize(cmd: ParsedCommand, ctx: CommandContext) -> None:
         return
 
     lines: list[str] = []
-    lines.append(f"[spec summarize request — past {cmd.args[0]}]")
-    lines.append("=" * 64)
+    # Rich markup: ``\\[`` / ``\\]`` render as literal brackets so tags in
+    # user prompts cannot break the pane (body lines are still escaped).
+    lines.append(
+        rf"\[spec summarize request — past {escape(cmd.args[0])}\]"
+    )
+    lines.append("[sf.muted]" + "─" * 64 + "[/]")
     lines.append("")
     for ev in rows:
         ts = ev.turn_at or ev.received_at or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        when = ts.astimezone().strftime("%H:%M:%S")
-        role = ev.role.upper()
-        bundle = f" · {ev.bundle_label}" if ev.bundle_label else ""
-        model = f"/{ev.model}" if ev.role == "assistant" and ev.model else ""
+        when = escape(ts.astimezone().strftime("%H:%M:%S"))
+        role_u = ev.role.upper()
+        role_style = {
+            "USER": "bold #3ddab4",
+            "ASSISTANT": "bold #7de3ff",
+            "ERROR": "bold #ff8a98",
+            "ASSISTANT_CLOSED": "dim #9aa3b2",
+        }.get(role_u, "bold #c7c9d1")
+        bundle = escape(f" · {ev.bundle_label}") if ev.bundle_label else ""
+        model = (
+            escape(f"/{ev.model}")
+            if ev.role == "assistant" and ev.model
+            else ""
+        )
         lines.append(
-            f"{ev.author_display} · {when} · {role} · "
-            f"{ev.source}{model} · {ev.branch or '-'}{bundle}"
+            f"[sf.muted]{when}[/] [bold #c7c9d1]{escape(ev.author_display)}[/] "
+            f"· [{role_style}]{role_u}[/] · "
+            f"[sf.label]{escape(ev.source)}[/]{model} · "
+            f"[sf.muted]{escape(ev.branch or '-')}{bundle}[/]"
         )
         body = (ev.text or ev.summary or "").strip()
         if body:
             for body_line in body.splitlines():
-                lines.append(f"  {body_line}")
+                lines.append(f"  [sf.muted]{escape(body_line)}[/]")
         else:
-            lines.append("  (no body)")
+            lines.append("  [sf.muted](no body)[/]")
         lines.append("")
-    lines.append("=" * 64)
+    lines.append("[sf.muted]" + "─" * 64 + "[/]")
     lines.append(
-        "[end of summarize request — please synthesise the above into "
-        "(1) what each engineer is currently working on, (2) any "
-        "patterns or risks across the team, (3) one concrete action "
-        "the team should take next.]"
+        r"\[end of summarize request — please synthesise the above into "
+        r"(1) what each engineer is currently working on, (2) any "
+        r"patterns or risks across the team, (3) one concrete action "
+        r"the team should take next.\]"
     )
     ctx.notifier.show_command_result("\n".join(lines), kind="summarize")
 

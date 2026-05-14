@@ -449,8 +449,12 @@ class Notifier:
         """Assistant prose cap before ``…`` truncation in the pane.
 
         Digest mode (``spec team watch`` without ``--show-tool-runs``)
-        sets :attr:`_assistant_live_cap` (~400 chars). ``--show-tool-runs``
-        keeps the schema wire cap so reviewers see full prose + tools.
+        sets :attr:`_assistant_live_cap` (~400 chars) for **per-row**
+        ``show()`` output when that path is used. Coalesced
+        ``show_completed_pair`` uses :meth:`_assistant_body_limit_for_completed_pair`
+        instead so a finished turn matches ``spec watch`` (full stored
+        prose up to :data:`MAX_TURN_TEXT_CHARS`). ``--show-tool-runs``
+        keeps the schema wire cap everywhere.
         """
         if self._assistant_live_cap is not None:
             return int(self._assistant_live_cap)
@@ -459,6 +463,18 @@ class Notifier:
         if self._review_feed_full_bodies and not self._compact:
             return MAX_TURN_TEXT_CHARS
         return _PREVIEW_ASSISTANT[1] if self._compact else _PREVIEW_ASSISTANT[0]
+
+    def _assistant_body_limit_for_completed_pair(self) -> int:
+        """Cap for merged assistant text in ``show_completed_pair``.
+
+        Default ``spec team watch`` buffers streaming chunks and only
+        prints the merged reply at flush; that block is the canonical
+        view of the turn, so we must not apply the live digest cap here
+        (``spec watch`` never applies that cap on assistant bodies).
+        """
+        if self._assistant_live_cap is not None:
+            return MAX_TURN_TEXT_CHARS
+        return self._assistant_body_limit_chars()
 
     def record_pairing(self, event: IncomingEvent) -> None:
         """Update the user→AI pairing tracker without rendering.
@@ -801,7 +817,9 @@ class Notifier:
         ).strip()
         if a_preview and self._strip_code_blocks and not self._show_tool_runs:
             a_preview = _strip_code_blocks(a_preview)
-        a_preview = _truncate(a_preview, self._assistant_body_limit_chars())
+        a_preview = _truncate(
+            a_preview, self._assistant_body_limit_for_completed_pair()
+        )
         a_ctx = _ctx_line(assistant)
         pending_line = (u_author, u_preview) if u_preview else None
 

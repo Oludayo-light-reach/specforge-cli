@@ -274,6 +274,78 @@ def test_digest_mode_assistant_live_cap_overrides_schema_max() -> None:
     )
     assert n._user_preview_limit() == MAX_TURN_TEXT_CHARS
     assert n._assistant_body_limit_chars() == 400
+    assert n._assistant_body_limit_for_completed_pair() == MAX_TURN_TEXT_CHARS
+
+
+def test_show_completed_pair_digest_mode_does_not_truncate_merged_assistant(
+    monkeypatch,
+) -> None:
+    """Coalesced Q/A is the only assistant surface in default team watch."""
+    from spec_cli.prompts.schema import MAX_TURN_TEXT_CHARS
+
+    import spec_cli.realtime.notifier as notifier_mod
+
+    cap = _recording_console()
+    monkeypatch.setattr(notifier_mod, "console", cap)
+    ts = datetime.now(timezone.utc)
+    long_body = "word " * 300  # 1800+ chars — would be clipped at 400 in ``show()``.
+    assert len(long_body) > 400
+    user = IncomingEvent(
+        id=400,
+        project_id=1,
+        session_id="sess-long",
+        source="cursor",
+        role="user",
+        branch="main",
+        commit_sha=None,
+        model=None,
+        summary=None,
+        text="go",
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    assistant = IncomingEvent(
+        id=401,
+        project_id=1,
+        session_id="sess-long",
+        source="cursor",
+        role="assistant",
+        branch="main",
+        commit_sha=None,
+        model="default",
+        summary="done",
+        text=long_body,
+        title=None,
+        cwd="/tmp",
+        paths_touched=[],
+        turn_at=ts,
+        received_at=ts,
+        author_user_id=7,
+        author_handle="jon",
+        author_name="Jon",
+        author_avatar_url=None,
+    )
+    n = Notifier(
+        critic_enabled=False,
+        review_feed_full_bodies=True,
+        assistant_live_cap=400,
+    )
+    n.show_completed_pair(user, assistant)
+    out = cap.export_text()
+    # Rich wraps at the recording console width — do not require one-line substring match.
+    before_footer = out.split("● turn complete")[0]
+    assert len(before_footer) > 1200
+    assert before_footer.count("word") >= 300
+    assert "…" not in before_footer
+    assert n._assistant_body_limit_chars() == 400
+    assert n._assistant_body_limit_for_completed_pair() == MAX_TURN_TEXT_CHARS
 
 
 def test_default_team_watch_strips_code_blocks_from_assistant_body(monkeypatch):

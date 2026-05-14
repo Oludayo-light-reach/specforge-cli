@@ -921,10 +921,11 @@ def team_watch_cmd(
         # keeps the raw code blocks (reviewers asking for the latter
         # presumably want the former too).
         strip_code_blocks=not show_tool_runs,
-        # Non-compact digest: user/error bodies can use the schema cap;
-        # assistant prose gets a ~400-char live preview so the pane stays
-        # scannable. ``--show-tool-runs`` lifts the assistant cap to the
-        # full stored body; ``/turn`` / ``/full`` always re-fetch full text.
+        # Non-compact digest: user/error bodies can use the schema cap.
+        # Assistant rows that hit ``Notifier.show`` (rare edge cases) use a
+        # ~400-char preview; merged ``show_completed_pair`` at turn flush
+        # uses the full stored body (same ceiling as ``spec watch``).
+        # ``--show-tool-runs`` removes the digest cap everywhere.
         review_feed_full_bodies=not compact,
         assistant_live_cap=(
             None if (compact or show_tool_runs) else 400

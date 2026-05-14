@@ -46,6 +46,7 @@ from ..config import (
 )
 from ..git import read_git_context
 from ..realtime.broadcast_identity import load_or_create_broadcast_client_id
+from ..realtime.live_event_dedup import LivePromptEventDeduper
 from ..realtime.commands import (
     CommandContext,
     WatchState,
@@ -456,6 +457,33 @@ class _TeamWatchQAState:
         # REST so ``/pair`` and idle flush see the same text the server
         # stored (heals missed SSE frames and early ``/pair`` races).
         self.pair_cloud: CloudClient | None = None
+        # After ``show_completed_pair``, suppress stray assistant rows for the
+        # same (project, session) with ``id`` not above this tail (duplicate
+        # SSE / late snapshots that would otherwise hit ``notifier.show``).
+        self._closed_assistant_hi: dict[tuple[int, str], int] = {}
+
+    def _bump_assistant_hi_after_flush(
+        self, pending: IncomingEvent, combined: list[IncomingEvent]
+    ) -> None:
+        if not combined:
+            return
+        key = self._session_key(pending)
+        hi = max(c.id for c in combined)
+        prev = self._closed_assistant_hi.get(key, 0)
+        if hi > prev:
+            self._closed_assistant_hi[key] = hi
+
+    def should_suppress_lagging_assistant(self, ev: IncomingEvent) -> bool:
+        """True when this assistant row is at/below the last merged tail."""
+        if ev.role != "assistant":
+            return False
+        if self.pending_user is not None:
+            return False
+        key = self._session_key(ev)
+        hi = self._closed_assistant_hi.get(key)
+        if hi is None:
+            return False
+        return ev.id <= hi
 
     @staticmethod
     def _session_key(ev: IncomingEvent) -> tuple[int, str]:
@@ -497,6 +525,7 @@ class _TeamWatchQAState:
         if not combined:
             return False
         merged = self._merge_assistant_chunks(combined)
+        self._bump_assistant_hi_after_flush(self.pending_user, combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.assistant_chunks.clear()
         self.pending_user = None
@@ -607,6 +636,7 @@ class _TeamWatchQAState:
             self.pending_since_mono = None
             return
         merged = self._merge_assistant_chunks(combined)
+        self._bump_assistant_hi_after_flush(self.pending_user, combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.pending_user = None
         self.assistant_chunks.clear()
@@ -1022,6 +1052,8 @@ def team_watch_cmd(
         bundle_root=bundle_watch_root,
     )
 
+    _live_ev_dedup = LivePromptEventDeduper()
+
     def _on_connect() -> None:
         # First successful handshake — print the "connected" banner
         # only now, so auth failures stay silent on stdout and the
@@ -1054,6 +1086,8 @@ def team_watch_cmd(
 
     def _deliver(ev: IncomingEvent, *, tick_clock: bool = True) -> None:
         """Shared path for live SSE frames and the one-shot REST warm."""
+        if _live_ev_dedup.is_redelivery(ev.id):
+            return
         use_qa_coalesce = tick_clock
         event_buffer.append(ev)
         event_to_project[ev.id] = ev.project_id
@@ -1124,6 +1158,15 @@ def team_watch_cmd(
             and ev.role == "assistant"
             and not force_show_assistant
             and qa.buffer_assistant(ev)
+        ):
+            if tick_clock:
+                last_output_at[0] = time.monotonic()
+            return
+        if (
+            use_qa_coalesce
+            and ev.role == "assistant"
+            and not force_show_assistant
+            and qa.should_suppress_lagging_assistant(ev)
         ):
             if tick_clock:
                 last_output_at[0] = time.monotonic()

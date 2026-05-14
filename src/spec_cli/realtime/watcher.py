@@ -47,6 +47,7 @@ from ..sources import (
 from ..stage import historical_bundle_paths, record_bundle_path
 from ..ui import dim
 from .broadcast_identity import load_or_create_broadcast_client_id
+from .live_event_dedup import LivePromptEventDeduper
 from .mirror import PeerMirror
 from .notifier import Notifier
 from .presence import (
@@ -323,8 +324,12 @@ def run_watcher(
         )
         consumer.set_resume_cursor(cursor.last_received_id)
 
+        _live_ev_dedup = LivePromptEventDeduper()
+
         def _on_event(event) -> None:  # type: ignore[no-untyped-def]
             cursor.record_received(event.id)
+            if _live_ev_dedup.is_redelivery(event.id):
+                return
             if opts.self_user_id is not None and (
                 event.author_user_id == opts.self_user_id
             ):

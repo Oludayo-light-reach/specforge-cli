@@ -21,6 +21,7 @@ work and save the cursor before exiting.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
 import signal
 import threading
@@ -38,6 +39,7 @@ from ..sources import (
     CursorError,
     claude_code_store_root,
     codex_transcript_store_available,
+    cursor_global_storage_db,
     cursor_workspace_storage_root,
     read_claude_code_sessions,
     read_codex_sessions,
@@ -45,8 +47,9 @@ from ..sources import (
     redact_text,
 )
 from ..stage import historical_bundle_paths, record_bundle_path
-from ..ui import dim
+from ..ui import dim, warn
 from .broadcast_identity import load_or_create_broadcast_client_id
+from .events import OutgoingEvent, ToolCallPayload
 from .live_event_dedup import LivePromptEventDeduper
 from .mirror import PeerMirror
 from .notifier import Notifier
@@ -200,6 +203,93 @@ class WatcherOptions:
     )
 
 
+# Throttle terminal noise when the cloud POST path is failing every tick.
+_POST_FAILURE_WARN_MONO: list[float] = [0.0]
+
+
+def _spec_live_startup_snapshot(bundle_root: Path) -> None:
+    """One-time human-readable scan of local agent stores.
+
+    When broadcasting is on but every adapter shows zero mapped
+    sessions, the team feed stays quiet — this line is the fastest
+    way to spot a Cursor workspace-path mismatch or a missing install.
+    """
+    paths = historical_bundle_paths(bundle_root)
+    bits: list[str] = []
+    n_cursor = -1
+    n_claude = -1
+    n_codex = -1
+
+    ws_root = cursor_workspace_storage_root()
+    if not ws_root.exists():
+        n_cursor = 0
+        bits.append("cursor: no workspaceStorage tree")
+    else:
+        gdb = cursor_global_storage_db()
+        if not gdb.is_file():
+            n_cursor = 0
+            bits.append("cursor: no global state.vscdb (cannot load bubbles)")
+        else:
+            try:
+                n_cursor = sum(
+                    1
+                    for _ in itertools.islice(
+                        read_cursor_sessions(paths, verbose=True), 400
+                    )
+                )
+                bits.append(f"cursor: {n_cursor} composer session(s) for this bundle")
+            except CursorError as e:
+                n_cursor = -2
+                bits.append("cursor: read error")
+                warn(f"Spec Live — could not read Cursor transcripts: {e}")
+
+    if claude_code_store_root().exists():
+        try:
+            n_claude = sum(
+                1
+                for _ in itertools.islice(
+                    read_claude_code_sessions(paths, since=None, verbose=True),
+                    400,
+                )
+            )
+            bits.append(f"claude_code: {n_claude} session(s)")
+        except ClaudeCodeError as e:
+            n_claude = -2
+            bits.append(f"claude_code: skip ({e})")
+    else:
+        n_claude = 0
+        bits.append("claude_code: store not found")
+
+    if codex_transcript_store_available():
+        try:
+            n_codex = sum(
+                1
+                for _ in itertools.islice(
+                    read_codex_sessions(paths, since=None, verbose=True), 400
+                )
+            )
+            bits.append(f"codex: {n_codex} session(s)")
+        except CodexError as e:
+            n_codex = -2
+            bits.append(f"codex: skip ({e})")
+    else:
+        n_codex = 0
+        bits.append("codex: not installed")
+
+    dim("Spec Live broadcast · local scan — " + " · ".join(bits))
+    if (
+        n_cursor >= 0
+        and n_claude >= 0
+        and n_codex >= 0
+        and (n_cursor + n_claude + n_codex) == 0
+    ):
+        warn(
+            "Spec Live: no Cursor / Claude Code / Codex sessions are mapped to "
+            "this bundle path yet — open this repo (or its parent workspace) in "
+            "your agent IDE, start a thread, then restart `spec watch`."
+        )
+
+
 def run_watcher(
     bundle_root: Path,
     opts: WatcherOptions,
@@ -242,6 +332,8 @@ def run_watcher(
     notifier.announce_connected(opts.project_label)
     if not opts.broadcast:
         notifier.announce_broadcast_disabled()
+    else:
+        _spec_live_startup_snapshot(bundle_root)
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -716,6 +808,18 @@ def _producer_tick(
 
             ok, created_id = poster.send(event)
             if not ok:
+                now_m = time.monotonic()
+                if now_m - _POST_FAILURE_WARN_MONO[0] >= 60.0:
+                    _POST_FAILURE_WARN_MONO[0] = now_m
+                    warn(
+                        "Spec Live: POST to cloud failed — teammates (and "
+                        "`spec team watch`) will not see new prompts until this "
+                        f"succeeds (project id {opts.project_id}). Check "
+                        "`spec login`, SPEC_API / saved api_base, and "
+                        "`.spec/watch.log`. If POST succeeds but SSE is empty, "
+                        "your API may be running multiple workers without a "
+                        "shared prompt hub."
+                    )
                 # Network blip — try this turn again next tick. Don't
                 # advance the cursor; we'd rather double-deliver
                 # (server is idempotent on session_id+role+turn_at)

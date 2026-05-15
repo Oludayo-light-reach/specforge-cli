@@ -38,6 +38,7 @@ import requests
 
 from ..config import Credentials
 from .broadcast_identity import load_or_create_broadcast_client_id
+from .events import OutgoingEvent
 from .presence import LocalPresence, compute_local_presence
 
 _USER_AGENT = "spec-cli/push-announce"

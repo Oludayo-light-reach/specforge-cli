@@ -32,9 +32,11 @@ The wrappers are deliberately conservative:
 * ``git`` wrapper: on ``init``, runs ``spec init`` when appropriate; on
   successful ``clone``, may run ``spec bundle doctor`` inside the new
   tree (see ``SPEC_NO_CLONE_DOCTOR``). Preserves git's exit code.
-* Autostart hook bails on the fast path the moment ``$PWD`` doesn't
-  contain a ``spec.yaml`` — saves ~50ms on every shell prompt for
-  users in a non-Spec directory.
+* Autostart hook walks up for ``spec.yaml`` first (fast path). When
+  that misses but ``cwd`` is inside a git monorepo with a tracked
+  bundle, it falls back to ``spec bundle root --quiet`` — same
+  discovery as ``spec watch``. Outside any bundle both paths are
+  cheap no-ops.
 * Both fall back gracefully if the ``spec`` binary is missing.
 """
 
@@ -61,8 +63,10 @@ SHELL_INTEGRATION_END: str = "# <<< spec shell integration <<<"
 # The autostart hook below is wired into the right per-shell prompt
 # event so it fires once per *prompt render*, not once per command.
 # Walking up to find ``spec.yaml`` is bounded by the depth of the
-# directory tree (~10 stat calls in the worst case) and we abort
-# the moment we cross the home directory, so the fast path is fast.
+# directory tree (~10 stat calls in the worst case). When that misses,
+# ``spec bundle root --quiet`` applies the same git-tracked discovery
+# as ``spec watch`` (monorepo parent cwd). We abort the walk at
+# ``$HOME`` so a stray pwd inside / doesn't stat forever.
 SHELL_INTEGRATION_BODY_BASH_ZSH: str = f"""\
 {SHELL_INTEGRATION_BEGIN}
 # Auto-installed by `spec shell install`. Three integrations:
@@ -152,9 +156,9 @@ git() {{
   return $__spec_rc
 }}
 
-# Walk up from $PWD looking for spec.yaml; print the bundle root or
-# nothing. Bounded at $HOME so a stray pwd inside / doesn't ever
-# stat a thousand directories. Pure POSIX — no GNU-isms.
+# Resolve bundle root: walk up for spec.yaml, then ask the CLI for
+# git-tracked discovery (monorepo parent cwd). Prints one path or
+# nothing. Bounded at $HOME — pure POSIX, no GNU-isms.
 __spec_find_bundle_root() {{
   local __spec_dir="$PWD"
   local __spec_home="${{HOME:-/}}"
@@ -165,14 +169,20 @@ __spec_find_bundle_root() {{
       return 0
     fi
     if [ "$__spec_dir" = "$__spec_home" ]; then
-      return 1
+      break
     fi
     __spec_steps=$((__spec_steps + 1))
     if [ $__spec_steps -gt 32 ]; then
-      return 1
+      break
     fi
     __spec_dir="$(dirname "$__spec_dir")"
   done
+  local __spec_cli_root
+  __spec_cli_root="$(spec bundle root --quiet 2>/dev/null)" || return 1
+  if [ -n "$__spec_cli_root" ]; then
+    printf '%s\\n' "$__spec_cli_root"
+    return 0
+  fi
   return 1
 }}
 
@@ -317,13 +327,18 @@ function __spec_find_bundle_root
             return 0
         end
         if test "$__spec_dir" = "$__spec_home"
-            return 1
+            break
         end
         set __spec_steps (math $__spec_steps + 1)
         if test $__spec_steps -gt 32
-            return 1
+            break
         end
         set __spec_dir (dirname $__spec_dir)
+    end
+    set -l __spec_cli_root (spec bundle root --quiet 2>/dev/null)
+    if test -n "$__spec_cli_root"
+        echo $__spec_cli_root
+        return 0
     end
     return 1
 end

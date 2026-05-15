@@ -11,7 +11,9 @@ from spec_cli.commands.team import (
     _TeamWatchQAState,
     _assistant_has_reviewable_prose,
     _resolve_assistant_quiet_secs,
+    _user_from_rest_before_assistant,
 )
+from spec_cli.api import ApiError
 from spec_cli.realtime.events import IncomingEvent
 
 
@@ -362,6 +364,49 @@ def test_assistant_has_reviewable_prose_rejects_redacted_only_body() -> None:
             summary="Investigating the live feed.",
         )
     )
+
+
+def _api_row(ev: IncomingEvent) -> dict:
+    return {
+        "id": ev.id,
+        "project_id": ev.project_id,
+        "session_id": ev.session_id,
+        "source": ev.source,
+        "role": ev.role,
+        "branch": ev.branch,
+        "text": ev.text,
+        "summary": ev.summary,
+        "turn_at": ev.turn_at.isoformat().replace("+00:00", "Z"),
+        "received_at": ev.received_at.isoformat().replace("+00:00", "Z"),
+        "author": {
+            "user_id": ev.author_user_id,
+            "handle": ev.author_handle,
+            "name": ev.author_name,
+        },
+    }
+
+
+def test_user_from_rest_before_assistant_finds_latest_user() -> None:
+    client = MagicMock()
+    user = _ev(id=10, role="user", text="my prompt")
+    assistant = _ev(id=12, role="assistant", text="reply")
+    client.list_prompt_events.return_value = [
+        _api_row(user),
+        _api_row(_ev(id=11, role="assistant", text="other thread", session_id="other")),
+        _api_row(assistant),
+    ]
+    found = _user_from_rest_before_assistant(client, assistant)
+    assert found is not None
+    assert found.id == 10
+    assert found.text == "my prompt"
+
+
+def test_user_from_rest_before_assistant_api_error_returns_none() -> None:
+    client = MagicMock()
+    client.list_prompt_events.side_effect = ApiError("nope")
+    assert _user_from_rest_before_assistant(
+        client, _ev(id=2, role="assistant", text="x")
+    ) is None
 
 
 def test_tick_quiet_flush_skipped_when_quiet_secs_zero(monkeypatch) -> None:

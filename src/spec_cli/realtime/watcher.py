@@ -129,30 +129,39 @@ TAIL_ASSISTANT_STABILITY_FLOOR_SECS = 12.0
 TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER = 3.0
 
 
-def tail_stability_quiet_secs(poll_interval: float) -> float:
-    """How long tail assistant ``text`` must be unchanged before we
+def tail_stability_quiet_secs(
+    poll_interval: float, *, tool_count: int = 0
+) -> float:
+    """How long the tail assistant turn must be unchanged before we
     treat the bubble as finished and POST ``assistant_closed``.
 
     Override with ``SPEC_LIVE_TAIL_STABILITY_SECS`` (seconds). While
     the model is still writing, the fingerprint keeps changing and we
     keep POSTing updates — this quiet window only applies after the
-    last visible chunk.
+    last visible chunk. Tool-heavy tails get a longer floor so we do
+    not emit ``turn complete`` while JSONL is still accumulating tools.
     """
     raw = os.environ.get("SPEC_LIVE_TAIL_STABILITY_SECS", "").strip()
     if raw:
         try:
             custom = float(raw)
             if custom > 0:
-                return max(
+                base = max(
                     custom,
                     poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
                 )
+                if tool_count > 0:
+                    return max(base, 20.0)
+                return base
         except ValueError:
             pass
-    return max(
+    base = max(
         TAIL_ASSISTANT_STABILITY_FLOOR_SECS,
         poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
     )
+    if tool_count > 0:
+        return max(base, 20.0)
+    return base
 
 
 @dataclass
@@ -164,8 +173,20 @@ class _AssistantTailHold:
     last_fp_change: float  # ``time.monotonic()`` when ``fp`` last changed
 
 
-def _assistant_text_fingerprint(text: str | None) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+def _assistant_turn_fingerprint(turn: Turn) -> str:
+    """Fingerprint tail stability from prose, summary, and tool activity."""
+    tool_calls = turn.tool_calls or []
+    prose = prose_without_redacted_placeholders((turn.text or "").strip())
+    summ = prose_without_redacted_placeholders((turn.summary or "").strip())
+    tool_names = ",".join(
+        sorted(
+            n
+            for n in (getattr(c, "name", None) or "" for c in tool_calls)
+            if n
+        )
+    )
+    payload = f"{prose}\0{summ}\0{len(tool_calls)}\0{tool_names}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _post_assistant_closed(
@@ -922,7 +943,7 @@ def _producer_tick(
                 prev,
                 clamped,
             )
-            cursor.mark_local_turns_posted(session.id, session.turns)
+            cursor.prune_posted_keys_from_index(session.id, clamped)
             cursor.clamp_broadcast(session.id, clamped)
             prev = clamped
         new_turns = session.turns[prev:]
@@ -962,25 +983,21 @@ def _producer_tick(
             )
 
             if is_tail_assistant:
-                fp = _assistant_text_fingerprint(turn.text)
+                fp = _assistant_turn_fingerprint(turn)
                 hold = holds.get(session.id)
                 now_m = time.monotonic()
+                tool_n = len(turn.tool_calls or [])
                 if (
                     hold is not None
                     and hold.turn_idx == turn_idx
                     and fp == hold.fp
                 ):
                     if now_m - hold.last_fp_change >= tail_stability_quiet_secs(
-                        opts.poll_interval
+                        opts.poll_interval, tool_count=tool_n
                     ):
                         holds.pop(session.id, None)
                         cursor.record_broadcast(session.id, turn_idx + 1)
-                        cursor.mark_turn_posted(
-                            session.id,
-                            turn_idx,
-                            "assistant",
-                            turn.at,
-                        )
+                        cursor.mark_turn_posted(session.id, turn_idx, turn)
                         _post_assistant_closed(
                             poster,
                             session,
@@ -993,11 +1010,8 @@ def _producer_tick(
 
             _EMPTY_TURN_RETRIES.pop((session.id, turn_idx), None)
 
-            if (
-                not is_tail_assistant
-                and cursor.is_turn_posted(
-                    session.id, turn_idx, turn.role, turn.at
-                )
+            if not is_tail_assistant and cursor.is_turn_posted(
+                session.id, turn_idx, turn
             ):
                 cursor.record_broadcast(session.id, turn_idx + 1)
                 continue
@@ -1027,12 +1041,10 @@ def _producer_tick(
                 cloud_ids[session.id] = created_id
 
             if not is_tail_assistant:
-                cursor.mark_turn_posted(
-                    session.id, turn_idx, turn.role, turn.at
-                )
+                cursor.mark_turn_posted(session.id, turn_idx, turn)
 
             if is_tail_assistant:
-                fp = _assistant_text_fingerprint(turn.text)
+                fp = _assistant_turn_fingerprint(turn)
                 holds[session.id] = _AssistantTailHold(
                     turn_idx=turn_idx,
                     fp=fp,

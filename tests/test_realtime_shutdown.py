@@ -389,7 +389,7 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
     monkeypatch.setattr("spec_cli.realtime.watcher.time.monotonic", _mono)
     monkeypatch.setattr(
         "spec_cli.realtime.watcher.tail_stability_quiet_secs",
-        lambda poll_interval: max(5.0, poll_interval * 3.0),
+        lambda poll_interval, tool_count=0: max(5.0, poll_interval * 3.0),
     )
 
     poster = _StubPoster()
@@ -553,7 +553,7 @@ def test_is_turn_posted_skips_duplicate_user_repost(
 
     poster = _StubPoster()
     cursor = LiveCursor.load(tmp_path, project_id=1)
-    cursor.mark_turn_posted(sid, 0, "user", at)
+    cursor.mark_turn_posted(sid, 0, session.turns[0])
     cursor.record_broadcast(sid, 1)
 
     _producer_tick(

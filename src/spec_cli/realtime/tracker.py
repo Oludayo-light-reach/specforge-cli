@@ -18,14 +18,19 @@ the server's monotonic ids handle cross-machine consistency.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+_TURN_KEY_IDX_RE = re.compile(r"^(\d+):")
 
 log = logging.getLogger(__name__)
 
@@ -120,15 +125,48 @@ class LiveCursor:
         return cursor
 
     @staticmethod
+    def turn_content_fingerprint(
+        *,
+        text: str = "",
+        summary: str | None = None,
+        tool_count: int = 0,
+    ) -> str:
+        """Stable digest of turn body — survives coalescing index remaps."""
+        payload = f"{text}\0{summary or ''}\0{tool_count}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @staticmethod
     def turn_post_key(
         turn_idx: int,
         role: str,
         turn_at: datetime | None,
+        *,
+        text: str = "",
+        summary: str | None = None,
+        tool_count: int = 0,
     ) -> str:
+        fp = LiveCursor.turn_content_fingerprint(
+            text=text, summary=summary, tool_count=tool_count
+        )
         if turn_at is not None:
             ts = turn_at.astimezone().replace(microsecond=0).isoformat()
-            return f"{turn_idx}:{role}:{ts}"
-        return f"{turn_idx}:{role}"
+            return f"{turn_idx}:{role}:{ts}:{fp}"
+        return f"{turn_idx}:{role}:{fp}"
+
+    @staticmethod
+    def turn_post_key_for(turn_idx: int, turn: Any) -> str:
+        """Build a dedupe key from a :class:`~spec_cli.prompts.schema.Turn`."""
+        text = getattr(turn, "text", None) or ""
+        summary = getattr(turn, "summary", None)
+        tool_calls = getattr(turn, "tool_calls", None) or []
+        return LiveCursor.turn_post_key(
+            turn_idx,
+            str(getattr(turn, "role", "")),
+            getattr(turn, "at", None),
+            text=text,
+            summary=summary,
+            tool_count=len(tool_calls),
+        )
 
     # ── reads ─────────────────────────────────────────────────────
 
@@ -137,40 +175,36 @@ class LiveCursor:
         with self._lock:
             return self.broadcast_turns.get(session_id, 0)
 
-    def is_turn_posted(
-        self,
-        session_id: str,
-        turn_idx: int,
-        role: str,
-        turn_at: datetime | None,
-    ) -> bool:
-        key = self.turn_post_key(turn_idx, role, turn_at)
+    def is_turn_posted(self, session_id: str, turn_idx: int, turn: Any) -> bool:
+        key = self.turn_post_key_for(turn_idx, turn)
         with self._lock:
             return key in self.posted_turn_keys.get(session_id, set())
 
-    def mark_turn_posted(
-        self,
-        session_id: str,
-        turn_idx: int,
-        role: str,
-        turn_at: datetime | None,
-    ) -> None:
-        key = self.turn_post_key(turn_idx, role, turn_at)
+    def mark_turn_posted(self, session_id: str, turn_idx: int, turn: Any) -> None:
+        key = self.turn_post_key_for(turn_idx, turn)
         with self._lock:
             self.posted_turn_keys.setdefault(session_id, set()).add(key)
 
-    def mark_local_turns_posted(self, session_id: str, turns: list) -> None:
-        """Record every local turn slot as already on Cloud (no POST)."""
+    def prune_posted_keys_from_index(self, session_id: str, from_idx: int) -> None:
+        """Drop dedupe keys for turn indices ``>= from_idx`` after transcript shrink."""
+        if from_idx < 0:
+            return
         with self._lock:
-            keys = self.posted_turn_keys.setdefault(session_id, set())
-            for idx, turn in enumerate(turns):
-                role = getattr(turn, "role", None)
-                if role in ("user", "assistant"):
-                    keys.add(
-                        self.turn_post_key(
-                            idx, role, getattr(turn, "at", None)
-                        )
-                    )
+            keys = self.posted_turn_keys.get(session_id)
+            if not keys:
+                return
+            kept = {
+                k
+                for k in keys
+                if not (
+                    (m := _TURN_KEY_IDX_RE.match(k))
+                    and int(m.group(1)) >= from_idx
+                )
+            }
+            if kept:
+                self.posted_turn_keys[session_id] = kept
+            else:
+                self.posted_turn_keys.pop(session_id, None)
 
     # ── writes ────────────────────────────────────────────────────
 

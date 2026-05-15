@@ -494,6 +494,49 @@ _TEAM_WATCH_THREAD_FETCH_LIMIT = 2500
 _TEAM_WATCH_THREAD_FETCH_TIMEOUT_SECS = 28.0
 
 
+def _user_from_rest_before_assistant(
+    client: CloudClient | None,
+    ev: IncomingEvent,
+) -> IncomingEvent | None:
+    """Latest ``role=user`` row for this session with ``id < ev.id``.
+
+    Heals SSE ordering gaps where assistant snapshots arrive before the
+    matching user prompt (or the user row was never streamed live).
+    """
+    if client is None or ev.role != "assistant":
+        return None
+    sid = (ev.session_id or "").strip()
+    if not sid:
+        return None
+    window = 120
+    since = max(0, ev.id - window)
+    try:
+        rows = client.list_prompt_events(
+            ev.project_id,
+            since_id=since,
+            limit=window + 20,
+            timeout=_TEAM_WATCH_THREAD_FETCH_TIMEOUT_SECS,
+        )
+    except ApiError:
+        return None
+    key = (ev.project_id, sid)
+    best: IncomingEvent | None = None
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            row = IncomingEvent.from_json(r)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (row.project_id, (row.session_id or "").strip()) != key:
+            continue
+        if row.role != "user" or row.id >= ev.id:
+            continue
+        if best is None or row.id > best.id:
+            best = row
+    return best
+
+
 def _assistant_tail_from_rest_after_user(
     client: CloudClient,
     pending: IncomingEvent,
@@ -1293,6 +1336,21 @@ def team_watch_cmd(
                 ev, notifier, last_output_at, is_bootstrap=is_bootstrap
             )
             return
+
+        if (
+            use_qa_coalesce
+            and ev.role == "assistant"
+            and qa.pending_user is None
+            and qa.pair_cloud is not None
+        ):
+            backfill = _user_from_rest_before_assistant(qa.pair_cloud, ev)
+            if backfill is not None:
+                qa.on_user(
+                    backfill,
+                    notifier,
+                    last_output_at,
+                    is_bootstrap=is_bootstrap,
+                )
 
         if use_qa_coalesce and ev.role == "error":
             qa.flush_on_error(notifier, last_output_at)

@@ -166,6 +166,30 @@ def bundle_group() -> None:
     """Inspect and align bundle metadata with your git remote."""
 
 
+@bundle_group.command("root")
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Print only the resolved path; exit 1 when no bundle is found.",
+)
+def bundle_root_cmd(quiet: bool) -> None:
+    """Print the Spec bundle root for the current working directory.
+
+    Uses the same resolution as ``spec watch``: walk up for ``spec.yaml``,
+    honor ``SPEC_BUNDLE_ROOT``, then discover git-tracked bundles in a
+    monorepo. Shell autostart calls this when the walk-up finds nothing.
+    """
+    try:
+        root = find_bundle_root()
+    except BundleNotFoundError as e:
+        if quiet:
+            raise SystemExit(1) from e
+        fatal(str(e))
+        return
+    click.echo(str(root.resolve()))
+
+
 @bundle_group.command("doctor")
 @click.option(
     "--local-only",

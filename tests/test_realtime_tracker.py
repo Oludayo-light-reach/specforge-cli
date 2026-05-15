@@ -95,6 +95,37 @@ def test_malformed_file_does_not_raise(tmp_path):
     assert reloaded.turns_broadcast_for("s") == 1
 
 
+def test_turn_post_key_includes_content_fingerprint():
+    """Index-only keys from older builds must not match remapped turns."""
+    from datetime import datetime, timezone
+
+    at = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = LiveCursor.turn_post_key(2, "user", at, text="hello")
+    k2 = LiveCursor.turn_post_key(2, "user", at, text="different prompt")
+    assert k1 != k2
+    assert len(k1.rsplit(":", 1)[-1]) == 16
+
+
+def test_prune_posted_keys_drops_inflated_indices(tmp_path):
+    cursor = LiveCursor.load(tmp_path, project_id=1)
+    sid = "sess"
+    with cursor._lock:
+        cursor.posted_turn_keys[sid] = {"20:user:abc", "21:assistant:def", "5:user:ghi"}
+    cursor.prune_posted_keys_from_index(sid, 20)
+    assert cursor.posted_turn_keys[sid] == {"5:user:ghi"}
+
+
+def test_is_turn_posted_ignores_legacy_index_only_keys(tmp_path):
+    from spec_cli.prompts.schema import Turn
+
+    cursor = LiveCursor.load(tmp_path, project_id=1)
+    sid = "sess"
+    turn = Turn(role="user", text="real prompt", at=None)
+    with cursor._lock:
+        cursor.posted_turn_keys[sid] = {"2:user"}
+    assert not cursor.is_turn_posted(sid, 2, turn)
+
+
 def test_save_is_atomic_via_rename(tmp_path):
     """The cursor file must be replaced atomically so a kill in
     flight can't leave half-written JSON behind. This test asserts the

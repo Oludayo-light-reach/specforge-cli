@@ -43,6 +43,7 @@ def test_bash_zsh_snippet_contains_autostart_pieces():
 
     # New autostart machinery.
     assert "__spec_find_bundle_root" in body
+    assert "spec bundle root --quiet" in body
     assert "__spec_live_autostart" in body
     assert "spec live ensure --quiet" in body
     assert "SPEC_NO_AUTOSTART" in body
@@ -65,6 +66,7 @@ def test_fish_snippet_contains_autostart_pieces():
     assert "spec init" in body
 
     assert "__spec_find_bundle_root" in body
+    assert "spec bundle root --quiet" in body
     assert "spec live ensure --quiet" in body
     assert "SPEC_NO_AUTOSTART" in body
     assert "--on-event fish_prompt" in body

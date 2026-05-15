@@ -393,9 +393,9 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # assistant-only streaks (Claude Code JSONL) so the USER row is still
 # in the warm-up batch.
 # Workspace bootstrap before SSE: most recent N events across bundles.
-# Kept modest so the first ``spec team watch`` connect does not replay
-# an overwhelming backlog (use ``/replay`` / REST for deep history).
-_TEAM_WATCH_BOOTSTRAP_LIMIT = 60
+# Kept small so the first ``spec team watch`` connect does not replay a
+# huge backlog (use ``/replay`` / REST for deep history).
+_TEAM_WATCH_BOOTSTRAP_LIMIT = 15
 
 # Default ``0`` = do not flush paired Q/A on idle time alone — wait for
 # ``assistant_closed`` from ``spec watch`` (after tail stability), the

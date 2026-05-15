@@ -800,6 +800,7 @@ def _producer_tick(
                 prev,
                 clamped,
             )
+            cursor.mark_local_turns_posted(session.id, session.turns)
             cursor.clamp_broadcast(session.id, clamped)
             prev = clamped
         new_turns = session.turns[prev:]
@@ -852,6 +853,12 @@ def _producer_tick(
                     ):
                         holds.pop(session.id, None)
                         cursor.record_broadcast(session.id, turn_idx + 1)
+                        cursor.mark_turn_posted(
+                            session.id,
+                            turn_idx,
+                            "assistant",
+                            turn.at,
+                        )
                         _post_assistant_closed(
                             poster,
                             session,
@@ -863,6 +870,15 @@ def _producer_tick(
                     continue
 
             _EMPTY_TURN_RETRIES.pop((session.id, turn_idx), None)
+
+            if (
+                not is_tail_assistant
+                and cursor.is_turn_posted(
+                    session.id, turn_idx, turn.role, turn.at
+                )
+            ):
+                cursor.record_broadcast(session.id, turn_idx + 1)
+                continue
 
             ok, created_id = poster.send(event)
             if not ok:
@@ -887,6 +903,11 @@ def _producer_tick(
 
             if turn.role == "assistant" and created_id is not None:
                 cloud_ids[session.id] = created_id
+
+            if not is_tail_assistant:
+                cursor.mark_turn_posted(
+                    session.id, turn_idx, turn.role, turn.at
+                )
 
             if is_tail_assistant:
                 fp = _assistant_text_fingerprint(turn.text)

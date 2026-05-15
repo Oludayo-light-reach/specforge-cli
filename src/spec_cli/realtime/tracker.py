@@ -24,6 +24,7 @@ import os
 import tempfile
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,10 @@ class LiveCursor:
     project_id: int | None = None
     last_received_id: int | None = None
     broadcast_turns: dict[str, int] = field(default_factory=dict)
+    # Stable keys for turns we successfully POSTed — survives cursor
+    # inflation and stops duplicate user rows when ``broadcast_turns``
+    # overshoots the local transcript length.
+    posted_turn_keys: dict[str, set[str]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ── factories ─────────────────────────────────────────────────
@@ -105,7 +110,25 @@ class LiveCursor:
                 for k, v in broadcast.items()
                 if isinstance(v, int) and v >= 0
             }
+        posted = raw.get("posted_turn_keys") or {}
+        if isinstance(posted, dict):
+            cursor.posted_turn_keys = {
+                str(sid): {str(k) for k in keys if isinstance(k, str)}
+                for sid, keys in posted.items()
+                if isinstance(keys, list)
+            }
         return cursor
+
+    @staticmethod
+    def turn_post_key(
+        turn_idx: int,
+        role: str,
+        turn_at: datetime | None,
+    ) -> str:
+        if turn_at is not None:
+            ts = turn_at.astimezone().replace(microsecond=0).isoformat()
+            return f"{turn_idx}:{role}:{ts}"
+        return f"{turn_idx}:{role}"
 
     # ── reads ─────────────────────────────────────────────────────
 
@@ -113,6 +136,41 @@ class LiveCursor:
         """How many turns of ``session_id`` have we already POSTed?"""
         with self._lock:
             return self.broadcast_turns.get(session_id, 0)
+
+    def is_turn_posted(
+        self,
+        session_id: str,
+        turn_idx: int,
+        role: str,
+        turn_at: datetime | None,
+    ) -> bool:
+        key = self.turn_post_key(turn_idx, role, turn_at)
+        with self._lock:
+            return key in self.posted_turn_keys.get(session_id, set())
+
+    def mark_turn_posted(
+        self,
+        session_id: str,
+        turn_idx: int,
+        role: str,
+        turn_at: datetime | None,
+    ) -> None:
+        key = self.turn_post_key(turn_idx, role, turn_at)
+        with self._lock:
+            self.posted_turn_keys.setdefault(session_id, set()).add(key)
+
+    def mark_local_turns_posted(self, session_id: str, turns: list) -> None:
+        """Record every local turn slot as already on Cloud (no POST)."""
+        with self._lock:
+            keys = self.posted_turn_keys.setdefault(session_id, set())
+            for idx, turn in enumerate(turns):
+                role = getattr(turn, "role", None)
+                if role in ("user", "assistant"):
+                    keys.add(
+                        self.turn_post_key(
+                            idx, role, getattr(turn, "at", None)
+                        )
+                    )
 
     # ── writes ────────────────────────────────────────────────────
 
@@ -181,6 +239,10 @@ class LiveCursor:
                 "project_id": self.project_id,
                 "last_received_id": self.last_received_id,
                 "broadcast_turns": dict(self.broadcast_turns),
+                "posted_turn_keys": {
+                    sid: sorted(keys)
+                    for sid, keys in self.posted_turn_keys.items()
+                },
             }
         tmp_fd, tmp_name = tempfile.mkstemp(
             prefix=f"{CURSOR_FILENAME}.",

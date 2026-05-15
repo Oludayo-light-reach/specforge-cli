@@ -45,7 +45,6 @@ from ..config import (
     parse_cloud_project,
 )
 from ..git import read_git_context
-from ..prompts.text_sanitize import is_cursor_redacted_placeholder
 from ..realtime.broadcast_identity import load_or_create_broadcast_client_id
 from ..realtime.live_event_dedup import LivePromptEventDeduper
 from ..realtime.commands import (
@@ -460,18 +459,15 @@ def _assistant_has_reviewable_prose(event: IncomingEvent) -> bool:
 
     Those rows carry structured ``tool_calls`` but no human-readable prose;
     showing them as live "AI" lines spammed the pane with useless headers.
+
+    Must match :meth:`Notifier._assistant_visible_prose` — a row with
+    ``text="[REDACTED]"`` and a real ``summary`` is reviewable, but the
+    old check treated raw ``text`` as prose and printed only ``[REDACTED]``.
     """
-    text = (event.text or "").strip()
-    if text and not is_cursor_redacted_placeholder(text):
-        return True
-    summary = (event.summary or "").strip()
-    if (
-        summary
-        and not is_cursor_redacted_placeholder(summary)
-        and not is_tool_only_summary(summary)
-    ):
-        return True
-    return False
+    if not Notifier._assistant_preview_is_meaningful(event.text, event.summary):
+        return False
+    body = Notifier._assistant_visible_prose(event.text, event.summary).strip()
+    return not is_tool_only_summary(body)
 
 
 def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:

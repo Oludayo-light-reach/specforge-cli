@@ -71,7 +71,7 @@ from ..git import read_git_context
 from ..prompts.text_sanitize import unwrap_cursor_user_message
 from .events import IncomingEvent
 from .merge_turns import merge_assistant_snapshots
-from .notifier import Notifier, _format_tool_call_line
+from .notifier import Notifier, _format_tool_call_line, format_live_event_clock
 from .team_push_requests import record_push_request
 
 
@@ -378,7 +378,7 @@ def _cmd_search(cmd: ParsedCommand, ctx: CommandContext) -> None:
     ]
     for ev, snippet in hits:
         ts = ev.turn_at or ev.received_at
-        when = ts.astimezone().strftime("%H:%M:%S") if ts else "??:??:??"
+        when = format_live_event_clock(ts) if ts else "—"
         body = snippet or (ev.summary or "(no body)")
         lines.append(
             f"  #{ev.id:<6} {when}  {ev.role:<5} {ev.author_display:<22}  {body}"
@@ -1060,7 +1060,7 @@ def _cmd_summarize(cmd: ParsedCommand, ctx: CommandContext) -> None:
         ts = ev.turn_at or ev.received_at or datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        when = escape(ts.astimezone().strftime("%H:%M:%S"))
+        when = escape(format_live_event_clock(ts))
         role_u = ev.role.upper()
         role_style = {
             "USER": "bold #3ddab4",

@@ -29,7 +29,27 @@ from spec_cli.realtime.notifier import (
     _short_cwd,
     _short_session,
     _strip_code_blocks,
+    format_live_event_clock,
 )
+
+
+def test_format_live_event_clock_includes_date():
+    dt = datetime(2026, 5, 15, 13, 7, 9, tzinfo=timezone.utc)
+    out = format_live_event_clock(dt)
+    assert out == dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_assistant_visible_prose_skips_redacted_text_for_summary():
+    """Cursor tool steps often ship text=[REDACTED] with a real summary."""
+    body = Notifier._assistant_visible_prose(
+        "[REDACTED]",
+        "Investigating the live feed.",
+    )
+    assert body == "Investigating the live feed."
+    assert Notifier._assistant_preview_is_meaningful(
+        "[REDACTED]", "Investigating the live feed."
+    )
+    assert not Notifier._assistant_preview_is_meaningful("[REDACTED]", "[REDACTED]")
 
 
 # ── _short_cwd ────────────────────────────────────────────────────

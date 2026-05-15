@@ -1143,6 +1143,8 @@ def _build_outgoing(
             text_out = _truncate(redact_text(prose), MAX_TURN_TEXT_CHARS)
         else:
             text_out = None
+        if text_out and is_cursor_redacted_placeholder(text_out):
+            text_out = None
         # Tool-only assistant turns (no prose, just tool_use entries
         # like Edit / Write / Bash / Read) used to be dropped entirely
         # — which made the team feed look like prompts vanishing into

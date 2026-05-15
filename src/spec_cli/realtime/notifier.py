@@ -35,10 +35,30 @@ from typing import Any
 from rich.markup import escape
 
 from ..prompts.schema import MAX_TURN_TEXT_CHARS
-from ..prompts.text_sanitize import unwrap_cursor_user_message
+from ..prompts.text_sanitize import (
+    is_cursor_redacted_placeholder,
+    prose_without_redacted_placeholders,
+    unwrap_cursor_user_message,
+)
 from ..ui import console, flush_streaming_output
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
 from .events import IncomingEvent, IncomingFlag, ToolCallPayload
+
+# Local wall clock for live panes — include the calendar date so
+# overnight / multi-day ``spec team watch`` sessions stay readable.
+_LIVE_EVENT_CLOCK_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def format_live_event_clock(value: datetime | None) -> str:
+    """Format ``value`` in the viewer's local timezone with date + time.
+
+    Matches the historical ``_short_time`` behaviour for naive vs aware
+    datetimes (naive values follow :meth:`datetime.datetime.astimezone`
+    rules).
+    """
+    if value is None:
+        value = datetime.now(timezone.utc)
+    return value.astimezone().strftime(_LIVE_EVENT_CLOCK_FMT)
 
 
 def _short_cwd(cwd: str | None) -> str | None:
@@ -251,9 +271,7 @@ def _source_label(source: str) -> str:
 
 
 def _short_time(value: datetime | None) -> str:
-    if value is None:
-        value = datetime.now(timezone.utc)
-    return value.astimezone().strftime("%H:%M:%S")
+    return format_live_event_clock(value)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -427,9 +445,13 @@ class Notifier:
         is not already the opening of ``text``. Long summaries are never
         pasted above the body — reviewers and ``/turn`` should rely on verbose
         assistant ``text`` rows from the broadcaster, not headline walls.
+
+        Cursor often stores ``text: "[REDACTED]"`` on tool steps while the
+        readable headline lives in ``summary`` — never prefer the placeholder
+        over real prose.
         """
-        t = (text or "").strip()
-        s = (summary or "").strip()
+        t = prose_without_redacted_placeholders((text or "").strip())
+        s = prose_without_redacted_placeholders((summary or "").strip())
         if not t:
             return s
         if not s:
@@ -441,6 +463,12 @@ class Notifier:
         if len(s) <= 400 and not t.startswith(s[: min(len(s), 120)]):
             return f"{s}\n\n{t}"
         return t
+
+    @staticmethod
+    def _assistant_preview_is_meaningful(text: str | None, summary: str | None) -> bool:
+        """True when :meth:`_assistant_visible_prose` would show readable text."""
+        body = Notifier._assistant_visible_prose(text, summary).strip()
+        return bool(body) and not is_cursor_redacted_placeholder(body)
 
     def last_turn_digest(self) -> tuple[str, int, int, int] | None:
         """``(session_id, project_id, user_event_id, assistant_event_id)``."""
@@ -1157,7 +1185,7 @@ class Notifier:
         """Visible "I am still listening" tick. Surfaced periodically
         from idle workspace watchers so engineers can tell at a glance
         that the stream is alive even when the team is quiet."""
-        ts = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
+        ts = format_live_event_clock(datetime.now(timezone.utc))
         with self._lock:
             if self._live_suppress:
                 self._skipped_while_suppressed += 1

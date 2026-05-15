@@ -9,6 +9,7 @@ import pytest
 
 from spec_cli.commands.team import (
     _TeamWatchQAState,
+    _assistant_has_reviewable_prose,
     _resolve_assistant_quiet_secs,
 )
 from spec_cli.realtime.events import IncomingEvent
@@ -347,6 +348,20 @@ def test_tick_quiet_flush_cloud_only_assistant_without_sse_buffer(
     )
     qa.tick_quiet_flush(n, [0.0], quiet_secs=10.0)
     n.show_completed_pair.assert_called_once()
+
+
+def test_assistant_has_reviewable_prose_rejects_redacted_only_body() -> None:
+    assert not _assistant_has_reviewable_prose(
+        _ev(id=1, role="assistant", text="[REDACTED]", summary="[REDACTED]")
+    )
+    assert _assistant_has_reviewable_prose(
+        _ev(
+            id=2,
+            role="assistant",
+            text="[REDACTED]",
+            summary="Investigating the live feed.",
+        )
+    )
 
 
 def test_tick_quiet_flush_skipped_when_quiet_secs_zero(monkeypatch) -> None:

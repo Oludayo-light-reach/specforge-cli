@@ -36,6 +36,11 @@ from typing import Iterable
 from ..api import ApiError, CloudClient
 from ..git import read_git_context
 from ..prompts.schema import Session, Turn
+from ..prompts.text_sanitize import (
+    is_cursor_redacted_placeholder,
+    prose_without_redacted_placeholders,
+    unwrap_cursor_user_message,
+)
 from .events import IncomingEvent
 from ..sources import (
     ClaudeCodeError,
@@ -1119,7 +1124,7 @@ def _build_outgoing(
     title = (session.title or "").strip() or None
 
     if role == "user":
-        body = (turn.text or "").strip()
+        body = unwrap_cursor_user_message((turn.text or "").strip())
         if len(body) < MIN_TURN_TEXT_CHARS:
             return None
         body = _truncate(redact_text(body), MAX_TURN_TEXT_CHARS)
@@ -1127,12 +1132,15 @@ def _build_outgoing(
         text_out: str | None = body
     else:
         summary = (turn.summary or "").strip() or None
-        if summary is None and (turn.text or "").strip():
-            summary = (turn.text or "").strip().splitlines()[0][:300]
+        if summary and is_cursor_redacted_placeholder(summary):
+            summary = None
+        prose = prose_without_redacted_placeholders((turn.text or "").strip())
+        if summary is None and prose:
+            summary = prose.splitlines()[0][:300]
         if summary is not None:
             summary = redact_text(summary)
-        if opts.verbose_assistant and turn.text:
-            text_out = _truncate(redact_text(turn.text.strip()), MAX_TURN_TEXT_CHARS)
+        if opts.verbose_assistant and prose:
+            text_out = _truncate(redact_text(prose), MAX_TURN_TEXT_CHARS)
         else:
             text_out = None
         # Tool-only assistant turns (no prose, just tool_use entries

@@ -89,6 +89,81 @@ def test_read_codex_sessions_extracts_turns(tmp_path, monkeypatch):
     assert s.turns[1].text is None
 
 
+def test_agent_transcript_coalesces_redacted_assistant_steps(tmp_path, monkeypatch):
+    """Cursor emits one JSONL row per tool step; many only have ``[REDACTED]`` prose."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sid = "33333333-3333-4333-a333-333333333333"
+    _write_transcript(
+        tmp_path,
+        bundle,
+        sid,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<user_query>\nfix the feed\n</user_query>",
+                        }
+                    ]
+                },
+            },
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "On it."},
+                        {
+                            "type": "tool_use",
+                            "name": "Grep",
+                            "input": {"pattern": "REDACTED", "path": str(bundle)},
+                        },
+                    ]
+                },
+            },
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "[REDACTED]"},
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"path": str(bundle / "README.md")},
+                        },
+                    ]
+                },
+            },
+            {
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "[REDACTED]"},
+                        {
+                            "type": "tool_use",
+                            "name": "Glob",
+                            "input": {"glob_pattern": "*.py", "target_directory": str(bundle)},
+                        },
+                    ]
+                },
+            },
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    sessions = list(read_cursor_sessions(bundle, verbose=True))
+    assert len(sessions) == 1
+    roles = [t.role for t in sessions[0].turns]
+    assert roles == ["user", "assistant"]
+    assert sessions[0].turns[0].text == "fix the feed"
+    asst = sessions[0].turns[1]
+    assert "On it." in (asst.text or "")
+    assert len(asst.tool_calls or []) == 3
+    assert {c.name for c in asst.tool_calls or []} == {"Grep", "Read", "Glob"}
+
+
 def test_read_codex_sessions_verbose_keeps_assistant_text(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
     bundle.mkdir()

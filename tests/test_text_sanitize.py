@@ -3,6 +3,9 @@ import tomllib
 from spec_cli.prompts.render import render_prompts_file
 from spec_cli.prompts.schema import CommitMeta, PromptsFile, Session, Turn
 from spec_cli.prompts.text_sanitize import (
+    CURSOR_REDACTED_PLACEHOLDER,
+    is_cursor_redacted_placeholder,
+    prose_without_redacted_placeholders,
     sanitize_for_toml_text,
     strip_ansi_escapes,
     unwrap_cursor_user_message,
@@ -17,6 +20,17 @@ def test_unwrap_cursor_user_message_strips_envelope():
         "</user_query>"
     )
     assert unwrap_cursor_user_message(raw) == "hi"
+
+
+def test_is_cursor_redacted_placeholder():
+    assert is_cursor_redacted_placeholder(CURSOR_REDACTED_PLACEHOLDER)
+    assert is_cursor_redacted_placeholder(f"{CURSOR_REDACTED_PLACEHOLDER}\n{CURSOR_REDACTED_PLACEHOLDER}")
+    assert not is_cursor_redacted_placeholder("On it.\n[REDACTED]")
+    assert not is_cursor_redacted_placeholder("hello")
+
+
+def test_prose_without_redacted_placeholders():
+    assert prose_without_redacted_placeholders("On it.\n[REDACTED]") == "On it."
 
 
 def test_unwrap_cursor_user_message_plain_text_unchanged():

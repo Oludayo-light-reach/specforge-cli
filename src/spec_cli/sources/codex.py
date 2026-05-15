@@ -53,7 +53,12 @@ from ..prompts.schema import (
     Turn,
     validate_session,
 )
-from ..prompts.text_sanitize import sanitize_for_toml_text
+from ..prompts.text_sanitize import (
+    is_cursor_redacted_placeholder,
+    prose_without_redacted_placeholders,
+    sanitize_for_toml_text,
+    unwrap_cursor_user_message,
+)
 from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 
 # This adapter currently reads Codex transcripts from Cursor's
@@ -647,7 +652,60 @@ def _build_session(path: Path, *, cwd: Path, verbose: bool) -> Session | None:
     # JSONL under ``~/.cursor/projects/.../agent-transcripts/`` is Cursor
     # in-editor Agent storage — not OpenAI Codex Desktop. Label it
     # ``cursor`` so Spec Live / capture match what users actually ran.
+    #
+    # Cursor emits one JSONL row per agent step. Many steps carry only the
+    # literal ``[REDACTED]`` prose placeholder (tool args are still in the
+    # row). Treating each row as its own :class:`Turn` made ``spec watch``
+    # POST dozens of useless assistant events and ``spec team watch`` print
+    # a wall of empty AI lines. Coalesce consecutive assistant rows into one
+    # logical turn — same shape as the Composer adapter in ``cursor.py``.
     builder = _SessionBuilder(id=path.stem, source="cursor")
+    pending_texts: list[str] = []
+    pending_tool_calls: list[ToolCall] = []
+    pending_first_at: datetime | None = None
+    pending_last_at: datetime | None = None
+    pending_model: str | None = None
+    pending_has_activity = False
+
+    def _flush_assistant() -> None:
+        nonlocal pending_texts, pending_tool_calls, pending_first_at
+        nonlocal pending_last_at, pending_model, pending_has_activity
+        if not pending_has_activity:
+            return
+        joined = "\n\n".join(
+            t.strip() for t in pending_texts if t.strip()
+        ).strip()
+        summary: str | None = _first_sentence(joined) if joined else None
+        if summary and is_cursor_redacted_placeholder(summary):
+            summary = None
+        preview_text = _preview(joined) if (verbose and joined) else None
+        if not summary and not preview_text and not pending_tool_calls:
+            pending_texts = []
+            pending_tool_calls = []
+            pending_first_at = None
+            pending_last_at = None
+            pending_model = None
+            pending_has_activity = False
+            return
+        builder.turns.append(
+            Turn(
+                role="assistant",
+                summary=summary or None,
+                text=preview_text,
+                at=pending_last_at or pending_first_at,
+                model=pending_model,
+                tool_calls=list(pending_tool_calls),
+            )
+        )
+        if builder.model is None and pending_model:
+            builder.model = pending_model
+        pending_texts = []
+        pending_tool_calls = []
+        pending_first_at = None
+        pending_last_at = None
+        pending_model = None
+        pending_has_activity = False
+
     for row in _iter_jsonl(path):
         role = row.get("role")
         if role not in {"user", "assistant"}:
@@ -665,34 +723,39 @@ def _build_session(path: Path, *, cwd: Path, verbose: bool) -> Session | None:
         )
         builder.observe_timestamp(ts)
         if role == "user":
-            if not text.strip():
+            _flush_assistant()
+            body = unwrap_cursor_user_message(text)
+            if not body.strip():
                 continue
-            builder.turns.append(Turn(role="user", text=text, at=ts))
+            builder.turns.append(Turn(role="user", text=body, at=ts))
             continue
 
         model_raw = msg.get("model") or row.get("model")
         turn_model: str | None = None
         if isinstance(model_raw, str) and model_raw.strip():
             turn_model = model_raw.strip()[:MAX_TURN_MODEL_CHARS]
+        if pending_model is None and turn_model is not None:
+            pending_model = turn_model
+        if pending_first_at is None:
+            pending_first_at = ts
+        if ts is not None:
+            pending_last_at = ts
+
         calls = _extract_tool_calls(content)
-        for call in calls:
-            builder.observe_paths_from_call(call)
-        summary = _first_sentence(text)
-        preview_text = _preview(text) if (verbose and text) else None
-        if not summary and not preview_text and not calls:
-            continue
-        builder.turns.append(
-            Turn(
-                role="assistant",
-                summary=summary or None,
-                text=preview_text,
-                at=ts,
-                model=turn_model,
-                tool_calls=calls,
-            )
-        )
-        if builder.model is None and turn_model:
-            builder.model = turn_model
+        if calls:
+            pending_tool_calls.extend(calls)
+            for call in calls:
+                builder.observe_paths_from_call(call)
+            pending_has_activity = True
+
+        prose = prose_without_redacted_placeholders(text)
+        if prose:
+            pending_texts.append(prose)
+            pending_has_activity = True
+        elif calls:
+            pending_has_activity = True
+
+    _flush_assistant()
 
     if builder.started_at is None:
         try:

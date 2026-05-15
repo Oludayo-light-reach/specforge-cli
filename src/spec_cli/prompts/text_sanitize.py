@@ -27,6 +27,32 @@ _CURSOR_USER_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cursor Agent transcripts replace tool-heavy prose with this literal
+# string while keeping structured ``tool_use`` blocks in the same row.
+CURSOR_REDACTED_PLACEHOLDER = "[REDACTED]"
+
+
+def is_cursor_redacted_placeholder(text: str | None) -> bool:
+    """True when ``text`` is empty or only Cursor's redaction placeholder(s)."""
+    if text is None:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped == CURSOR_REDACTED_PLACEHOLDER:
+        return True
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    return bool(lines) and all(ln == CURSOR_REDACTED_PLACEHOLDER for ln in lines)
+
+
+def prose_without_redacted_placeholders(text: str) -> str:
+    """Drop placeholder-only lines; join the rest."""
+    kept: list[str] = []
+    for line in text.splitlines():
+        if line.strip() and line.strip() != CURSOR_REDACTED_PLACEHOLDER:
+            kept.append(line)
+    return "\n".join(kept).strip()
+
 
 def strip_ansi_escapes(s: str) -> str:
     """Remove ANSI/VT escape sequences; leave newlines and tabs intact."""

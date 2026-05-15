@@ -68,6 +68,7 @@ from rich.markup import escape
 from ..api import ApiError
 from ..config import load_credentials
 from ..git import read_git_context
+from ..prompts.text_sanitize import unwrap_cursor_user_message
 from .events import IncomingEvent
 from .merge_turns import merge_assistant_snapshots
 from .notifier import Notifier, _format_tool_call_line
@@ -624,6 +625,8 @@ def _format_thread_turn_block(
     """One user prompt plus ordered assistant/error segments for ``/turn`` / ``/full``."""
     chip = (user.session_id or "").strip()[:8] or "?"
     ubody = (user.text or user.summary or "").strip()
+    if user.source == "cursor" and ubody:
+        ubody = unwrap_cursor_user_message(ubody)
     ordered = sorted(reply_chunks, key=lambda e: e.id)
     lines: list[str] = [
         f"── {label} · session {chip}… · user #{user.id} ──",

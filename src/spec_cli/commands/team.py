@@ -45,6 +45,7 @@ from ..config import (
     parse_cloud_project,
 )
 from ..git import read_git_context
+from ..prompts.text_sanitize import is_cursor_redacted_placeholder
 from ..realtime.broadcast_identity import load_or_create_broadcast_client_id
 from ..realtime.live_event_dedup import LivePromptEventDeduper
 from ..realtime.commands import (
@@ -452,6 +453,25 @@ def _build_team_watch_bootstrap_events(
 # still means "wait for ``assistant_closed`` only" — set
 # ``--assistant-quiet-secs 0`` or ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS=0``.
 _TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 60.0
+
+
+def _assistant_has_reviewable_prose(event: IncomingEvent) -> bool:
+    """False for Cursor's ``[REDACTED]``-only snapshots (tool steps).
+
+    Those rows carry structured ``tool_calls`` but no human-readable prose;
+    showing them as live "AI" lines spammed the pane with useless headers.
+    """
+    text = (event.text or "").strip()
+    if text and not is_cursor_redacted_placeholder(text):
+        return True
+    summary = (event.summary or "").strip()
+    if (
+        summary
+        and not is_cursor_redacted_placeholder(summary)
+        and not is_tool_only_summary(summary)
+    ):
+        return True
+    return False
 
 
 def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
@@ -1243,8 +1263,7 @@ def team_watch_cmd(
         # still streaming. The auto-critic still scans them; if it
         # fires the row surfaces anyway.
         is_prose_assistant = (
-            ev.role == "assistant"
-            and ((ev.text or "").strip() or not is_tool_only_summary(ev.summary))
+            ev.role == "assistant" and _assistant_has_reviewable_prose(ev)
         )
         force_show_assistant = False
         if (

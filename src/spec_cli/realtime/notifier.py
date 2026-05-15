@@ -35,7 +35,7 @@ from typing import Any
 from rich.markup import escape
 
 from ..prompts.schema import MAX_TURN_TEXT_CHARS
-from ..ui import console
+from ..ui import console, flush_streaming_output
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
 from .events import IncomingEvent, IncomingFlag, ToolCallPayload
 
@@ -717,6 +717,7 @@ class Notifier:
                 ):
                     self._render_tool_calls(event.tool_calls)
                 self._render_critiques(event, critiques)
+                flush_streaming_output()
                 return
             console.print()
             console.print(head)
@@ -769,6 +770,7 @@ class Notifier:
                 # "narration" / "what the AI did" visually.
                 self._render_tool_calls(event.tool_calls)
             self._render_critiques(event, critiques)
+            flush_streaming_output()
 
     def show_completed_pair(
         self,
@@ -955,6 +957,7 @@ class Notifier:
                     f"{chip}[/]   [sf.muted]whole session:[/] [sf.label]/full "
                     f"{chip}[/]"
                 )
+            flush_streaming_output()
 
     def _render_tool_calls(self, calls: list[ToolCallPayload]) -> None:
         """Print one line per tool invocation under the assistant body.
@@ -1260,6 +1263,7 @@ class Notifier:
                 f"[sf.mint]●[/] connected · [sf.label]{project_label}[/] [sf.muted]· "
                 f"streaming team prompts[/]"
             )
+            flush_streaming_output()
 
     def announce_connecting(self, detail: str) -> None:
         """Printed once before the SSE thread delivers live rows.
@@ -1271,6 +1275,7 @@ class Notifier:
                 self._skipped_while_suppressed += 1
                 return
             console.print(f"[sf.warn]…[/] connecting [sf.muted]({detail})[/]")
+            flush_streaming_output()
 
     def announce_broadcast_disabled(self) -> None:
         with self._lock:
@@ -1282,10 +1287,12 @@ class Notifier:
                 "(run [sf.label]spec live on[/] to share, or "
                 "[sf.label]spec live status[/] to see why it's off)"
             )
+            flush_streaming_output()
 
     def announce_fatal(self, msg: str) -> None:
         with self._lock:
             console.print(f"[sf.reject]✗[/] {msg}")
+            flush_streaming_output()
 
 
 __all__ = ["Notifier"]

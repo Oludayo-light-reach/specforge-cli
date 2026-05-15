@@ -533,6 +533,9 @@ def _child_env() -> dict[str, str]:
     # Mark child so it can disambiguate "I'm a background daemon" in
     # logs / error reports without parsing argv.
     env["SPEC_LIVE_BACKGROUND"] = "1"
+    # Background daemons write to ``.spec/watch.log`` (not a TTY). Without
+    # unbuffered stdio, Rich output can sit invisible for many seconds.
+    env["PYTHONUNBUFFERED"] = "1"
     return env
 
 

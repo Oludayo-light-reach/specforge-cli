@@ -448,13 +448,11 @@ def _build_team_watch_bootstrap_events(
 
     return sorted(users + others, key=lambda e: e.id)
 
-# Default ``0`` = do not flush paired Q/A on idle time alone — wait for
-# ``assistant_closed`` from ``spec watch`` (after tail stability), the
-# next user message, ``error``, ``/pair``, or exit. Long agent runs can
-# pause for minutes between tool rounds; a short idle timer used to
-# print incomplete replies. Set ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS``
-# or ``--assistant-quiet-secs`` when you want a fallback (e.g. 120).
-_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 0.0
+# Default idle flush when ``assistant_closed`` is delayed (POST blips,
+# broadcaster on an older CLI, or a long tail-stability window). Zero
+# still means "wait for ``assistant_closed`` only" — set
+# ``--assistant-quiet-secs 0`` or ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS=0``.
+_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 60.0
 
 
 def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
@@ -972,10 +970,10 @@ def team_request_push_cmd(handle: str, message: str | None, ttl: int) -> None:
     default=None,
     help=(
         "Seconds with no new assistant chunk before printing the paired "
-        "Q/A block without another user message. Default 0 (wait for "
-        "assistant_closed from spec watch, next user, error, /pair, or "
-        "exit). Set e.g. 120 or SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS when "
-        "teammates run an older broadcaster without assistant_closed."
+        "Q/A block without another user message. Default 60 (fallback when "
+        "assistant_closed is delayed). Use 0 to wait only for "
+        "assistant_closed, the next user, error, /pair, or exit. Override "
+        "with SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS."
     ),
 )
 def team_watch_cmd(
@@ -1292,6 +1290,11 @@ def team_watch_cmd(
             and not force_show_assistant
             and qa.buffer_assistant(ev)
         ):
+            # Live preview: show each prose snapshot while we still merge
+            # the durable paired block at flush (``assistant_closed``,
+            # idle timer, next user, ``/pair``, …).
+            if is_prose_assistant:
+                notifier.show(ev)
             if tick_clock:
                 last_output_at[0] = time.monotonic()
             return

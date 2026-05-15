@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from spec_cli.cli import cli
 from spec_cli.prompts import read_prompts_file
 from spec_cli.sources.codex import encode_bundle_path, read_codex_sessions
+from spec_cli.sources.cursor import read_cursor_sessions
 from spec_cli.sources.codex import (
     list_recent_codex_sessions,
     read_codex_rollout_session,
@@ -75,11 +76,11 @@ def test_read_codex_sessions_extracts_turns(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
 
-    sessions = list(read_codex_sessions(bundle))
+    sessions = list(read_cursor_sessions(bundle))
     assert len(sessions) == 1
     s = sessions[0]
     assert s.id == sid
-    assert s.source == "codex"
+    assert s.source == "cursor"
     assert s.cwd == str(bundle.resolve())
     assert [t.role for t in s.turns] == ["user", "assistant"]
     assert s.turns[0].text == "Refactor billing please."
@@ -109,7 +110,7 @@ def test_read_codex_sessions_verbose_keeps_assistant_text(tmp_path, monkeypatch)
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
 
-    sessions = list(read_codex_sessions(bundle, verbose=True))
+    sessions = list(read_cursor_sessions(bundle, verbose=True))
     assert sessions[0].verbose is True
     assert sessions[0].turns[1].text == "A longer reply."
 
@@ -134,7 +135,7 @@ def test_read_codex_sessions_includes_subdirectory_aliases(tmp_path, monkeypatch
     )
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
 
-    sessions = list(read_codex_sessions(bundle))
+    sessions = list(read_cursor_sessions(bundle))
     assert sorted(s.id for s in sessions) == sorted([root_id, sub_id])
 
 
@@ -157,7 +158,7 @@ def test_read_codex_sessions_honors_cursor_home_fallback(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
-    sessions = list(read_codex_sessions(bundle))
+    sessions = list(read_cursor_sessions(bundle))
     assert [s.id for s in sessions] == [sid]
 
 

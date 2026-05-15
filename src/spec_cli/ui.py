@@ -11,6 +11,7 @@ The CLI stays quiet by default. Color is signal, not decoration:
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.console import Console
@@ -40,13 +41,28 @@ def configure_streaming_stdio() -> None:
     or the process exits. Line buffering flushes after each line so
     banners, heartbeats, and events show up immediately.
     """
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
     for stream in (sys.stdout, sys.stderr):
         try:
             reconfigure = getattr(stream, "reconfigure", None)
             if callable(reconfigure):
-                reconfigure(line_buffering=True)
+                reconfigure(line_buffering=True, write_through=True)
         except (OSError, ValueError, TypeError, AttributeError):
             continue
+
+
+def flush_streaming_output() -> None:
+    """Best-effort flush after Rich prints in long-lived stream commands."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+    for con in (console, err_console):
+        try:
+            con.file.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def ok(msg: str) -> None:

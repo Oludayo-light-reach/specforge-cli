@@ -5,8 +5,8 @@ and normalize them into `spec_cli.prompts.Session` objects.
 Three adapters today:
 
   - ``claude_code`` — reads Claude Code's per-project JSONL store.
-  - ``cursor``      — reads Cursor's per-workspace SQLite store.
-  - ``codex``       — reads Codex/Cursor agent transcript JSONL store.
+  - ``cursor``      — reads Cursor Composer (SQLite) plus in-editor Agent JSONL.
+  - ``codex``       — reads OpenAI Codex Desktop rollout JSONL only.
 
 Both adapters expose a ``read_*_sessions(bundle_paths, *, since,
 verbose)`` entry point. ``bundle_paths`` may be a single ``Path`` or
@@ -31,6 +31,7 @@ from .codex import (
     codex_project_dir,
     codex_store_root,
     codex_transcript_store_available,
+    iter_cursor_agent_transcript_sessions,
     read_codex_rollout_session,
     read_codex_sessions,
     redact_text,
@@ -56,6 +57,7 @@ __all__ = [
     "cursor_global_storage_db",
     "cursor_workspace_storage_root",
     "encode_bundle_path",
+    "iter_cursor_agent_transcript_sessions",
     "list_recent_codex_sessions",
     "read_codex_rollout_session",
     "read_claude_code_sessions",

@@ -1,8 +1,12 @@
 """
 Codex adapter.
 
-Reads Codex Desktop rollout JSONL files and Cursor agent transcript JSONL
-files, then produces ``spec_cli.prompts.Session`` objects.
+Reads Codex Desktop rollout JSONL files (under ``~/.codex``) and Cursor
+in-editor Agent transcript JSONL files (under ``~/.cursor/projects/.../``),
+then produces ``spec_cli.prompts.Session`` objects.
+
+Cursor ``agent-transcripts`` sessions use ``source="cursor"``; only
+OpenAI Codex Desktop rollouts use ``source="codex"``.
 
 Store layout (Codex Desktop, observed):
 
@@ -640,7 +644,10 @@ def _project_dir_candidates(bundle_paths: Iterable[Path]) -> list[tuple[Path, Pa
 
 
 def _build_session(path: Path, *, cwd: Path, verbose: bool) -> Session | None:
-    builder = _SessionBuilder(id=path.stem)
+    # JSONL under ``~/.cursor/projects/.../agent-transcripts/`` is Cursor
+    # in-editor Agent storage — not OpenAI Codex Desktop. Label it
+    # ``cursor`` so Spec Live / capture match what users actually ran.
+    builder = _SessionBuilder(id=path.stem, source="cursor")
     for row in _iter_jsonl(path):
         role = row.get("role")
         if role not in {"user", "assistant"}:
@@ -700,13 +707,63 @@ def _build_session(path: Path, *, cwd: Path, verbose: bool) -> Session | None:
     return session
 
 
+def iter_cursor_agent_transcript_sessions(
+    bundle_paths: Path | Iterable[Path],
+    *,
+    since: datetime | None = None,
+    verbose: bool = False,
+) -> Iterable[Session]:
+    """Yield Cursor in-editor Agent sessions from JSONL under ``agent-transcripts``.
+
+    Cursor stores these under ``<CURSOR_HOME or ~/.cursor>/projects/<encoded>/``.
+    Same on-disk layout historically reached through :func:`read_codex_sessions`;
+    that path is now owned here so ``source`` is consistently ``cursor`` and
+    :func:`read_cursor_sessions` can merge them with Composer data.
+    """
+    roots: list[Path] = [bundle_paths] if isinstance(bundle_paths, Path) else list(bundle_paths)
+    if not roots:
+        return  # type: ignore[return-value]
+    yielded: set[str] = set()
+    candidates = _project_dir_candidates(roots)
+    if not candidates:
+        return  # type: ignore[return-value]
+
+    for project_dir, anchor in candidates:
+        transcripts_dir = project_dir / "agent-transcripts"
+        if not transcripts_dir.is_dir():
+            continue
+        for session_dir in sorted(transcripts_dir.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            path = session_dir / f"{session_dir.name}.jsonl"
+            if not path.is_file():
+                continue
+            if path.stem in yielded:
+                continue
+            try:
+                session = _build_session(path, cwd=anchor, verbose=verbose)
+            except Exception as e:  # noqa: BLE001
+                raise CodexError(f"{path.name}: could not build session — {e}") from e
+            if session is None:
+                continue
+            if since is not None and session.started_at is not None and session.started_at < since:
+                continue
+            yielded.add(session.id)
+            yield session
+
+
 def read_codex_sessions(
     bundle_paths: Path | Iterable[Path],
     *,
     since: datetime | None = None,
     verbose: bool = False,
 ) -> Iterable[Session]:
-    """Yield Codex sessions for the current bundle scope."""
+    """Yield OpenAI Codex Desktop rollout sessions for the current bundle.
+
+    Cursor in-editor Agent JSONL lives under ``~/.cursor/projects/`` — use
+    :func:`read_cursor_sessions` (which calls :func:`iter_cursor_agent_transcript_sessions`)
+    so those threads are labeled ``source=cursor`` and merged with Composer.
+    """
     roots: list[Path] = [bundle_paths] if isinstance(bundle_paths, Path) else list(bundle_paths)
     if not roots:
         return  # type: ignore[return-value]
@@ -733,30 +790,3 @@ def read_codex_sessions(
             continue
         yielded.add(session.id)
         yield session
-
-    candidates = _project_dir_candidates(roots)
-    if not candidates:
-        return
-
-    for project_dir, anchor in candidates:
-        transcripts_dir = project_dir / "agent-transcripts"
-        if not transcripts_dir.is_dir():
-            continue
-        for session_dir in sorted(transcripts_dir.iterdir()):
-            if not session_dir.is_dir():
-                continue
-            path = session_dir / f"{session_dir.name}.jsonl"
-            if not path.is_file():
-                continue
-            if path.stem in yielded:
-                continue
-            try:
-                session = _build_session(path, cwd=anchor, verbose=verbose)
-            except Exception as e:  # noqa: BLE001
-                raise CodexError(f"{path.name}: could not build session — {e}") from e
-            if session is None:
-                continue
-            if since is not None and session.started_at is not None and session.started_at < since:
-                continue
-            yielded.add(session.id)
-            yield session

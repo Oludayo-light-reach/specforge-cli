@@ -310,6 +310,20 @@ class SSEConsumer:
                     e,
                     self._retry_delay,
                 )
+            except AttributeError as e:
+                if "read" in str(e).lower():
+                    log.debug(
+                        "spec-live: stream socket closed during read — "
+                        "reconnect in %.1fs",
+                        self._retry_delay,
+                    )
+                else:
+                    log.warning(
+                        "spec-live: unexpected stream error (%s) — "
+                        "reconnect in %.1fs",
+                        e,
+                        self._retry_delay,
+                    )
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "spec-live: unexpected stream error (%s) — reconnect in %.1fs",
@@ -373,11 +387,12 @@ class SSEConsumer:
                 except Exception as e:  # noqa: BLE001
                     log.debug("spec-live: on_connect callback raised: %s", e)
 
-            for parsed in _iter_sse_frames(resp.iter_lines(decode_unicode=True)):
+            for parsed in _iter_sse_frames(
+                _iter_sse_lines(resp, stop_event=self._stop)
+            ):
                 if self._stop.is_set():
                     return
-                if parsed.id is not None:
-                    self._last_event_id = parsed.id
+                frame_id = parsed.id
                 if parsed.event == "turn" and parsed.data:
                     try:
                         payload = json.loads(parsed.data)
@@ -390,6 +405,8 @@ class SSEConsumer:
                         log.debug("spec-live: dropping unparseable event: %s", e)
                         continue
                     yield event
+                    if frame_id is not None:
+                        self._last_event_id = frame_id
                 elif parsed.event == "flag" and parsed.data:
                     try:
                         payload = json.loads(parsed.data)
@@ -422,6 +439,33 @@ class SSEConsumer:
             if self._stop.is_set():
                 return
             time.sleep(0.5)
+
+
+def _iter_sse_lines(
+    resp: requests.Response,
+    *,
+    stop_event: threading.Event | None = None,
+) -> Iterator[str]:
+    """Yield decoded SSE lines, exiting cleanly when the socket closes.
+
+    ``requests.Response.iter_lines`` can raise ``AttributeError: 'NoneType'
+    object has no attribute 'read'`` when :meth:`SSEConsumer.stop` closes the
+    response from another thread mid-read. Treat that as a normal stream end
+    so the consumer reconnects instead of logging a scary error and stalling.
+    """
+    try:
+        for raw in resp.iter_lines(decode_unicode=True):
+            if stop_event is not None and stop_event.is_set():
+                return
+            yield raw
+    except AttributeError as e:
+        if "read" in str(e).lower():
+            log.debug("spec-live: stream socket closed during read: %s", e)
+            return
+        raise
+    except (requests.exceptions.ChunkedEncodingError, OSError) as e:
+        log.debug("spec-live: stream read ended: %s", e)
+        return
 
 
 def _iter_sse_frames(lines: Iterator[str]) -> Iterator[_ParsedEvent]:

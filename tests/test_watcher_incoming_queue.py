@@ -1,0 +1,156 @@
+"""``spec watch`` must not render SSE frames on the reader thread."""
+from __future__ import annotations
+
+import queue
+import threading
+import time
+
+import pytest
+
+from spec_cli.realtime.watcher import WatcherOptions, run_watcher
+
+
+class _BlockingNotifier:
+    """Simulate slow Rich output on the main thread."""
+
+    def __init__(self) -> None:
+        self.show_calls: list[int] = []
+        self._release = threading.Event()
+
+    def announce_connected(self, _label: str) -> None:
+        pass
+
+    def announce_broadcast_disabled(self) -> None:
+        pass
+
+    def show(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.show_calls.append(event.id)
+        self._release.wait(timeout=2.0)
+
+    def announce_fatal(self, _msg: str) -> None:
+        pass
+
+
+class _FastEnqueueConsumer:
+    """Pushes several events immediately — would overflow a slow reader."""
+
+    def __init__(self, events: list) -> None:
+        self._events = list(events)
+        self._stop = threading.Event()
+
+    def set_resume_cursor(self, _last_id) -> None:  # type: ignore[no-untyped-def]
+        pass
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def test_watcher_drains_incoming_on_main_thread(monkeypatch, tmp_path) -> None:
+    from spec_cli.realtime import events as evmod
+
+    events = [
+        evmod.IncomingEvent(
+            id=i,
+            project_id=1,
+            session_id="s",
+            source="cursor",
+            role="user",
+            branch="main",
+            commit_sha=None,
+            model=None,
+            summary="hi",
+            text=f"msg {i}",
+            title=None,
+            cwd=str(tmp_path),
+            paths_touched=[],
+            turn_at=evmod.datetime.now(evmod.timezone.utc),
+            received_at=evmod.datetime.now(evmod.timezone.utc),
+            author_user_id=2,
+            author_handle="bob",
+            author_name="Bob",
+            author_avatar_url=None,
+        )
+        for i in (1, 2, 3)
+    ]
+    consumer = _FastEnqueueConsumer(events)
+    notifier = _BlockingNotifier()
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.Notifier",
+        lambda *a, **kw: notifier,
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.HTTPPoster",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.SSEConsumer",
+        lambda *a, **kw: consumer,
+    )
+
+    delivered: list[int] = []
+
+    def _run_consumer(c, on_event, on_fatal, **kw):  # type: ignore[no-untyped-def]
+        def _worker() -> None:
+            for ev in events:
+                on_event(ev)
+            time.sleep(0.05)
+            c.stop()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.run_consumer_in_thread", _run_consumer
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher._spec_live_startup_snapshot", lambda _r: None
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.read_git_context",
+        lambda _r: type("G", (), {"branch": "main", "commit_sha": None})(),
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.historical_bundle_paths", lambda _r: []
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.compute_local_presence",
+        lambda _r: type(
+            "P", (), {"files": [], "head_commit": None, "fingerprint": ""}
+        )(),
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.TeamPresenceMirror.write", lambda *a, **k: None
+    )
+
+    stop = threading.Event()
+
+    def _stop_soon() -> None:
+        time.sleep(0.2)
+        notifier._release.set()
+        stop.set()
+
+    threading.Thread(target=_stop_soon, daemon=True).start()
+
+    opts = WatcherOptions(
+        project_id=1,
+        project_label="alice/demo",
+        api_base="http://localhost",
+        access_token="t",
+        self_user_id=1,
+        receive=True,
+        broadcast=False,
+        presence_enabled=False,
+        poll_interval=0.2,
+    )
+  # (tmp_path / "spec.yaml") not required — bundle_root is tmp_path
+    (tmp_path / "spec.yaml").write_text(
+        "schema: spec/v0.1\nname: t\ncloud:\n  project: a/b\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".spec").mkdir(exist_ok=True)
+
+    run_watcher(tmp_path, opts, stop_event=stop)
+
+    assert notifier.show_calls == [1, 2, 3]

@@ -24,6 +24,7 @@ import hashlib
 import itertools
 import logging
 import os
+import queue
 import signal
 import threading
 import time
@@ -456,42 +457,70 @@ def run_watcher(
         consumer.set_resume_cursor(cursor.last_received_id)
 
         _live_ev_dedup = LivePromptEventDeduper()
+        # SSE reader thread only enqueues — the main loop drains and
+        # renders. Blocking Rich I/O on the reader used to stall
+        # ``iter_lines``, fill the server hub queue, and drop live
+        # frames teammates had already POSTed.
+        incoming: queue.Queue = queue.Queue()
+
+        def _process_incoming_event(event) -> None:  # type: ignore[no-untyped-def]
+            try:
+                if _live_ev_dedup.is_redelivery(event.id):
+                    return
+                if opts.self_user_id is not None and (
+                    event.author_user_id == opts.self_user_id
+                ):
+                    # Skip only this install's echoes (same bearer + same client id).
+                    # Missing ``broadcast_client_id`` on the wire means we cannot
+                    # tell another machine from a legacy echo — prefer showing the row.
+                    local_bid = (opts.broadcast_client_id or "").strip()
+                    wire_bid = (event.broadcast_client_id or "").strip()
+                    if wire_bid and local_bid and wire_bid == local_bid:
+                        return
+                if event.role == "presence":
+                    # Presence updates land in the cache (and trigger a
+                    # mirror rewrite below); we do NOT print them to the
+                    # terminal — the dirty file list churns too much for
+                    # a scrolling log to be useful, and the
+                    # ``team-presence.json`` writer is the canonical
+                    # surface. We'll surface a one-line "alice is now
+                    # editing X" only on transitions; that's a §future
+                    # polish.
+                    if presence_cache.apply_event(event):
+                        _write_team_presence(
+                            bundle_root,
+                            opts,
+                            presence_cache,
+                            team_presence,
+                            last_local_presence,
+                        )
+                    return
+                notifier.show(event)
+                if mirror is not None:
+                    mirror.write_event(event)
+            finally:
+                # Advance the resume cursor only after we have accepted
+                # the frame locally. Updating before render meant a
+                # crash or slow terminal could skip rows on reconnect.
+                cursor.record_received(event.id)
+
+        def _drain_incoming() -> None:
+            while True:
+                try:
+                    event = incoming.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    _process_incoming_event(event)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "spec-live: incoming handler raised on event %s: %s",
+                        getattr(event, "id", "?"),
+                        e,
+                    )
 
         def _on_event(event) -> None:  # type: ignore[no-untyped-def]
-            cursor.record_received(event.id)
-            if _live_ev_dedup.is_redelivery(event.id):
-                return
-            if opts.self_user_id is not None and (
-                event.author_user_id == opts.self_user_id
-            ):
-                # Skip only this install's echoes (same bearer + same client id).
-                # Missing ``broadcast_client_id`` on the wire means we cannot
-                # tell another machine from a legacy echo — prefer showing the row.
-                local_bid = (opts.broadcast_client_id or "").strip()
-                wire_bid = (event.broadcast_client_id or "").strip()
-                if wire_bid and local_bid and wire_bid == local_bid:
-                    return
-            if event.role == "presence":
-                # Presence updates land in the cache (and trigger a
-                # mirror rewrite below); we do NOT print them to the
-                # terminal — the dirty file list churns too much for
-                # a scrolling log to be useful, and the
-                # ``team-presence.json`` writer is the canonical
-                # surface. We'll surface a one-line "alice is now
-                # editing X" only on transitions; that's a §future
-                # polish.
-                if presence_cache.apply_event(event):
-                    _write_team_presence(
-                        bundle_root,
-                        opts,
-                        presence_cache,
-                        team_presence,
-                        last_local_presence,
-                    )
-                return
-            notifier.show(event)
-            if mirror is not None:
-                mirror.write_event(event)
+            incoming.put(event)
 
         def _on_fatal(err: SSEStreamError) -> None:
             fatal_error.append(err)
@@ -525,6 +554,8 @@ def run_watcher(
     )
     try:
         while not stop_event.is_set():
+            if opts.receive:
+                _drain_incoming()
             tick_started = time.monotonic()
             if poster is not None:
                 try:
@@ -603,6 +634,8 @@ def run_watcher(
             consumer.stop()
         if consumer_thread is not None:
             consumer_thread.join(timeout=1.5)
+        if opts.receive:
+            _drain_incoming()
 
         # Best-effort: broadcast a clean-state event before stopping
         # so peers can drop our presence row immediately instead of
@@ -940,24 +973,41 @@ def _iter_local_sessions(paths) -> Iterable[Session]:  # type: ignore[no-untyped
     when one isn't installed. ``verbose=True`` ensures assistant turn
     text is available; per-event redaction / truncation happens in
     :func:`_build_outgoing`.
+
+    Sessions are sorted **newest-first** (by ``ended_at`` then
+    ``started_at``) so a busy tick still ships the latest prompts to
+    Cloud before older backlog — matches reviewer expectations for
+    "live" and reduces time-to-visible for the thread you just typed in.
     """
+    sessions: list[Session] = []
+
     if claude_code_store_root().exists():
         try:
-            yield from read_claude_code_sessions(paths, since=None, verbose=True)
+            sessions.extend(
+                read_claude_code_sessions(paths, since=None, verbose=True)
+            )
         except ClaudeCodeError as e:
             log.debug("spec-live: claude_code adapter skipped: %s", e)
 
     if cursor_workspace_storage_root().exists():
         try:
-            yield from read_cursor_sessions(paths, since=None, verbose=True)
+            sessions.extend(read_cursor_sessions(paths, since=None, verbose=True))
         except CursorError as e:
             log.debug("spec-live: cursor adapter skipped: %s", e)
 
     if codex_transcript_store_available():
         try:
-            yield from read_codex_sessions(paths, since=None, verbose=True)
+            sessions.extend(read_codex_sessions(paths, since=None, verbose=True))
         except CodexError as e:
             log.debug("spec-live: codex adapter skipped: %s", e)
+
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+    def _recency_key(s: Session) -> datetime:
+        return s.ended_at or s.started_at or epoch
+
+    sessions.sort(key=_recency_key, reverse=True)
+    yield from sessions
 
 
 def _build_outgoing(

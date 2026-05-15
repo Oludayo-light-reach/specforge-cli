@@ -28,6 +28,10 @@ Cursor stores chat data in two places:
     ``modelInfo``)
     and per-message bodies under
     ``cursorDiskKV[bubbleId:<composerId>:<bubbleId>]``.
+  - **In-editor Agent JSONL** under
+    ``<USER_DATA>/projects/<encoded-workspace>/agent-transcripts/``
+    (same path layout as ``codex_store_root()`` — merged here so
+    ``source`` is always ``cursor``).
 
 Why split this way? Composers are workspace-tied (you only see them in
 the workspace they were created in), but the message bodies are large
@@ -82,6 +86,7 @@ from ..prompts.schema import (
 )
 from ..prompts.text_sanitize import sanitize_for_toml_text
 from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
+from .codex import CodexError, iter_cursor_agent_transcript_sessions
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +867,9 @@ def read_cursor_sessions(
     through ``stage.historical_bundle_paths`` so a moved bundle still
     finds its old sessions (Fix #2).
 
+    Returns **Composer** sessions from workspace SQLite plus **Agent
+    JSONL** sessions from ``.../agent-transcripts/`` when present.
+
     Scope mirrors git: a composer counts if Cursor was opened on the
     bundle root or any subdirectory of it. We map bundle paths to
     Cursor workspaceStorage entries via each entry's
@@ -881,16 +889,28 @@ def read_cursor_sessions(
     if not roots:
         return  # type: ignore[return-value]
 
+    yielded: set[str] = set()
+
+    try:
+        for session in iter_cursor_agent_transcript_sessions(
+            roots, since=since, verbose=verbose
+        ):
+            if session.id in yielded:
+                continue
+            yielded.add(session.id)
+            yield session
+    except CodexError as e:
+        raise CursorError(f"cursor agent transcripts: {e}") from e
+
     matches = _workspace_dir_candidates(roots)
     if not matches:
         return  # type: ignore[return-value]
 
     global_db = cursor_global_storage_db()
     if not global_db.is_file():
-        # No global storage means no bubble bodies to read; yield nothing.
+        # No global storage means no composer bubble bodies; agent JSONL
+        # may still have been yielded above.
         return  # type: ignore[return-value]
-
-    yielded: set[str] = set()
 
     for match in matches:
         workspace_db = match.storage_dir / "state.vscdb"

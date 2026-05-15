@@ -31,6 +31,24 @@ console = Console(theme=_theme, highlight=False, soft_wrap=False)
 err_console = Console(theme=_theme, stderr=True, highlight=False, soft_wrap=False)
 
 
+def configure_streaming_stdio() -> None:
+    """Prefer line-buffered stdout/stderr for long-lived stream commands.
+
+    When stdout is not a TTY (piped output, some IDE-integrated terminals),
+    CPython uses block buffering. Rich output from ``spec watch`` and
+    ``spec team watch`` can then look completely dead until ~8KiB fills
+    or the process exits. Line buffering flushes after each line so
+    banners, heartbeats, and events show up immediately.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            reconfigure = getattr(stream, "reconfigure", None)
+            if callable(reconfigure):
+                reconfigure(line_buffering=True)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+
+
 def ok(msg: str) -> None:
     console.print(f"[sf.mint]✓[/] {msg}")
 

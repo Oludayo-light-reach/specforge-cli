@@ -387,6 +387,10 @@ def test_producer_tail_assistant_reposts_then_advances_when_stable(
         return clock[0]
 
     monkeypatch.setattr("spec_cli.realtime.watcher.time.monotonic", _mono)
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.tail_stability_quiet_secs",
+        lambda poll_interval: max(5.0, poll_interval * 3.0),
+    )
 
     poster = _StubPoster()
     cursor = LiveCursor.load(tmp_path, project_id=1)

@@ -13,6 +13,13 @@ Cursor stores chat data in two places:
     storage dir(s)*. Inside ``state.vscdb`` the ``ItemTable`` row
     keyed ``composer.composerData`` lists every Composer thread that
     belongs to this workspace.
+
+    **Important:** this is the **Composer / in-editor Agent** transcript
+    model, not necessarily Cursor's separate **sidebar Chat** UI. Chats
+    you open only in the right-hand Chat panel may never appear under
+    ``composer.composerData`` for the workspace folder Spec resolves —
+    use Agent/Composer in the editor for the same repo if you need Spec
+    Live to see the thread.
   - **Global** ``state.vscdb`` under ``<USER_DATA>/User/globalStorage/``.
     Cursor stores per-thread metadata under
     ``cursorDiskKV[composerData:<composerId>]`` (which carries

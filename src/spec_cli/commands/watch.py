@@ -160,8 +160,9 @@ def watch_cmd(
     event out over an SSE stream to every teammate's `spec watch`
     daemon, which renders it in their terminal within a few seconds.
 
-    Requires `cloud.prompt_stream: enabled` in spec.yaml to broadcast.
-    Receiving is always available to project members. Use `--mirror`
+    Broadcasting follows ``cloud.prompt_stream`` in spec.yaml (default ON).
+    Use ``spec live off`` / ``spec live mute`` to opt out. Receiving teammate
+    events is always available to project members. Use `--mirror`
     to also drop incoming peer events into a local file you can grep.
 
     By default this runs in the foreground; pass `--background` to

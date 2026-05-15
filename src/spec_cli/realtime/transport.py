@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -36,7 +37,14 @@ log = logging.getLogger(__name__)
 # Networking knobs. Sized for a single-instance backend on commodity
 # hardware; we err on the side of patience because any time saved on
 # aggressive timeouts comes back as user-visible reconnect noise.
-POST_TIMEOUT_SECS = 15.0
+#
+# POST uses ``(connect, read)`` so a slow TLS handshake does not eat the
+# same budget as a large JSON body commit on the server. Prod can take
+# >15s on big assistant rows while small user probes return in ~1s.
+POST_CONNECT_TIMEOUT_SECS = 10.0
+POST_READ_TIMEOUT_SECS = 60.0
+# Legacy single-value default (read budget) for callers passing a scalar.
+POST_TIMEOUT_SECS = POST_READ_TIMEOUT_SECS
 STREAM_CONNECT_TIMEOUT_SECS = 15.0
 STREAM_READ_TIMEOUT_SECS = 60.0  # > server keepalive interval (15s)
 
@@ -44,6 +52,22 @@ STREAM_READ_TIMEOUT_SECS = 60.0  # > server keepalive interval (15s)
 # starts there and doubles on consecutive failures up to the cap.
 RECONNECT_BASE_DELAY_SECS = 5.0
 RECONNECT_MAX_DELAY_SECS = 60.0
+
+
+def post_timeout() -> float | tuple[float, float]:
+    """Connect/read timeouts for prompt-event POSTs.
+
+    Override with ``SPEC_LIVE_POST_TIMEOUT_SECS`` (read seconds only).
+    """
+    raw = os.environ.get("SPEC_LIVE_POST_TIMEOUT_SECS", "").strip()
+    if raw:
+        try:
+            read_secs = float(raw)
+            if read_secs > 0:
+                return (POST_CONNECT_TIMEOUT_SECS, read_secs)
+        except ValueError:
+            pass
+    return (POST_CONNECT_TIMEOUT_SECS, POST_READ_TIMEOUT_SECS)
 
 
 class SSEStreamError(RuntimeError):
@@ -107,7 +131,7 @@ class HTTPPoster:
 
         On failure returns ``(False, None)``.
         """
-        deadline_timeout = timeout if timeout is not None else POST_TIMEOUT_SECS
+        deadline_timeout = timeout if timeout is not None else post_timeout()
         max_attempts = 4
         for attempt in range(max_attempts):
             try:

@@ -67,7 +67,7 @@ from ..realtime.team_push_requests import (
     record_push_request,
 )
 from ..realtime.transport import SSEConsumer, SSEStreamError, run_consumer_in_thread
-from ..ui import console, dim, fatal, ok
+from ..ui import configure_streaming_stdio, console, dim, fatal, ok
 
 
 def _ago(value: datetime | None) -> str:
@@ -87,6 +87,11 @@ def _ago(value: datetime | None) -> str:
 
 # GitHub-style handle — server ``author_handle`` filter is exact match.
 _HANDLE_STYLE = re.compile(r"^[a-z0-9][a-z0-9-]{0,37}$")
+
+# Bundle-scoped list has no ``role=`` query param — when the user passes
+# ``--role user``, over-fetch before client-side filter so presence rows
+# do not hide real turns behind a small ``--limit``.
+_TEAM_SNAPSHOT_ROLE_OVERFETCH_MAX = 200
 
 # Closed enum (mirrors the server's ``PromptEventFlagCreate``).
 _FLAG_KINDS = ("warning", "question", "block", "ack")
@@ -109,6 +114,8 @@ def _run_team_snapshot(
     project: str | None,
     org_wide: bool,
     user_filter: str | None,
+    *,
+    include_presence: bool,
 ) -> None:
     creds = load_credentials()
     if not creds or not creds.access_token:
@@ -129,7 +136,7 @@ def _run_team_snapshot(
                 limit=limit,
                 author_handle=api_author,
                 role=role_filter,
-                include_presence=False,
+                include_presence=include_presence,
             )
         except ApiError as e:
             fatal(str(e))
@@ -160,8 +167,14 @@ def _run_team_snapshot(
             fatal(str(e))
             return
         project_id = int(project_info["id"])
+        fetch_limit = limit
+        if role_filter:
+            fetch_limit = min(
+                _TEAM_SNAPSHOT_ROLE_OVERFETCH_MAX,
+                max(limit * 25, 50),
+            )
         try:
-            rows = client.list_prompt_events(project_id, limit=limit)
+            rows = client.list_prompt_events(project_id, limit=fetch_limit)
         except ApiError as e:
             fatal(str(e))
             return
@@ -169,6 +182,13 @@ def _run_team_snapshot(
 
     events = [IncomingEvent.from_json(r) for r in rows if isinstance(r, dict)]
     events = [e for e in events if e.role != "assistant_closed"]
+    # Bundle-scoped REST returns presence pings (``spec watch`` ~15s) mixed
+    # with real turns. They used to render as fake ``AI … assistant``
+    # rows because ``model`` is null — crowding ``--limit`` and hiding
+    # actual Cursor / Claude activity. Match ``--org`` defaults: hide
+    # unless the user explicitly asks.
+    if not include_presence:
+        events = [e for e in events if e.role != "presence"]
 
     if branch_filter:
         needle = branch_filter.lower()
@@ -177,6 +197,8 @@ def _run_team_snapshot(
         events = [e for e in events if e.role == role_filter]
     if user_filter:
         events = [e for e in events if _event_matches_user_filter(e, user_filter)]
+
+    events = events[:limit]
 
     if not events:
         dim(f"no recent activity for {label} — waiting for the team.")
@@ -200,6 +222,9 @@ def _run_team_snapshot(
         if event.role == "user":
             badge = "[bold black on #3ddab4] USER [/]"
             who = f"[bold #3ddab4]{author}[/]"
+        elif event.role == "presence":
+            badge = "[bold black on #9aa3b2] PRS [/]"
+            who = f"[bold #c7c9d1]{author}[/]"
         else:
             badge = "[bold black on #7de3ff]  AI  [/]"
             model = event.model or "assistant"
@@ -309,6 +334,17 @@ def _run_team_snapshot(
         "display name, or @handle (case-insensitive)."
     ),
 )
+@click.option(
+    "--include-presence",
+    "include_presence",
+    is_flag=True,
+    default=False,
+    help=(
+        "Include ``role=presence`` rows (git dirty-file pings from "
+        "``spec watch``). Off by default — they are noisy and were easy "
+        "to mistake for AI turns before this flag existed."
+    ),
+)
 def team_group(
     ctx: click.Context,
     limit: int,
@@ -317,6 +353,7 @@ def team_group(
     project: str | None,
     org_wide: bool,
     user_filter: str | None,
+    include_presence: bool,
 ) -> None:
     """Print recent Spec Live prompt activity, or stream the whole workspace.
 
@@ -340,6 +377,7 @@ def team_group(
         project,
         org_wide,
         user_filter,
+        include_presence=include_presence,
     )
 
 
@@ -359,13 +397,13 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # an overwhelming backlog (use ``/replay`` / REST for deep history).
 _TEAM_WATCH_BOOTSTRAP_LIMIT = 60
 
-# Default ``120`` = two minutes with no new assistant chunk after at
-# least one chunk arrived; then we print the ``paired reply`` block so a
-# solo thread is not silent forever. There is no perfect "model done"
-# signal on the wire without server help — this is a heuristic. Use ``0``
-# (``--assistant-quiet-secs 0`` or env) to disable idle flush and rely on
-# the next user message, ``error``, ``/pair``, or process exit instead.
-_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 120.0
+# Default ``0`` = do not flush paired Q/A on idle time alone — wait for
+# ``assistant_closed`` from ``spec watch`` (after tail stability), the
+# next user message, ``error``, ``/pair``, or exit. Long agent runs can
+# pause for minutes between tool rounds; a short idle timer used to
+# print incomplete replies. Set ``SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS``
+# or ``--assistant-quiet-secs`` when you want a fallback (e.g. 120).
+_TEAM_WATCH_ASSISTANT_QUIET_SECS_DEFAULT = 0.0
 
 
 def _resolve_assistant_quiet_secs(cli_value: float | None) -> float:
@@ -849,9 +887,10 @@ def team_request_push_cmd(handle: str, message: str | None, ttl: int) -> None:
     default=None,
     help=(
         "Seconds with no new assistant chunk before printing the paired "
-        "Q/A block without another user message. Default 120 (2m) or "
-        "SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS; use 0 to flush only on the "
-        "next user message, error, /pair, or exit."
+        "Q/A block without another user message. Default 0 (wait for "
+        "assistant_closed from spec watch, next user, error, /pair, or "
+        "exit). Set e.g. 120 or SPEC_TEAM_WATCH_ASSISTANT_QUIET_SECS when "
+        "teammates run an older broadcaster without assistant_closed."
     ),
 )
 def team_watch_cmd(
@@ -926,6 +965,8 @@ def team_watch_cmd(
     if not creds or not creds.access_token:
         fatal("Not signed in. Run `spec login` first.")
         return
+
+    configure_streaming_stdio()
 
     assistant_quiet_resolved = _resolve_assistant_quiet_secs(assistant_quiet_secs)
 

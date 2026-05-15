@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import logging
+import os
 import signal
 import threading
 import time
@@ -47,7 +48,7 @@ from ..sources import (
     redact_text,
 )
 from ..stage import historical_bundle_paths, record_bundle_path
-from ..ui import dim, warn
+from ..ui import configure_streaming_stdio, dim, warn
 from .broadcast_identity import load_or_create_broadcast_client_id
 from .events import OutgoingEvent, ToolCallPayload
 from .live_event_dedup import LivePromptEventDeduper
@@ -101,10 +102,36 @@ MIN_TURN_TEXT_CHARS = 1
 # disk between producer polls. We POST updates while ``text``
 # changes, then delay advancing ``broadcast_turns`` until the body
 # stays unchanged long enough that token streams are unlikely to
-# resume in the same bubble (sub-second quiet was too aggressive —
-# models often pause longer between chunks).
-TAIL_ASSISTANT_STABILITY_FLOOR_SECS = 5.0
+# resume in the same bubble. Agent runs can pause for minutes between
+# tool rounds or stream for hours — default to a 2h quiet window.
+DEFAULT_TAIL_ASSISTANT_STABILITY_SECS = 7200.0  # 2 hours
 TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER = 3.0
+
+
+def tail_stability_quiet_secs(poll_interval: float) -> float:
+    """How long tail assistant ``text`` must be unchanged before we
+    treat the bubble as finished and POST ``assistant_closed``.
+
+    Override with ``SPEC_LIVE_TAIL_STABILITY_SECS`` (seconds). While
+    the model is still writing, the fingerprint keeps changing and we
+    keep POSTing updates — this quiet window only applies after the
+    last visible chunk.
+    """
+    raw = os.environ.get("SPEC_LIVE_TAIL_STABILITY_SECS", "").strip()
+    if raw:
+        try:
+            custom = float(raw)
+            if custom > 0:
+                return max(
+                    custom,
+                    poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
+                )
+        except ValueError:
+            pass
+    return max(
+        DEFAULT_TAIL_ASSISTANT_STABILITY_SECS,
+        poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
+    )
 
 
 @dataclass
@@ -277,6 +304,11 @@ def _spec_live_startup_snapshot(bundle_root: Path) -> None:
         bits.append("codex: not installed")
 
     dim("Spec Live broadcast · local scan — " + " · ".join(bits))
+    dim(
+        "Tip: only Cursor Composer / in-editor Agent sessions in this folder "
+        "are scanned (workspaceStorage). The sidebar Chat panel often lives "
+        "elsewhere — use Agent tied to this repo to see turns in team watch."
+    )
     if (
         n_cursor >= 0
         and n_claude >= 0
@@ -309,6 +341,7 @@ def run_watcher(
     The internal SIGINT/SIGTERM handlers always set this same event,
     so external callers and signal handlers compose cleanly.
     """
+    configure_streaming_stdio()
     record_bundle_path(bundle_root)
     cursor = LiveCursor.load(bundle_root, project_id=opts.project_id)
     cursor.project_id = opts.project_id
@@ -790,9 +823,8 @@ def _producer_tick(
                     and hold.turn_idx == turn_idx
                     and fp == hold.fp
                 ):
-                    if now_m - hold.last_fp_change >= max(
-                        TAIL_ASSISTANT_STABILITY_FLOOR_SECS,
-                        opts.poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
+                    if now_m - hold.last_fp_change >= tail_stability_quiet_secs(
+                        opts.poll_interval
                     ):
                         holds.pop(session.id, None)
                         cursor.record_broadcast(session.id, turn_idx + 1)
@@ -823,8 +855,9 @@ def _producer_tick(
                 # Network blip — try this turn again next tick. Don't
                 # advance the cursor; we'd rather double-deliver
                 # (server is idempotent on session_id+role+turn_at)
-                # than skip.
-                return
+                # than skip. ``break`` (not ``return``) so other agent
+                # sessions in this tick still get a chance to POST.
+                break
 
             if turn.role == "assistant" and created_id is not None:
                 cloud_ids[session.id] = created_id

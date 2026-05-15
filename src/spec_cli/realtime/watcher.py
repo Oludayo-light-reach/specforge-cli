@@ -33,8 +33,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from ..api import ApiError, CloudClient
 from ..git import read_git_context
 from ..prompts.schema import Session, Turn
+from .events import IncomingEvent
 from ..sources import (
     ClaudeCodeError,
     CodexError,
@@ -91,6 +93,10 @@ DEFAULT_TEAM_PRESENCE_TICK_SECS = 30.0
 # against a kill -9 / power loss costing more than a few seconds of
 # replays.
 CURSOR_SAVE_INTERVAL_SECS = 10.0
+# Recent Cloud rows printed once on connect so ``spec watch`` is not
+# live-only. SSE ``Last-Event-ID`` replay only covers the gap since the
+# last run; this REST warm-up supplies context when you are already caught up.
+WATCH_BOOTSTRAP_LIMIT_DEFAULT = 25
 # Hard cap on per-event text payload before redaction. The server caps
 # at 512 KB; we cap a hair below to avoid edge-of-frame rejections,
 # leaving room for redaction expanding text by a few bytes.
@@ -232,6 +238,9 @@ class WatcherOptions:
     # by default so the pane shows prose narration only.
     show_tool_runs: bool = False
     project_branch_filter: str | None = None
+    # When True (default), fetch the latest project prompt rows over REST
+    # before opening the SSE tail so the pane shows recent teammate activity.
+    bootstrap_receive: bool = True
     user_agent: str = field(
         default_factory=lambda: "spec-cli/live"
     )
@@ -239,6 +248,51 @@ class WatcherOptions:
 
 # Throttle terminal noise when the cloud POST path is failing every tick.
 _POST_FAILURE_WARN_MONO: list[float] = [0.0]
+
+
+def _watch_bootstrap_limit() -> int:
+    raw = os.environ.get("SPEC_WATCH_BOOTSTRAP_LIMIT", "").strip()
+    if raw.isdigit():
+        return max(0, min(int(raw), 200))
+    return WATCH_BOOTSTRAP_LIMIT_DEFAULT
+
+
+def build_watch_bootstrap_events(
+    client: CloudClient,
+    project_id: int,
+    *,
+    limit: int | None = None,
+) -> list[IncomingEvent]:
+    """Recent prompt rows for this project, oldest-first, for startup replay.
+
+    Skips ``presence`` rows (noisy git pings). Fetches extra rows then
+    keeps the newest ``limit`` by monotonic ``id``.
+    """
+    cap = _watch_bootstrap_limit() if limit is None else max(0, min(int(limit), 200))
+    if cap == 0:
+        return []
+    fetch = min(max(cap * 2, cap), 200)
+    try:
+        rows = client.list_prompt_events(project_id, limit=fetch)
+    except ApiError:
+        return []
+    by_id: dict[int, IncomingEvent] = {}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        role = raw.get("role")
+        if role == "presence":
+            continue
+        try:
+            ev = IncomingEvent.from_json(raw)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ev.id >= 0:
+            by_id[ev.id] = ev
+    ordered = sorted(by_id.values(), key=lambda e: e.id)
+    if len(ordered) > cap:
+        ordered = ordered[-cap:]
+    return ordered
 
 
 def _spec_live_startup_snapshot(bundle_root: Path) -> None:
@@ -369,7 +423,6 @@ def run_watcher(
         self_user_id=opts.self_user_id,
         local_broadcast_client_id=opts.broadcast_client_id,
     )
-    notifier.announce_connected(opts.project_label)
     if not opts.broadcast:
         notifier.announce_broadcast_disabled()
     else:
@@ -526,6 +579,27 @@ def run_watcher(
             fatal_error.append(err)
             notifier.announce_fatal(str(err))
             stop_event.set()
+
+        if opts.bootstrap_receive:
+            try:
+                hist = CloudClient(
+                    api_base=opts.api_base, access_token=opts.access_token
+                )
+                boot = build_watch_bootstrap_events(hist, opts.project_id)
+            except Exception:  # noqa: BLE001
+                boot = []
+            if boot:
+                for ev in boot:
+                    _process_incoming_event(ev)
+                dim(
+                    f"spec watch: replayed {len(boot)} recent event(s) from Cloud "
+                    f"(then live tail)."
+                )
+            resume = cursor.last_received_id
+            if resume is not None:
+                consumer.set_resume_cursor(resume)
+
+        notifier.announce_connected(opts.project_label)
 
         consumer_thread = run_consumer_in_thread(
             consumer, on_event=_on_event, on_fatal=_on_fatal

@@ -52,6 +52,14 @@ from ..ui import dim, fatal, info, ok, warn
     help="Broadcast only — do not display teammates' incoming prompts.",
 )
 @click.option(
+    "--no-bootstrap",
+    is_flag=True,
+    help=(
+        "Do not print recent Cloud history on connect — only new SSE "
+        "events (and any gap replay since your last run)."
+    ),
+)
+@click.option(
     "--mirror",
     is_flag=True,
     help=(
@@ -143,6 +151,7 @@ from ..ui import dim, fatal, info, ok, warn
 def watch_cmd(
     no_broadcast: bool,
     no_receive: bool,
+    no_bootstrap: bool,
     mirror: bool,
     verbose_out: bool,
     compact: bool,
@@ -339,6 +348,7 @@ def watch_cmd(
             poll_interval=poll_interval if poll_interval and poll_interval > 0 else 2.0,
             broadcast=broadcast_active,
             receive=not no_receive,
+            bootstrap_receive=not no_bootstrap and not no_receive,
             mirror=mirror,
             # Presence shares the same gates as prompt broadcasting so a
             # user who muted Spec Live doesn't unintentionally start

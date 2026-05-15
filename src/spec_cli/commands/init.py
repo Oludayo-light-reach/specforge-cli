@@ -110,7 +110,9 @@ POST_MERGE_HOOK_BODY: str = f"""\
 # half of `git pull`) succeeds. When the user is on the trunk branch,
 # rolls every `prompts/<slug>.prompts` from a non-trunk branch into
 # `prompts/<trunk>.prompts` and `git add`s the result so the rollup
-# shows up in `git status` for a follow-up commit. Never blocks.
+# shows up in `git status` for a follow-up commit. Then runs a fast
+# local-only `spec bundle doctor` (stderr hints only when misaligned).
+# Never blocks.
 if command -v spec >/dev/null 2>&1; then
   spec git-hooks post-merge || true
 else
@@ -280,11 +282,14 @@ approvals:
   required: 1
 
 cloud:
-  project: {name}
-  # `bundle_id:` is stamped here automatically on the first successful
-  # `spec push` (PLAN.md §11). Once set, every push verifies it against
-  # the remote — pointing `cloud.project` at an unrelated bundle by
-  # accident is then a hard refusal, not a silent overwrite.
+  project: {cloud_project}
+  # Prefer `handle/slug` (matches Cloud URLs) so teammates resolve the
+  # same bundle without relying on who is logged in. When `spec init`
+  # runs after `spec login`, we stamp your handle + bundle name; otherwise
+  # this is a bare slug until the first `spec push` canonicalizes it.
+  # `bundle_id:` is stamped on the first successful `spec push` (PLAN.md §11).
+  # Once set, every push verifies it against the remote — pointing
+  # `cloud.project` at an unrelated bundle by accident is then a hard refusal.
 
   # Spec Live — real-time prompt sharing across the team. Each new
   # turn in any local Cursor / Codex / Claude Code session is
@@ -458,9 +463,9 @@ this file) should call `spec presence check` themselves.
 """
 
 
-def _write_starter_manifest(path: Path, name: str) -> None:
+def _write_starter_manifest(path: Path, name: str, *, cloud_project: str) -> None:
     path.write_text(
-        _STARTER_MANIFEST.format(name=name),
+        _STARTER_MANIFEST.format(name=name, cloud_project=cloud_project),
         encoding="utf-8",
     )
 
@@ -782,7 +787,14 @@ def init_cmd(
             bundle_name = root.name
             name_origin = "dir"
 
-    _write_starter_manifest(manifest_path, bundle_name)
+    from ..config import load_credentials
+
+    creds = load_credentials()
+    handle = ""
+    if creds and creds.access_token and isinstance(creds.user_handle, str):
+        handle = creds.user_handle.strip().lower()
+    cloud_project_value = f"{handle}/{bundle_name}" if handle else bundle_name
+    _write_starter_manifest(manifest_path, bundle_name, cloud_project=cloud_project_value)
 
     docs_dir = root / "docs"
     docs_dir.mkdir(exist_ok=True)

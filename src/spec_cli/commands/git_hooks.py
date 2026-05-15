@@ -318,9 +318,11 @@ def run_git_hook_post_merge() -> None:
     bundle = resolve_bundle_root_for_git_hook(top)
     if bundle is None:
         return
+    from .bundle import emit_bundle_doctor_post_merge_hints
     from .prompts import run_git_hook_post_merge_rollup
 
     run_git_hook_post_merge_rollup(bundle)
+    emit_bundle_doctor_post_merge_hints(bundle)
 
 
 def run_git_hook_pre_push() -> int:

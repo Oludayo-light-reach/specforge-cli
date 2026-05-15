@@ -350,6 +350,37 @@ def push_cmd(
             return
     project_id = project_info["id"]
 
+    # Canonical Cloud URL shape for `cloud.project` — teammates cloning the
+    # repo must not depend on "bare slug + whoever ran spec login". Use the
+    # server's owner_handle when present (team bundles), else the handle we
+    # resolved with; slug always from the project record.
+    own_raw = project_info.get("owner_handle")
+    if isinstance(own_raw, str) and own_raw.strip():
+        canon_handle = own_raw.strip().lower()
+    else:
+        canon_handle = handle
+    slug_raw = project_info.get("slug")
+    if isinstance(slug_raw, str) and slug_raw.strip():
+        canon_slug = slug_raw.strip()
+    else:
+        canon_slug = slug
+    canonical_project = f"{canon_handle}/{canon_slug}"
+    prior_lit = (cloud_project_prior_raw or "").strip()
+    if prior_lit != canonical_project:
+        try:
+            manifest.set_cloud_project(canonical_project)
+            dump_manifest(manifest)
+            dim(
+                f"Canonicalized `cloud.project` → `{canonical_project}` "
+                f"(owner namespace + slug from Cloud)."
+            )
+        except OSError as e:
+            warn(
+                f"Could not write canonical `cloud.project` ({e}). "
+                f"Set it to `{canonical_project}` manually so teammates clone safely."
+            )
+    handle, slug = canon_handle, canon_slug
+
     header_target = url_target.raw_url if url_target else f"{handle}/{slug}"
     git_desc = (
         f"{git.branch}@{git.commit_sha[:7]}"

@@ -27,7 +27,10 @@ curl -LsSf https://spec.lightreach.io/install.sh | sh
 ```
 
 That installs [`uv`](https://docs.astral.sh/uv) if you don't already have it,
-then drops `spec` on your `PATH` in an isolated environment. Full instructions
+then drops `spec` on your `PATH` in an isolated environment, and runs
+`spec shell install` (a `git` wrapper: `git init` → `spec init`, post-clone
+`spec bundle doctor` when the clone contains `spec.yaml`, plus `spec live`
+autostart — see the hosted docs). Full instructions
 — including a manual path that doesn't pipe into `sh`, and a contributor path
 that installs from a local clone — live at
 [spec.lightreach.io/install](https://spec.lightreach.io/install).
@@ -68,8 +71,10 @@ spec compile
 `spec init` inside a git repo installs **pre-commit** (mirrors `git add` into
 `spec add` / `spec unstage` for bundle paths, including **renames**),
 **commit-msg** (`spec git-hooks commit-msg` — runs capture and stages `.prompts`
-into the **same** commit), and **pre-push** (`spec push` when you `git push` a
-branch). Refresh with `spec git-hooks install`. Remove Spec hook blocks from
+into the **same** commit), **pre-push** (`spec push` when you `git push` a
+branch), and **post-merge** (prompt rollup on trunk plus a fast **local-only**
+bundle alignment check — stderr hints only when something is off, no Cloud
+round-trip). Refresh with `spec git-hooks install`. Remove Spec hook blocks from
 `.git/hooks/` with `spec git-hooks uninstall` (non-Spec hook content in the same
 files is preserved). Skip Spec upload on push with `SKIP_SPEC_PUSH=1`, or skip
 all hooks with `git push --no-verify`. Multi-bundle monorepos: set

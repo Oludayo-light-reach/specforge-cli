@@ -51,6 +51,7 @@ def mock_cloud_client() -> MagicMock:
     client.create_project.return_value = {
         "id": 42,
         "slug": "my-bundle",
+        "owner_handle": "alice",
         "bundle_id": "bdl_auto_create_test",
         "default_branch": "main",
     }
@@ -102,6 +103,7 @@ def test_push_updates_manifest_when_server_suffixes_slug(
     mock_cloud_client.create_project.return_value = {
         "id": 43,
         "slug": "my-bundle-2",
+        "owner_handle": "alice",
         "bundle_id": "bdl_suffix_test",
         "default_branch": "main",
     }
@@ -150,3 +152,44 @@ def test_push_does_not_auto_create_for_foreign_handle(
 
     assert r.exit_code != 0
     mock_cloud_client.create_project.assert_not_called()
+
+
+def test_push_canonicalizes_bare_cloud_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bare `cloud.project` is rewritten to owner/slug from Cloud after resolve."""
+    root = tmp_path / "bare"
+    _bundle(root, cloud_project="my-bundle")
+    _fake_git_main(root)
+    monkeypatch.chdir(root)
+
+    runner = CliRunner()
+    runner.invoke(cli, ["add", ".", "--no-capture"], catch_exceptions=False)
+
+    client = MagicMock()
+    client.resolve_project.return_value = {
+        "id": 77,
+        "slug": "my-bundle",
+        "owner_handle": "alice",
+        "bundle_id": "bdl_bare_slug",
+        "default_branch": "main",
+    }
+
+    def _batch(_project_id: int, chunk: list, **kw):
+        return {"results": [{"ok": True, "path": item["path"]} for item in chunk]}
+
+    client.batch_upload.side_effect = _batch
+
+    creds = Credentials(
+        api_base="https://spec.example",
+        access_token="tok",
+        user_handle="alice",
+    )
+    monkeypatch.setattr("spec_cli.commands.push.load_credentials", lambda: creds)
+
+    with patch("spec_cli.commands.push.CloudClient", return_value=client):
+        r = runner.invoke(cli, ["push"], catch_exceptions=False)
+
+    assert r.exit_code == 0
+    data = yaml.safe_load((root / "spec.yaml").read_text(encoding="utf-8"))
+    assert data["cloud"]["project"] == "alice/my-bundle"

@@ -394,8 +394,59 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # in the warm-up batch.
 # Workspace bootstrap before SSE: most recent N events across bundles.
 # Kept small so the first ``spec team watch`` connect does not replay a
-# huge backlog (use ``/replay`` / REST for deep history).
+# huge backlog (use ``/replay`` / REST for deep history). Reserve slots
+# for ``user`` rows so a burst of assistant-only Codex chunks does not
+# warm up as AI-only orphans.
 _TEAM_WATCH_BOOTSTRAP_LIMIT = 15
+_TEAM_WATCH_BOOTSTRAP_USER_SLOTS = 5
+
+
+def _build_team_watch_bootstrap_events(
+    client: CloudClient,
+    *,
+    limit: int,
+    include_presence: bool,
+) -> list[IncomingEvent]:
+    """Merge recent user prompts with the latest tail for warm-up.
+
+    ``GET /api/me/prompt-events`` returns newest-first; a live Codex run
+    can fill the whole window with assistant rows. We always pull recent
+    ``role=user`` rows separately, then cap the combined set at ``limit``.
+    """
+    user_cap = min(_TEAM_WATCH_BOOTSTRAP_USER_SLOTS, limit)
+    other_cap = max(0, limit - user_cap)
+
+    user_rows = client.list_my_prompt_events(
+        limit=user_cap,
+        role="user",
+        include_presence=include_presence,
+    )
+    tail_rows = client.list_my_prompt_events(
+        limit=limit,
+        include_presence=include_presence,
+    )
+
+    by_id: dict[int, IncomingEvent] = {}
+    for raw in user_rows + tail_rows:
+        if not isinstance(raw, dict):
+            continue
+        ev = IncomingEvent.from_json(raw)
+        if ev is not None and ev.id >= 0:
+            by_id[ev.id] = ev
+
+    users = [e for e in by_id.values() if e.role == "user"]
+    users.sort(key=lambda e: e.id)
+    users = users[-user_cap:]
+
+    others = [
+        e
+        for e in by_id.values()
+        if e.role != "user" and e.id not in {u.id for u in users}
+    ]
+    others.sort(key=lambda e: e.id)
+    others = others[-other_cap:]
+
+    return sorted(users + others, key=lambda e: e.id)
 
 # Default ``0`` = do not flush paired Q/A on idle time alone — wait for
 # ``assistant_closed`` from ``spec watch`` (after tail stability), the
@@ -606,8 +657,10 @@ class _TeamWatchQAState:
         ev: IncomingEvent,
         notifier: Notifier,
         last_output_at: list[float],
+        *,
+        is_bootstrap: bool = False,
     ) -> None:
-        if self.is_duplicate_user(ev):
+        if not is_bootstrap and self.is_duplicate_user(ev):
             return
         if self.pending_user is not None and self.combined_assistant_chunks():
             self.flush_pair(notifier)
@@ -1157,7 +1210,12 @@ def team_watch_cmd(
         on_connect=_on_connect,
     )
 
-    def _deliver(ev: IncomingEvent, *, tick_clock: bool = True) -> None:
+    def _deliver(
+        ev: IncomingEvent,
+        *,
+        tick_clock: bool = True,
+        is_bootstrap: bool = False,
+    ) -> None:
         """Shared path for live SSE frames and the one-shot REST warm."""
         if _live_ev_dedup.is_redelivery(ev.id):
             return
@@ -1216,7 +1274,9 @@ def team_watch_cmd(
             return
 
         if use_qa_coalesce and ev.role == "user":
-            qa.on_user(ev, notifier, last_output_at)
+            qa.on_user(
+                ev, notifier, last_output_at, is_bootstrap=is_bootstrap
+            )
             return
 
         if use_qa_coalesce and ev.role == "error":
@@ -1251,23 +1311,16 @@ def team_watch_cmd(
 
     try:
         hist_client = CloudClient(creds)
-        boot_rows = hist_client.list_my_prompt_events(
+        boot_events = _build_team_watch_bootstrap_events(
+            hist_client,
             limit=_TEAM_WATCH_BOOTSTRAP_LIMIT,
             include_presence=include_presence,
-        )
-        boot_events = sorted(
-            (
-                IncomingEvent.from_json(r)
-                for r in boot_rows
-                if isinstance(r, dict)
-            ),
-            key=lambda e: e.id,
         )
         max_boot_id: int | None = None
         for ev in boot_events:
             if max_boot_id is None or ev.id > max_boot_id:
                 max_boot_id = ev.id
-            _deliver(ev, tick_clock=True)
+            _deliver(ev, tick_clock=True, is_bootstrap=True)
         if max_boot_id is not None:
             consumer.set_resume_cursor(max_boot_id)
     except ApiError:

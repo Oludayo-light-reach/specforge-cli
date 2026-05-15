@@ -188,6 +188,27 @@ def test_flush_pair_prefers_cloud_tail_over_partial_sse_buffer(
     assert "much longer assistant" in (merged.text or "")
 
 
+def test_bootstrap_merge_reserves_user_slots() -> None:
+    from spec_cli.commands.team import _build_team_watch_bootstrap_events
+
+    client = MagicMock()
+    client.list_my_prompt_events.side_effect = [
+        [{"id": 3, "role": "user", "session_id": "s", "project_id": 1,
+          "source": "cursor", "text": "q3"}],
+        [
+            {"id": 10, "role": "assistant", "session_id": "s", "project_id": 1,
+             "source": "codex", "text": "a10"},
+            {"id": 9, "role": "assistant", "session_id": "s", "project_id": 1,
+             "source": "codex", "text": "a9"},
+        ],
+    ]
+    events = _build_team_watch_bootstrap_events(
+        client, limit=3, include_presence=False
+    )
+    assert len(events) == 3
+    assert any(e.role == "user" for e in events)
+
+
 def test_on_user_skips_duplicate_reposted_prompt() -> None:
     qa = _TeamWatchQAState()
     n = MagicMock()
@@ -197,6 +218,16 @@ def test_on_user_skips_duplicate_reposted_prompt() -> None:
     assert n.show.call_count == 1
     qa.on_user(u2, n, [0.0])
     assert n.show.call_count == 1
+
+
+def test_on_user_bootstrap_still_shows_duplicate_text() -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    u1 = _ev(id=1, role="user", text="same question", session_id="s1")
+    u2 = _ev(id=99, role="user", text="same question", session_id="s1")
+    qa.on_user(u1, n, [0.0], is_bootstrap=True)
+    qa.on_user(u2, n, [0.0], is_bootstrap=True)
+    assert n.show.call_count == 2
 
 
 def test_flush_pair_skips_duplicate_paired_block() -> None:

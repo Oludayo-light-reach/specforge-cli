@@ -84,7 +84,7 @@ from ..prompts.schema import (
     Turn,
     validate_session,
 )
-from ..prompts.text_sanitize import sanitize_for_toml_text
+from ..prompts.text_sanitize import sanitize_for_toml_text, unwrap_cursor_user_message
 from ..prompts.tools import ALLOWED_TOOL_NAMES, summarize_tool_call
 from .codex import CodexError, iter_cursor_agent_transcript_sessions
 
@@ -781,7 +781,7 @@ def _build_session(
             # A user turn always closes any pending assistant run that
             # belonged to the *previous* user prompt.
             _flush_assistant()
-            text = _bubble_text(bubble)
+            text = unwrap_cursor_user_message(_bubble_text(bubble))
             if not text.strip():
                 if _bubble_has_user_activity(bubble):
                     text = "(prompt body not extractable — see Cursor)"

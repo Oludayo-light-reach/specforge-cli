@@ -35,6 +35,7 @@ from typing import Any
 from rich.markup import escape
 
 from ..prompts.schema import MAX_TURN_TEXT_CHARS
+from ..prompts.text_sanitize import unwrap_cursor_user_message
 from ..ui import console, flush_streaming_output
 from .critic import SEV_HIGH, Critique, critique_event, suggested_flag_command
 from .events import IncomingEvent, IncomingFlag, ToolCallPayload
@@ -411,6 +412,14 @@ class Notifier:
         self._skipped_while_suppressed = 0
 
     @staticmethod
+    def _user_visible_text(event: IncomingEvent) -> str:
+        """Human prompt body for display and ``⤷ prompt`` pairing."""
+        raw = (event.text or event.summary or "").strip()
+        if event.source == "cursor" and raw:
+            return unwrap_cursor_user_message(raw)
+        return raw
+
+    @staticmethod
     def _assistant_visible_prose(text: str | None, summary: str | None) -> str:
         """Prefer the stored assistant ``text`` (full model reply body).
 
@@ -547,7 +556,7 @@ class Notifier:
                 return None
             if ev.role != "user":
                 continue
-            preview = (ev.text or ev.summary or "").strip()
+            preview = self._user_visible_text(ev)
             if not preview:
                 continue
             lim_u = self._user_preview_limit()
@@ -609,7 +618,7 @@ class Notifier:
         pair_key = self._session_pair_key(event)
         pending_prompt: tuple[str, str] | None = None
         if event.role == "user":
-            preview = (event.text or event.summary or "").strip()
+            preview = self._user_visible_text(event)
             preview = _truncate(preview, self._user_preview_limit())
             # USER badge (mint background) + author handle in the
             # source's accent color. A reviewer scanning a fast pane
@@ -820,7 +829,7 @@ class Notifier:
             f"[sf.muted]· {u_branch} · {u_time}[/]"
             f"{u_bundle}"
         )
-        u_preview_raw = (user.text or user.summary or "").strip()
+        u_preview_raw = self._user_visible_text(user)
         u_preview = _truncate(u_preview_raw, self._user_preview_limit())
         u_ctx = _ctx_line(user)
 

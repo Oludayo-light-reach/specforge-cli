@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import pytest
@@ -106,7 +106,9 @@ class _Handler(BaseHTTPRequestHandler):
 def stub_api() -> str:
     _HUB._events.clear()
     _HUB._next_id = 0
-    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    # Threading server so a blocking GET (waiting for POST) cannot deadlock
+    # the stub when POST arrives on another client connection.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"

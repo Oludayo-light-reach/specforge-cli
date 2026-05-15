@@ -183,6 +183,34 @@ def test_cursor_paths_resolve_under_cursor_home(tmp_path, monkeypatch):
     )
 
 
+def test_read_cursor_sessions_unwraps_user_query_envelope(tmp_path, monkeypatch):
+    """Cursor user bubbles store Agent envelope tags; capture shows plain text."""
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    composer_id = "99999999-9999-4999-a999-999999999999"
+    _make_workspace(tmp_path, "ws-env", bundle, [composer_id])
+    _add_composer(
+        tmp_path,
+        composer_id,
+        bubbles=[
+            {
+                "id": "bub-u",
+                "type": 1,
+                "text": (
+                    "<timestamp>Friday, May 15, 2026, 8:02 PM (UTC+8)</timestamp>\n"
+                    "<user_query>\n"
+                    "hi\n"
+                    "</user_query>"
+                ),
+                "createdAt": "2026-03-10T11:00:00Z",
+            },
+        ],
+    )
+    sessions = list(read_cursor_sessions(bundle))
+    assert sessions[0].turns[0].text == "hi"
+
+
 def test_read_cursor_sessions_extracts_user_and_assistant_turns(tmp_path, monkeypatch):
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path))
     bundle = tmp_path / "bundle"

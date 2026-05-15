@@ -96,7 +96,7 @@ CURSOR_SAVE_INTERVAL_SECS = 10.0
 # Recent Cloud rows printed once on connect so ``spec watch`` is not
 # live-only. SSE ``Last-Event-ID`` replay only covers the gap since the
 # last run; this REST warm-up supplies context when you are already caught up.
-WATCH_BOOTSTRAP_LIMIT_DEFAULT = 25
+WATCH_BOOTSTRAP_LIMIT_DEFAULT = 80
 # Hard cap on per-event text payload before redaction. The server caps
 # at 512 KB; we cap a hair below to avoid edge-of-frame rejections,
 # leaving room for redaction expanding text by a few bytes.
@@ -115,9 +115,12 @@ _EMPTY_TURN_RETRIES: dict[tuple[str, int], int] = {}
 # disk between producer polls. We POST updates while ``text``
 # changes, then delay advancing ``broadcast_turns`` until the body
 # stays unchanged long enough that token streams are unlikely to
-# resume in the same bubble. Agent runs can pause for minutes between
-# tool rounds or stream for hours — default to a 2h quiet window.
-DEFAULT_TAIL_ASSISTANT_STABILITY_SECS = 7200.0  # 2 hours
+# resume in the same bubble. A few-second quiet window matches human
+# typing pauses between streamed chunks; ``assistant_closed`` must
+# arrive promptly so ``spec team watch`` can flush Q/A pairs.
+# Override with ``SPEC_LIVE_TAIL_STABILITY_SECS`` (e.g. ``120`` for
+# very slow Codex runs between tool rounds).
+TAIL_ASSISTANT_STABILITY_FLOOR_SECS = 12.0
 TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER = 3.0
 
 
@@ -142,7 +145,7 @@ def tail_stability_quiet_secs(poll_interval: float) -> float:
         except ValueError:
             pass
     return max(
-        DEFAULT_TAIL_ASSISTANT_STABILITY_SECS,
+        TAIL_ASSISTANT_STABILITY_FLOOR_SECS,
         poll_interval * TAIL_ASSISTANT_STABILITY_POLL_MULTIPLIER,
     )
 
@@ -196,12 +199,19 @@ def _post_assistant_closed(
         closes_event_id=last_assistant_cloud_id,
         broadcast_client_id=opts.broadcast_client_id,
     )
-    ok, _ = poster.send(evt)
-    if not ok:
-        log.warning(
-            "spec-live: assistant_closed POST failed for session %s",
-            (session.id or "")[:32],
-        )
+    # ``HTTPPoster.send`` already retries transient errors; one extra
+    # pass here because a dropped sentinel strands teammates' Q/A in
+    # ``spec team watch`` until idle timeout.
+    for attempt in range(2):
+        ok, _ = poster.send(evt)
+        if ok:
+            return
+        if attempt == 0:
+            time.sleep(0.35)
+    log.warning(
+        "spec-live: assistant_closed POST failed for session %s",
+        (session.id or "")[:32],
+    )
 
 
 @dataclass

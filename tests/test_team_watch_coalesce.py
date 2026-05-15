@@ -209,15 +209,26 @@ def test_bootstrap_merge_reserves_user_slots() -> None:
     assert any(e.role == "user" for e in events)
 
 
-def test_on_user_skips_duplicate_reposted_prompt() -> None:
+def test_on_user_skips_same_cloud_row_id_replay() -> None:
+    """SSE warm-up can redeliver the same user row id — show once."""
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    u = _ev(id=1, role="user", text="same question", session_id="s1")
+    qa.on_user(u, n, [0.0])
+    assert n.show.call_count == 1
+    qa.on_user(u, n, [0.0])
+    assert n.show.call_count == 1
+
+
+def test_on_user_distinct_ids_same_body_shows_twice() -> None:
+    """Two Cloud rows with different ids are two prompts — never drop."""
     qa = _TeamWatchQAState()
     n = MagicMock()
     u1 = _ev(id=1, role="user", text="same question", session_id="s1")
     u2 = _ev(id=99, role="user", text="same question", session_id="s1")
     qa.on_user(u1, n, [0.0])
-    assert n.show.call_count == 1
     qa.on_user(u2, n, [0.0])
-    assert n.show.call_count == 1
+    assert n.show.call_count == 2
 
 
 def test_on_user_bootstrap_still_shows_duplicate_text() -> None:
@@ -230,7 +241,8 @@ def test_on_user_bootstrap_still_shows_duplicate_text() -> None:
     assert n.show.call_count == 2
 
 
-def test_flush_pair_skips_duplicate_paired_block() -> None:
+def test_flush_pair_allows_same_body_distinct_user_rows() -> None:
+    """Two real prompts with identical text must not be collapsed."""
     qa = _TeamWatchQAState()
     n = MagicMock()
     u = _ev(id=1, role="user", text="hey", session_id="s1")
@@ -241,6 +253,20 @@ def test_flush_pair_skips_duplicate_paired_block() -> None:
     assert n.show_completed_pair.call_count == 1
     qa.pending_user = _ev(id=3, role="user", text="hey", session_id="s1")
     qa.assistant_chunks = [_ev(id=4, role="assistant", text="reply", session_id="s1")]
+    assert qa.flush_pair(n)
+    assert n.show_completed_pair.call_count == 2
+
+
+def test_flush_pair_skips_reflush_same_user_event_id() -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    u = _ev(id=1, role="user", text="hey", session_id="s1")
+    a = _ev(id=2, role="assistant", text="reply", session_id="s1")
+    qa.pending_user = u
+    qa.assistant_chunks = [a]
+    assert qa.flush_pair(n)
+    qa.pending_user = u
+    qa.assistant_chunks = [a]
     assert not qa.flush_pair(n)
     assert n.show_completed_pair.call_count == 1
 

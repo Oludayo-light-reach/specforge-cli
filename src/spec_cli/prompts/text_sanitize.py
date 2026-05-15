@@ -17,6 +17,15 @@ _ANSI_ESCAPE_RE = re.compile(
 )
 # OSC can end in BEL or ST
 _OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
+# Cursor Agent wraps the human prompt in XML-like tags in workspaceStorage.
+_CURSOR_TIMESTAMP_RE = re.compile(
+    r"<timestamp>\s*[\s\S]*?\s*</timestamp>\s*",
+    re.IGNORECASE,
+)
+_CURSOR_USER_QUERY_RE = re.compile(
+    r"<user_query>\s*([\s\S]*?)\s*</user_query>",
+    re.IGNORECASE,
+)
 
 
 def strip_ansi_escapes(s: str) -> str:
@@ -24,6 +33,26 @@ def strip_ansi_escapes(s: str) -> str:
     s = _OSC_RE.sub("", s)
     s = _ANSI_ESCAPE_RE.sub("", s)
     return s.replace("\x1b", "")
+
+
+def unwrap_cursor_user_message(text: str) -> str:
+    """Return the human prompt from Cursor's Agent envelope markup.
+
+    Cursor stores user bubbles as ``<timestamp>…</timestamp>`` plus
+    ``<user_query>…</user_query>`` (and sometimes more system context).
+    Spec Live should show and broadcast only what the teammate typed.
+    """
+    if not text or not text.strip():
+        return text
+    s = _CURSOR_TIMESTAMP_RE.sub("", text)
+    parts = [
+        m.strip()
+        for m in _CURSOR_USER_QUERY_RE.findall(s)
+        if isinstance(m, str) and m.strip()
+    ]
+    if parts:
+        return "\n\n".join(parts)
+    return s.strip()
 
 
 def sanitize_for_toml_text(s: str) -> str:

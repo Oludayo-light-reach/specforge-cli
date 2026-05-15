@@ -393,12 +393,11 @@ _TEAM_WATCH_HEARTBEAT_SECS = 60.0
 # assistant-only streaks (Claude Code JSONL) so the USER row is still
 # in the warm-up batch.
 # Workspace bootstrap before SSE: most recent N events across bundles.
-# Kept small so the first ``spec team watch`` connect does not replay a
-# huge backlog (use ``/replay`` / REST for deep history). Reserve slots
-# for ``user`` rows so a burst of assistant-only Codex chunks does not
-# warm up as AI-only orphans.
-_TEAM_WATCH_BOOTSTRAP_LIMIT = 15
-_TEAM_WATCH_BOOTSTRAP_USER_SLOTS = 5
+# Large enough that joining ``spec team watch`` mid-thread still shows
+# the USER row that kicked off the current reply (Codex/Cursor can emit
+# long assistant-only tails). Cap keeps the first REST round trip bounded.
+_TEAM_WATCH_BOOTSTRAP_LIMIT = 200
+_TEAM_WATCH_BOOTSTRAP_USER_SLOTS = 25
 
 
 def _build_team_watch_bootstrap_events(
@@ -548,10 +547,13 @@ class _TeamWatchQAState:
         # same (project, session) with ``id`` not above this tail (duplicate
         # SSE / late snapshots that would otherwise hit ``notifier.show``).
         self._closed_assistant_hi: dict[tuple[int, str], int] = {}
-        # Suppress duplicate user prompts and paired blocks when Cloud
-        # carries many rows for the same Composer turn (replay storm).
-        self._seen_user_fps: set[tuple[int, str, str]] = set()
-        self._flushed_pair_fps: set[tuple[int, str, str]] = set()
+        # After ``show_completed_pair``, suppress re-printing the same
+        # *user prompt row* (same Cloud ``id``) if the stream redelivers it.
+        self._seen_user_event_ids: set[tuple[int, int]] = set()
+        # One merged block per (project, session, user event id) — keyed
+        # by the durable user row id, not prompt body text, so two real
+        # prompts that say "ok" twice still both render.
+        self._flushed_pair_keys: set[tuple[int, str, int]] = set()
 
     def _bump_assistant_hi_after_flush(
         self, pending: IncomingEvent, combined: list[IncomingEvent]
@@ -581,21 +583,21 @@ class _TeamWatchQAState:
         return (ev.project_id, (ev.session_id or "").strip())
 
     @staticmethod
-    def _user_fp(ev: IncomingEvent) -> tuple[int, str, str]:
-        body = (ev.text or ev.summary or "").strip()
-        body = " ".join(body.split())
-        if len(body) > 500:
-            body = body[:500]
-        return (ev.project_id, (ev.session_id or "").strip(), body)
+    def _pair_flush_key(pending: IncomingEvent) -> tuple[int, str, int]:
+        return (
+            pending.project_id,
+            (pending.session_id or "").strip(),
+            pending.id,
+        )
 
     def is_duplicate_user(self, ev: IncomingEvent) -> bool:
-        """True when this user prompt was already shown in this watch run."""
+        """True when this exact user row was already shown in this watch run."""
         if ev.role != "user":
             return False
-        fp = self._user_fp(ev)
-        if fp in self._seen_user_fps:
+        key = (ev.project_id, ev.id)
+        if key in self._seen_user_event_ids:
             return True
-        self._seen_user_fps.add(fp)
+        self._seen_user_event_ids.add(key)
         return False
 
     @staticmethod
@@ -630,8 +632,8 @@ class _TeamWatchQAState:
     def flush_pair(self, notifier: Notifier) -> bool:
         if self.pending_user is None:
             return False
-        pair_fp = self._user_fp(self.pending_user)
-        if pair_fp in self._flushed_pair_fps:
+        pair_key = self._pair_flush_key(self.pending_user)
+        if pair_key in self._flushed_pair_keys:
             self.assistant_chunks.clear()
             self.pending_user = None
             self.last_assistant_mono = None
@@ -641,7 +643,7 @@ class _TeamWatchQAState:
         if not combined:
             return False
         merged = self._merge_assistant_chunks(combined)
-        self._flushed_pair_fps.add(pair_fp)
+        self._flushed_pair_keys.add(pair_key)
         self._bump_assistant_hi_after_flush(self.pending_user, combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.assistant_chunks.clear()

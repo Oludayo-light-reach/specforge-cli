@@ -3,7 +3,10 @@ Reads/writes the two config surfaces the CLI owns:
 
   1. `spec.yaml` at the bundle root — the manifest the compiler and the
      cloud both consume. We only load/dump it here; validation lives in the
-     compiler (source of truth for the schema).
+     compiler (source of truth for the schema). Known YAML merge typos
+     (e.g. ``output:hropic``) are auto-repaired on load: the original file is
+     copied to ``.spec/spec.yaml.invalid-backup`` and a canonical ``spec.yaml``
+     is rewritten unless ``SPEC_NO_MANIFEST_AUTOWRITE`` is set.
 
   2. `~/.spec/credentials` — a JSON file holding the Spec session token,
      the Cloud API base URL, and the signed-in user's public handle.
@@ -21,6 +24,7 @@ under the worktree (same rules as git hooks).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import stat
@@ -34,9 +38,113 @@ import yaml
 
 from .constants import MANIFEST_FILENAME
 
+log = logging.getLogger(__name__)
+
 
 class BundleNotFoundError(FileNotFoundError):
     """Raised when no `spec.yaml` is found in cwd or any parent."""
+
+
+class ManifestYamlError(ValueError):
+    """``spec.yaml`` exists but is not valid YAML (and no autorepair applied)."""
+
+    def __init__(self, path: Path, message: str):
+        super().__init__(message)
+        self.path = path
+
+
+_MERGED_OUTPUT_TYPO_KEY_RE = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)output:hropic[ \t]*$"
+)
+# Placeholder must be a valid YAML mapping key and unlikely to collide.
+_AUTOREPAIR_PLACEHOLDER_KEY = "spec_cli_autorepair__merged_output_typo"
+
+
+def _try_repair_manifest_yaml(raw: str) -> tuple[dict[str, Any], str] | None:
+    """Handle a known ``spec.yaml`` corruption: ``output:hropic`` line.
+
+    Editors / merges occasionally concatenate ``output:`` + ``anthropic`` into
+    one token, leaving the following ``model`` / ``temperature`` lines
+    indented under an invalid key so PyYAML raises. We remap those fields
+    back onto ``compiler`` and ``output`` heuristically.
+    """
+    if not _MERGED_OUTPUT_TYPO_KEY_RE.search(raw):
+        return None
+    patched = _MERGED_OUTPUT_TYPO_KEY_RE.sub(
+        lambda m: f"{m.group('indent')}{_AUTOREPAIR_PLACEHOLDER_KEY}:",
+        raw,
+        count=1,
+    )
+    try:
+        data = yaml.safe_load(patched) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    pod = data.pop(_AUTOREPAIR_PLACEHOLDER_KEY, None)
+    if not isinstance(pod, dict):
+        return None
+
+    compiler = data.get("compiler")
+    if not isinstance(compiler, dict):
+        compiler = {}
+        data["compiler"] = compiler
+    output = data.get("output")
+    if not isinstance(output, dict):
+        output = {}
+        data["output"] = output
+
+    for key in ("engine", "model", "temperature", "max_output_tokens"):
+        if key in pod:
+            compiler[key] = pod.pop(key)
+    for key in ("target", "changelog", "commit_style"):
+        if key in pod:
+            output[key] = pod.pop(key)
+    # Anything left (unknown keys that lived under the typo line) lands on
+    # ``output`` so we do not drop user data silently.
+    for k, v in pod.items():
+        output[k] = v
+
+    note = (
+        'merged invalid key "output:hropic" → `compiler` (model/engine/…) '
+        "and `output` (target/changelog/…)"
+    )
+    return data, note
+
+
+def _raise_manifest_yaml_error(path: Path, raw: str, err: yaml.YAMLError) -> None:
+    """Turn a raw PyYAML traceback into a short, path-centric CLI error."""
+    hint = str(err).strip()
+    mark = getattr(err, "problem_mark", None)
+    if mark is not None:
+        lines = raw.splitlines()
+        idx = mark.line
+        if 0 <= idx < len(lines):
+            bad = lines[idx].rstrip()
+            pointer = f"{' ' * mark.column}^"
+            hint = (
+                f"{hint}\n  {path}:{mark.line + 1}: {bad}\n  {pointer}\n"
+                "  Hint: look for a merged token like `output:hropic` (should be "
+                "separate `compiler:` / `output:` blocks)."
+            )
+    raise ManifestYamlError(path, f"Invalid YAML in {path}:\n{hint}") from err
+
+
+def _persist_manifest_repair(
+    root: Path, path: Path, original_raw: str, data: dict[str, Any], note: str
+) -> None:
+    """Backup broken YAML, then write a canonical repaired ``spec.yaml``."""
+    bdir = root / ".spec"
+    bdir.mkdir(parents=True, exist_ok=True)
+    backup = bdir / "spec.yaml.invalid-backup"
+    backup.write_text(original_raw, encoding="utf-8")
+    dump_manifest(Manifest(path=path, data=data))
+    log.warning(
+        "spec.yaml: auto-repaired known corruption (%s). "
+        "Original saved to %s — review formatting and run `git diff spec.yaml`.",
+        note,
+        backup,
+    )
 
 
 @dataclass
@@ -291,8 +399,28 @@ def find_bundle_root(start: Path | None = None) -> Path:
 def load_manifest(root: Path | None = None) -> Manifest:
     root = root or find_bundle_root()
     path = root / MANIFEST_FILENAME
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+    raw = path.read_text(encoding="utf-8")
+    skip_disk = os.environ.get("SPEC_NO_MANIFEST_AUTOWRITE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as e:
+        repaired = _try_repair_manifest_yaml(raw)
+        if repaired is None:
+            _raise_manifest_yaml_error(path, raw, e)
+        data, note = repaired
+        if skip_disk:
+            log.warning(
+                "spec.yaml: in-memory autorepair applied (%s). "
+                "Unset SPEC_NO_MANIFEST_AUTOWRITE to persist the fix to disk "
+                "(backup + rewritten spec.yaml).",
+                note,
+            )
+        else:
+            _persist_manifest_repair(root, path, raw, data, note)
     if not isinstance(data, dict):
         raise ValueError(f"{path} must be a YAML mapping at the top level")
     return Manifest(path=path, data=data)

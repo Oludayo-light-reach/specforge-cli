@@ -780,6 +780,22 @@ def _producer_tick(
         if stop_event.is_set():
             return
         prev = cursor.turns_broadcast_for(session.id)
+        # Cursor (and other adapters) can shrink on-disk turn lists while
+        # our cursor still counts empty skips we advanced past without a
+        # successful POST. Clamp to the local length — do *not* rewind to
+        # zero and re-POST history every poll (that spammed Cloud and made
+        # ``spec team watch`` look like an endless replay loop).
+        if prev > len(session.turns):
+            clamped = len(session.turns)
+            log.info(
+                "spec-live: clamping broadcast cursor for session %s "
+                "(%s → %s local turns)",
+                session.id[:8],
+                prev,
+                clamped,
+            )
+            cursor.clamp_broadcast(session.id, clamped)
+            prev = clamped
         new_turns = session.turns[prev:]
         if not new_turns:
             continue

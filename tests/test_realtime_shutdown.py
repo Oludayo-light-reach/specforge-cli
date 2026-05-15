@@ -513,6 +513,61 @@ def test_producer_does_not_skip_empty_tail_assistant_slot(
     assert cursor.turns_broadcast_for(sid) == 1
 
 
+def test_producer_clamps_ahead_broadcast_cursor_without_repost(
+    tmp_path, monkeypatch
+):
+    """When ``broadcast_turns`` overshoots local length, clamp — do not
+    rewind and re-POST the whole transcript every poll."""
+    from spec_cli.prompts.schema import Session, Turn
+    from spec_cli.realtime.tracker import LiveCursor
+
+    sid = "ahead-cursor-session"
+    session = Session(
+        id=sid,
+        source="cursor",
+        title="t",
+        turns=[
+            Turn(role="user", text="one", at=None),
+            Turn(role="assistant", text="two", at=None),
+        ],
+        cwd=str(tmp_path),
+        paths_touched=[],
+        verbose=True,
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher._iter_local_sessions",
+        lambda _paths: iter([session]),
+    )
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.historical_bundle_paths",
+        lambda _root: [],
+    )
+
+    class _StubGit:
+        branch = "main"
+        commit_sha = None
+        author_name = "test"
+        author_email = "test@example.com"
+
+    monkeypatch.setattr(
+        "spec_cli.realtime.watcher.read_git_context", lambda _root: _StubGit()
+    )
+
+    poster = _StubPoster()
+    cursor = LiveCursor.load(tmp_path, project_id=1)
+    cursor.record_broadcast(sid, 10)
+
+    _producer_tick(
+        bundle_root=tmp_path,
+        cursor=cursor,
+        poster=poster,
+        opts=_make_opts(),
+        stop_event=threading.Event(),
+    )
+    assert poster.events == []
+    assert cursor.turns_broadcast_for(sid) == 2
+
+
 # ── Issue 3: run_watcher exits promptly on stop_event ──────────────
 
 

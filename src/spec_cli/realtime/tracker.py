@@ -130,6 +130,19 @@ class LiveCursor:
             if turn_count > current:
                 self.broadcast_turns[session_id] = turn_count
 
+    def clamp_broadcast(self, session_id: str, turn_count: int) -> None:
+        """Lower the broadcast cursor when the local transcript shrank.
+
+        Unlike :meth:`record_broadcast`, this may move backwards so we
+        can recover from empty-skip inflation without re-POSTing history.
+        """
+        if turn_count < 0:
+            return
+        with self._lock:
+            current = self.broadcast_turns.get(session_id, 0)
+            if turn_count < current:
+                self.broadcast_turns[session_id] = turn_count
+
     def record_received(self, event_id: int) -> None:
         """Mark ``event_id`` as the most recent event we have processed.
 

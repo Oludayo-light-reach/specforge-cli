@@ -499,6 +499,10 @@ class _TeamWatchQAState:
         # same (project, session) with ``id`` not above this tail (duplicate
         # SSE / late snapshots that would otherwise hit ``notifier.show``).
         self._closed_assistant_hi: dict[tuple[int, str], int] = {}
+        # Suppress duplicate user prompts and paired blocks when Cloud
+        # carries many rows for the same Composer turn (replay storm).
+        self._seen_user_fps: set[tuple[int, str, str]] = set()
+        self._flushed_pair_fps: set[tuple[int, str, str]] = set()
 
     def _bump_assistant_hi_after_flush(
         self, pending: IncomingEvent, combined: list[IncomingEvent]
@@ -526,6 +530,24 @@ class _TeamWatchQAState:
     @staticmethod
     def _session_key(ev: IncomingEvent) -> tuple[int, str]:
         return (ev.project_id, (ev.session_id or "").strip())
+
+    @staticmethod
+    def _user_fp(ev: IncomingEvent) -> tuple[int, str, str]:
+        body = (ev.text or ev.summary or "").strip()
+        body = " ".join(body.split())
+        if len(body) > 500:
+            body = body[:500]
+        return (ev.project_id, (ev.session_id or "").strip(), body)
+
+    def is_duplicate_user(self, ev: IncomingEvent) -> bool:
+        """True when this user prompt was already shown in this watch run."""
+        if ev.role != "user":
+            return False
+        fp = self._user_fp(ev)
+        if fp in self._seen_user_fps:
+            return True
+        self._seen_user_fps.add(fp)
+        return False
 
     @staticmethod
     def _merge_assistant_chunks(chunks: list[IncomingEvent]) -> IncomingEvent:
@@ -559,10 +581,18 @@ class _TeamWatchQAState:
     def flush_pair(self, notifier: Notifier) -> bool:
         if self.pending_user is None:
             return False
+        pair_fp = self._user_fp(self.pending_user)
+        if pair_fp in self._flushed_pair_fps:
+            self.assistant_chunks.clear()
+            self.pending_user = None
+            self.last_assistant_mono = None
+            self.pending_since_mono = None
+            return False
         combined = self.combined_assistant_chunks()
         if not combined:
             return False
         merged = self._merge_assistant_chunks(combined)
+        self._flushed_pair_fps.add(pair_fp)
         self._bump_assistant_hi_after_flush(self.pending_user, combined)
         notifier.show_completed_pair(self.pending_user, merged)
         self.assistant_chunks.clear()
@@ -577,6 +607,8 @@ class _TeamWatchQAState:
         notifier: Notifier,
         last_output_at: list[float],
     ) -> None:
+        if self.is_duplicate_user(ev):
+            return
         if self.pending_user is not None and self.combined_assistant_chunks():
             self.flush_pair(notifier)
         self.assistant_chunks.clear()

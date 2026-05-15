@@ -98,6 +98,12 @@ MAX_TURN_TEXT_CHARS = 480 * 1024
 # is almost always an artefact of an empty draft submit; we don't want
 # to flood the team feed with blanks.
 MIN_TURN_TEXT_CHARS = 1
+# Empty local turns we retry before advancing the broadcast cursor
+# (advancing on empty skip without a POST inflated the cursor past the
+# real transcript and caused duplicate Cloud rows on shrink).
+_MAX_EMPTY_TURN_RETRIES = 8
+_EMPTY_TURN_RETRIES: dict[tuple[str, int], int] = {}
+
 # Final assistant turns (Cursor streams into one bubble) may grow on
 # disk between producer polls. We POST updates while ``text``
 # changes, then delay advancing ``broadcast_turns`` until the body
@@ -805,23 +811,25 @@ def _producer_tick(
                 return
             event = _build_outgoing(session, turn, branch=branch, git=git, opts=opts)
             if event is None:
-                # Skip empty / undeliverable turn but still advance the
-                # cursor so we don't rescan it forever.
-                #
-                # Exception: the final assistant slot can appear in
-                # ``session.turns`` before any body exists on disk (Cursor
-                # is the usual case; other adapters can yield the same
-                # ``_build_outgoing`` → ``None`` pattern). Advancing past
-                # that slot drops the reply for every ``session.source``
-                # (cursor / claude_code / codex). Retry next poll until the
-                # turn becomes shippable.
+                # Retry empty / undeliverable slots — do not advance the
+                # broadcast cursor until we POST or exhaust retries.
+                # Advancing without a POST let ``broadcast_turns`` overshoot
+                # ``len(session.turns)`` and later rewinds/clamps spammed
+                # duplicate user rows to Cloud.
+                turn_idx_empty = prev + offset
                 if (
                     turn.role == "assistant"
-                    and (prev + offset) == len(session.turns) - 1
+                    and turn_idx_empty == len(session.turns) - 1
                 ):
                     continue
+                retry_key = (session.id, turn_idx_empty)
+                tries = _EMPTY_TURN_RETRIES.get(retry_key, 0) + 1
+                _EMPTY_TURN_RETRIES[retry_key] = tries
+                if tries < _MAX_EMPTY_TURN_RETRIES:
+                    continue
                 holds.pop(session.id, None)
-                cursor.record_broadcast(session.id, prev + offset + 1)
+                cursor.record_broadcast(session.id, turn_idx_empty + 1)
+                _EMPTY_TURN_RETRIES.pop(retry_key, None)
                 continue
 
             turn_idx = prev + offset
@@ -853,6 +861,8 @@ def _producer_tick(
                             last_assistant_cloud_id=cloud_ids.get(session.id),
                         )
                     continue
+
+            _EMPTY_TURN_RETRIES.pop((session.id, turn_idx), None)
 
             ok, created_id = poster.send(event)
             if not ok:
@@ -898,6 +908,8 @@ def _producer_tick(
                     opts=opts,
                     last_assistant_cloud_id=cloud_ids.get(session.id),
                 )
+
+        cursor.clamp_broadcast(session.id, len(session.turns))
 
 
 def _iter_local_sessions(paths) -> Iterable[Session]:  # type: ignore[no-untyped-def]

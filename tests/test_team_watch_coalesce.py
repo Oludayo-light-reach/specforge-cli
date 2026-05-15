@@ -188,6 +188,32 @@ def test_flush_pair_prefers_cloud_tail_over_partial_sse_buffer(
     assert "much longer assistant" in (merged.text or "")
 
 
+def test_on_user_skips_duplicate_reposted_prompt() -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    u1 = _ev(id=1, role="user", text="same question", session_id="s1")
+    u2 = _ev(id=99, role="user", text="same question", session_id="s1")
+    qa.on_user(u1, n, [0.0])
+    assert n.show.call_count == 1
+    qa.on_user(u2, n, [0.0])
+    assert n.show.call_count == 1
+
+
+def test_flush_pair_skips_duplicate_paired_block() -> None:
+    qa = _TeamWatchQAState()
+    n = MagicMock()
+    u = _ev(id=1, role="user", text="hey", session_id="s1")
+    a = _ev(id=2, role="assistant", text="reply", session_id="s1")
+    qa.pending_user = u
+    qa.assistant_chunks = [a]
+    assert qa.flush_pair(n)
+    assert n.show_completed_pair.call_count == 1
+    qa.pending_user = _ev(id=3, role="user", text="hey", session_id="s1")
+    qa.assistant_chunks = [_ev(id=4, role="assistant", text="reply", session_id="s1")]
+    assert not qa.flush_pair(n)
+    assert n.show_completed_pair.call_count == 1
+
+
 def test_flush_on_assistant_closed_uses_cloud_when_sse_buffer_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
